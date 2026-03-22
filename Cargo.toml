@@ -10,6 +10,13 @@ rawloader = "0.37"
 imagepipe = "0.5"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 rayon = "1.10"
 anyhow = "1"
 indicatif = "0.17"
+walkdir = "2"
+kamadak-exif = "0.6.1"
+img-parts = "0.4.0"
+
+[dev-dependencies]
+tempfile = "3"
