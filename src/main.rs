@@ -1,5 +1,6 @@
 mod converter;
 mod exif;
+mod naming;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -36,6 +37,12 @@ struct Cli {
     /// Output directory (defaults to same directory as each input file)
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Name template for output files, relative to the output directory
+    /// and without extension. Fields: {stem} {date} {year} {month} {day}
+    /// {time} {model}. Example: "{date}/{model}_{stem}"
+    #[arg(long, value_name = "TEMPLATE")]
+    name: Option<naming::NameTemplate>,
 
     /// Output format
     #[arg(short, long, value_enum, default_value_t = OutputFormat::Jpeg)]
@@ -150,7 +157,12 @@ fn main() -> Result<()> {
         bail!("No RAW files found in the provided inputs.");
     }
 
-    let jobs = plan_outputs(&files, cli.output.as_deref(), cli.format)?;
+    let jobs = plan_outputs(
+        &files,
+        cli.output.as_deref(),
+        cli.format,
+        cli.name.as_ref(),
+    )?;
 
     if cli.dry_run {
         for (input_path, output_path) in &jobs {
@@ -361,20 +373,54 @@ fn canonical(path: &Path) -> PathBuf {
 
 /// Pair each input with its output path. Fails without converting anything
 /// if two inputs would write the same output path.
+///
+/// With a name template, the output goes to the template's path below the
+/// output directory (or below the input's directory when there is none), and
+/// the scanned subdirectory is not mirrored.
 fn plan_outputs(
     files: &[InputFile],
     output_dir: Option<&Path>,
     format: OutputFormat,
+    template: Option<&naming::NameTemplate>,
 ) -> Result<Vec<(PathBuf, PathBuf)>> {
+    // Reading EXIF for the template opens every file, so do it in parallel.
+    let named: Option<Vec<PathBuf>> = template.map(|t| {
+        let needs_exif = t.needs_exif();
+        files
+            .par_iter()
+            .map(|f| t.expand(&naming::NameInfo::read(&f.path, needs_exif)))
+            .collect()
+    });
+
     let mut jobs = Vec::with_capacity(files.len());
     let mut claimed: HashMap<PathBuf, &Path> = HashMap::new();
     let mut conflicts = Vec::new();
 
-    for f in files {
-        let dir = output_dir.map(|d| d.join(&f.rel_dir));
-        let output = make_output_path(&f.path, dir.as_deref(), format);
-        // Compare outputs by where they land on disk, not by how the input was spelled.
-        let key = make_output_path(&canonical(&f.path), dir.as_deref(), format);
+    for (i, f) in files.iter().enumerate() {
+        let (output, key) = match &named {
+            Some(named) => {
+                let mut name = named[i].clone().into_os_string();
+                name.push(".");
+                name.push(extension(format));
+                let base = |input: &Path| match output_dir {
+                    Some(dir) => dir.to_path_buf(),
+                    None => input.parent().unwrap_or(Path::new("")).to_path_buf(),
+                };
+                (
+                    base(&f.path).join(&name),
+                    base(&canonical(&f.path)).join(&name),
+                )
+            }
+            None => {
+                let dir = output_dir.map(|d| d.join(&f.rel_dir));
+                (
+                    make_output_path(&f.path, dir.as_deref(), format),
+                    // Compare outputs by where they land on disk, not by how
+                    // the input was spelled.
+                    make_output_path(&canonical(&f.path), dir.as_deref(), format),
+                )
+            }
+        };
         if let Some(first) = claimed.get(&key) {
             conflicts.push(format!(
                 "  {} and {} both write {}",
@@ -397,6 +443,14 @@ fn plan_outputs(
     Ok(jobs)
 }
 
+fn extension(format: OutputFormat) -> &'static str {
+    match format {
+        OutputFormat::Jpeg => "jpg",
+        OutputFormat::Tiff => "tiff",
+        OutputFormat::Png => "png",
+    }
+}
+
 /// File extensions of the RAW formats that the decoder supports.
 const RAW_EXTENSIONS: &[&str] = &[
     "arw", "srf", "sr2", "dng", "cr2", "crw", "nef", "nrw", "raf", "orf", "rw2", "pef", "srw",
@@ -413,11 +467,7 @@ fn is_raw(path: &Path) -> bool {
 /// Build the output path for a given input ARW file.
 fn make_output_path(input: &Path, output_dir: Option<&Path>, format: OutputFormat) -> PathBuf {
     let stem = input.file_stem().unwrap_or_default();
-    let ext = match format {
-        OutputFormat::Jpeg => "jpg",
-        OutputFormat::Tiff => "tiff",
-        OutputFormat::Png => "png",
-    };
+    let ext = extension(format);
     let file_name = format!("{}.{}", stem.to_string_lossy(), ext);
 
     match output_dir {
@@ -770,7 +820,7 @@ mod tests {
 
         let files = collect_raw_files(&[input], true).unwrap();
         let out = Path::new("/out");
-        let jobs = plan_outputs(&files, Some(out), OutputFormat::Jpeg).unwrap();
+        let jobs = plan_outputs(&files, Some(out), OutputFormat::Jpeg, None).unwrap();
         let outputs: Vec<&Path> = jobs.iter().map(|(_, o)| o.as_path()).collect();
         assert_eq!(
             outputs,
@@ -783,6 +833,43 @@ mod tests {
     }
 
     #[test]
+    fn plan_outputs_with_template_names_files_below_the_output_dir() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("in");
+        fs::create_dir_all(input.join("a")).unwrap();
+        fs::write(input.join("a/x.arw"), b"fake").unwrap();
+        fs::write(input.join("y.arw"), b"fake").unwrap();
+        let files = collect_raw_files(std::slice::from_ref(&input), true).unwrap();
+        let template: naming::NameTemplate = "{date}/{stem}-web".parse().unwrap();
+
+        let jobs =
+            plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Jpeg, Some(&template))
+                .unwrap();
+        let outputs: Vec<&Path> = jobs.iter().map(|(_, o)| o.as_path()).collect();
+        assert_eq!(
+            outputs,
+            vec![
+                Path::new("/out/unknown/x-web.jpg"),
+                Path::new("/out/unknown/y-web.jpg"),
+            ]
+        );
+
+        // Without an output directory, the path is below each input's directory.
+        let jobs = plan_outputs(&files, None, OutputFormat::Png, Some(&template)).unwrap();
+        assert_eq!(jobs[0].1, input.join("a/unknown/x-web.png"));
+    }
+
+    #[test]
+    fn plan_outputs_with_template_detects_collisions() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.arw"), b"fake").unwrap();
+        fs::write(tmp.path().join("b.arw"), b"fake").unwrap();
+        let files = collect_raw_files(&[tmp.path().to_path_buf()], false).unwrap();
+        let template: naming::NameTemplate = "{date}".parse().unwrap();
+        assert!(plan_outputs(&files, None, OutputFormat::Jpeg, Some(&template)).is_err());
+    }
+
+    #[test]
     fn plan_outputs_explicit_files_go_directly_into_output_dir() {
         let tmp = TempDir::new().unwrap();
         let nested = tmp.path().join("a/b");
@@ -790,7 +877,7 @@ mod tests {
         fs::write(nested.join("x.arw"), b"fake").unwrap();
 
         let files = collect_raw_files(&[nested.join("x.arw")], true).unwrap();
-        let jobs = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Png).unwrap();
+        let jobs = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Png, None).unwrap();
         assert_eq!(jobs[0].1, PathBuf::from("/out/x.png"));
     }
 
@@ -801,7 +888,7 @@ mod tests {
         fs::write(tmp.path().join("a/x.arw"), b"fake").unwrap();
 
         let files = collect_raw_files(&[tmp.path().to_path_buf()], true).unwrap();
-        let jobs = plan_outputs(&files, None, OutputFormat::Jpeg).unwrap();
+        let jobs = plan_outputs(&files, None, OutputFormat::Jpeg, None).unwrap();
         assert_eq!(jobs[0].1, tmp.path().join("a/x.jpg"));
     }
 
@@ -816,7 +903,7 @@ mod tests {
         let b = tmp.path().join("b/x.arw");
 
         let files = collect_raw_files(&[a.clone(), b.clone()], false).unwrap();
-        let err = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Jpeg)
+        let err = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Jpeg, None)
             .expect_err("expected a conflict error");
         let msg = err.to_string();
         assert!(msg.contains(&*a.to_string_lossy()), "{msg}");
@@ -831,7 +918,7 @@ mod tests {
 
         let inputs = vec![tmp.path().join("x.arw"), tmp.path().join(".").join("x.png")];
         let files = collect_raw_files(&inputs, false).unwrap();
-        assert!(plan_outputs(&files, None, OutputFormat::Jpeg).is_err());
+        assert!(plan_outputs(&files, None, OutputFormat::Jpeg, None).is_err());
     }
 
     #[test]
