@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::{generate, Shell};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -14,13 +14,15 @@ use walkdir::WalkDir;
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum OutputFormat {
+    #[value(alias = "jpg")]
     Jpeg,
+    #[value(alias = "tif")]
     Tiff,
     Png,
 }
 
 #[derive(Parser)]
-#[command(name = "rawdog", about = "Raw files in, images out. No Lightroom, no fuss.")]
+#[command(name = "rawdog", version, about = "Raw files in, images out. No Lightroom, no fuss.")]
 struct Cli {
     /// One or more ARW files or directories containing ARW files
     #[arg(required_unless_present = "completions")]
@@ -43,7 +45,7 @@ struct Cli {
     quality: u8,
 
     /// Resize long edge to this many pixels, preserving aspect ratio
-    #[arg(short, long)]
+    #[arg(short, long, value_parser = clap::value_parser!(u32).range(1..))]
     resize: Option<u32>,
 
     /// Overwrite existing output files (default: skip if exists)
@@ -72,6 +74,9 @@ fn main() -> Result<()> {
     let missing_inputs = cli.input.iter().any(|p| !p.is_dir() && !p.is_file());
 
     if files.is_empty() {
+        if missing_inputs {
+            bail!("No ARW files found: one or more input paths do not exist.");
+        }
         bail!("No ARW files found in the provided inputs.");
     }
 
@@ -90,6 +95,10 @@ fn main() -> Result<()> {
             .expect("invalid progress bar template")
             .progress_chars("=> "),
     );
+
+    // Decoder panics are reported per file below; the default hook would
+    // print a backtrace message for each one.
+    std::panic::set_hook(Box::new(|_| {}));
 
     jobs.par_iter().for_each(|(input_path, output_path)| {
         if output_path.exists() && canonical(output_path) == canonical(input_path) {
@@ -112,7 +121,14 @@ fn main() -> Result<()> {
             return;
         }
 
-        match converter::convert_arw(input_path, output_path, cli.format, cli.quality, cli.resize) {
+        // The RAW decoder can panic on corrupt files. Report that as a
+        // failure of this file instead of aborting the batch.
+        let result = std::panic::catch_unwind(|| {
+            converter::convert_arw(input_path, output_path, cli.format, cli.quality, cli.resize)
+        })
+        .unwrap_or_else(|_| Err(anyhow!("decoder panicked; the file is probably corrupt")));
+
+        match result {
             Ok(()) => {
                 succeeded.fetch_add(1, Ordering::Relaxed);
             }
@@ -185,7 +201,7 @@ fn collect_arw_files(inputs: &[PathBuf], recursive: bool) -> Result<Vec<InputFil
                 for entry in std::fs::read_dir(path)? {
                     let entry = entry?;
                     let p = entry.path();
-                    if is_arw(&p) {
+                    if p.is_file() && is_arw(&p) {
                         files.push(InputFile {
                             path: p,
                             rel_dir: PathBuf::new(),
