@@ -4,7 +4,7 @@ Raw files in, images out. No Lightroom, no fuss.
 
 A no-nonsense RAW converter supporting JPEG, TIFF, and PNG output. Built for Sony ARW; it also accepts most other camera RAW formats (DNG, CR2, CR3, NEF, RAF, ORF, RW2, PEF, and more).
 
-Two decoder libraries are used. [rawloader](https://github.com/pedrocr/rawloader) decodes cameras up to about 2018. For a file that it does not know, rawdog uses [rawler](https://github.com/dnglab/dnglab), which knows newer cameras such as the Sony a7 IV and a7R V, and Canon CR3 files. Metadata is not copied from CR3 files.
+Two decoder libraries are used. [rawloader](https://github.com/pedrocr/rawloader) decodes cameras up to about 2018. For a file that it does not know, rawdog uses [rawler](https://github.com/dnglab/dnglab), which knows newer cameras such as the Sony a7 IV and a7R V, and Canon CR3 files. For CR3 files the main metadata fields are copied (camera, lens, exposure, date, GPS).
 
 ## Installation
 

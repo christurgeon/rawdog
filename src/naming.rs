@@ -108,13 +108,18 @@ impl NameInfo {
         if !needs_exif {
             return info;
         }
-        let Ok(Some(exif)) = crate::exif::read_source_exif(path) else {
+        let Ok(Some((fields, _))) = crate::exif::read_source_fields(path) else {
             return info;
         };
 
-        let ascii = |tag| match exif.get_field(tag, exif::In::PRIMARY).map(|f| &f.value) {
-            Some(exif::Value::Ascii(v)) => v.first().cloned(),
-            _ => None,
+        let ascii = |tag| {
+            fields
+                .iter()
+                .find(|f| f.tag == tag && f.ifd_num == exif::In::PRIMARY)
+                .and_then(|f| match &f.value {
+                    exif::Value::Ascii(v) => v.first().cloned(),
+                    _ => None,
+                })
         };
         info.taken = ascii(exif::Tag::DateTimeOriginal)
             .or_else(|| ascii(exif::Tag::DateTime))
