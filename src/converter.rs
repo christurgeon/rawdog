@@ -6,7 +6,7 @@ use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::codecs::tiff::TiffEncoder;
 use image::{ImageBuffer, Rgb, RgbImage};
-use imagepipe::{ImageSource, Pipeline};
+use imagepipe::{ImageSource, Pipeline, SplineFunc};
 
 use crate::exif as exif_utils;
 use crate::OutputFormat;
@@ -21,6 +21,11 @@ pub struct ConvertOptions {
     pub resize: Option<u32>,
     /// Scale during RAW decoding instead of after it. Needs `resize`.
     pub fast: bool,
+    /// Exposure change in stops (EV).
+    pub exposure: Option<f32>,
+    /// White balance as (colour temperature in kelvin, tint). Replaces the
+    /// as-shot white balance.
+    pub white_balance: Option<(f32, f32)>,
     pub metadata: exif_utils::MetadataOptions,
 }
 
@@ -31,6 +36,8 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         quality,
         resize,
         fast,
+        exposure,
+        white_balance,
         ref metadata,
     } = *opts;
 
@@ -43,6 +50,14 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     if let (true, Some(max_edge)) = (fast, resize) {
         pipeline.globals.settings.maxwidth = max_edge as usize;
         pipeline.globals.settings.maxheight = max_edge as usize;
+    }
+
+    if let Some((kelvin, tint)) = white_balance {
+        pipeline.ops.tolab.set_temp(kelvin, tint);
+    }
+    if let Some(ev) = exposure {
+        let curve = &mut pipeline.ops.basecurve;
+        curve.points = exposure_curve(ev, &curve.get_spline());
     }
 
     // Ensure output directory exists
@@ -70,6 +85,43 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// Tone curve points that apply an exposure change of `ev` stops, followed
+/// by the pipeline's own base curve.
+///
+/// imagepipe's `basecurve.exposure` setting multiplies the curve output, which
+/// clips highlights from about +0.7 EV. This curve applies the gain in linear
+/// light with a highlight roll-off, so white stays white and nothing clips.
+/// The points are in normalised CIE L*, which is what the curve operates on.
+fn exposure_curve(ev: f32, base: &SplineFunc) -> Vec<(f32, f32)> {
+    const STEPS: usize = 32;
+    let gain = ev.exp2();
+    let l_to_y = |l: f32| {
+        let l = l * 100.0;
+        if l > 8.0 {
+            ((l + 16.0) / 116.0).powi(3)
+        } else {
+            l * 27.0 / 24389.0
+        }
+    };
+    let y_to_l = |y: f32| {
+        let l = if y > 216.0 / 24389.0 {
+            116.0 * y.cbrt() - 16.0
+        } else {
+            y * 24389.0 / 27.0
+        };
+        l / 100.0
+    };
+    (1..STEPS)
+        .map(|i| {
+            let l = i as f32 / STEPS as f32;
+            let y = l_to_y(l);
+            // Slope `gain` in the shadows; maps 0 to 0 and 1 to 1.
+            let y = gain * y / (1.0 + (gain - 1.0) * y);
+            (l, base.interpolate(y_to_l(y)).clamp(0.0, 1.0))
+        })
+        .collect()
 }
 
 fn temp_path_for(output: &Path) -> PathBuf {
@@ -474,6 +526,46 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // exposure_curve tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn exposure_curve_zero_ev_equals_base_curve() {
+        let base = SplineFunc::new(&[(0.5, 0.6)]);
+        for (x, y) in exposure_curve(0.0, &base) {
+            assert!((y - base.interpolate(x)).abs() < 1e-4, "at {x}");
+        }
+    }
+
+    #[test]
+    fn exposure_curve_brightens_or_darkens_without_clipping() {
+        let base = SplineFunc::new(&[(0.5, 0.6)]);
+        for ev in [-3.0f32, -1.0, 1.0, 3.0] {
+            let points = exposure_curve(ev, &base);
+            for pair in points.windows(2) {
+                assert!(pair[1].1 > pair[0].1, "ev {ev}: not increasing at {}", pair[1].0);
+            }
+            for &(x, y) in &points {
+                assert!(y > 0.0 && y < 1.0, "ev {ev}: {y} at {x}");
+                if ev > 0.0 {
+                    assert!(y > base.interpolate(x), "ev {ev} at {x}");
+                } else {
+                    assert!(y < base.interpolate(x), "ev {ev} at {x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exposure_curve_one_stop_doubles_linear_shadows() {
+        // Identity base curve. In deep shadows the roll-off is negligible,
+        // so +1 EV must double the linear value. Below L* = 8, L* is linear.
+        let identity = SplineFunc::new(&[]);
+        let (x, y) = exposure_curve(1.0, &identity)[0];
+        assert!((y / x - 2.0).abs() < 0.02, "{x} -> {y}");
+    }
+
+    // -----------------------------------------------------------------------
     // convert_raw error handling tests
     // -----------------------------------------------------------------------
 
@@ -487,6 +579,8 @@ mod tests {
                 quality: 92,
                 resize: None,
                 fast: false,
+                exposure: None,
+                white_balance: None,
                 metadata: Default::default(),
             },
         );
@@ -507,6 +601,8 @@ mod tests {
                 quality: 92,
                 resize: None,
                 fast: false,
+                exposure: None,
+                white_balance: None,
                 metadata: Default::default(),
             },
         );

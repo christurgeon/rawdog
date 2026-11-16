@@ -54,6 +54,22 @@ struct Cli {
     #[arg(long, requires = "resize")]
     fast: bool,
 
+    /// Exposure correction in stops, from -5 to 5. Highlights roll off
+    /// instead of clipping
+    #[arg(short, long, value_name = "EV", allow_negative_numbers = true,
+          value_parser = float_in_range::<-5, 5>)]
+    exposure: Option<f32>,
+
+    /// White balance colour temperature in kelvin, from 1500 to 15000.
+    /// Replaces the as-shot white balance of every file
+    #[arg(long, value_name = "KELVIN", value_parser = float_in_range::<1500, 15000>)]
+    wb: Option<f32>,
+
+    /// White balance tint for --wb. Above 1 is more magenta, below 1 is
+    /// more green
+    #[arg(long, requires = "wb", default_value_t = 1.0, value_parser = tint_value)]
+    tint: f32,
+
     /// Do not copy GPS location to the output
     #[arg(long)]
     strip_gps: bool,
@@ -95,6 +111,20 @@ struct Cli {
     /// Print errors only
     #[arg(long)]
     quiet: bool,
+}
+
+fn float_in_range<const MIN: i32, const MAX: i32>(s: &str) -> Result<f32, String> {
+    match s.parse::<f32>() {
+        Ok(v) if v >= MIN as f32 && v <= MAX as f32 => Ok(v),
+        _ => Err(format!("must be a number from {MIN} to {MAX}")),
+    }
+}
+
+fn tint_value(s: &str) -> Result<f32, String> {
+    match s.parse::<f32>() {
+        Ok(v) if (0.5..=2.0).contains(&v) => Ok(v),
+        _ => Err("must be a number from 0.5 to 2".to_string()),
+    }
 }
 
 fn main() -> Result<()> {
@@ -153,6 +183,8 @@ fn main() -> Result<()> {
         quality: cli.quality,
         resize: cli.resize,
         fast: cli.fast,
+        exposure: cli.exposure,
+        white_balance: cli.wb.map(|kelvin| (kelvin, cli.tint)),
         metadata: exif::MetadataOptions {
             strip_all: cli.strip_metadata,
             strip_gps: cli.strip_gps,

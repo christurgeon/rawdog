@@ -86,6 +86,14 @@ Make small proofs quickly. `--fast` scales during RAW decoding, which is several
 rawdog ./card -r 2048 --fast -o ./proofs
 ```
 
+Brighten a dark batch by two thirds of a stop and set the white balance to 3400 K:
+
+```sh
+rawdog ./reception --exposure 0.67 --wb 3400
+```
+
+`--exposure` rolls off highlights instead of clipping them. `--wb` replaces the as-shot white balance of every file; add `--tint` to correct a green or magenta cast.
+
 Export for the web without location data, with your name and copyright:
 
 ```sh

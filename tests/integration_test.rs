@@ -472,3 +472,66 @@ fn cli_copyright_and_artist_are_written_to_every_format() {
         assert_eq!(text(exif::Tag::Copyright), "\"(c) Test\"", "{name}");
     }
 }
+
+/// Mean value of each channel of an image file.
+fn channel_means(path: &std::path::Path) -> [f64; 3] {
+    let img = image::open(path).unwrap().to_rgb8();
+    let n = (img.width() * img.height()) as f64;
+    let mut sums = [0.0; 3];
+    for p in img.pixels() {
+        for c in 0..3 {
+            sums[c] += p[c] as f64;
+        }
+    }
+    sums.map(|s| s / n)
+}
+
+fn convert_grey_with(args: &[&str]) -> [f64; 3] {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("grey.png");
+    // The decoder's full pipeline needs more than a few pixels per side.
+    image::RgbImage::from_pixel(64, 64, image::Rgb([100, 100, 100]))
+        .save(&input)
+        .unwrap();
+    let mut all: Vec<&std::ffi::OsStr> = vec![input.as_ref()];
+    all.extend(args.iter().map(|a| a.as_ref() as &std::ffi::OsStr));
+    let output = run(&all);
+    assert!(
+        output.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    channel_means(&tmp.path().join("grey.jpg"))
+}
+
+#[test]
+fn cli_exposure_brightens_and_darkens() {
+    let normal = convert_grey_with(&[])[1];
+    let up = convert_grey_with(&["--exposure", "1"])[1];
+    let down = convert_grey_with(&["--exposure", "-1"])[1];
+    assert!((normal - 100.0).abs() < 3.0, "normal {normal}");
+    assert!(up > normal + 20.0, "up {up} vs {normal}");
+    assert!(down < normal - 20.0, "down {down} vs {normal}");
+    assert!(up < 255.0);
+}
+
+#[test]
+fn cli_exposure_range_is_validated() {
+    let output = run(&["--exposure".as_ref(), "9".as_ref(), "/tmp/fake.arw".as_ref()]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn cli_wb_shifts_colour_in_the_expected_direction() {
+    // A low kelvin setting corrects for warm light, so the result is bluer.
+    let [r_low, _, b_low] = convert_grey_with(&["--wb", "3000"]);
+    let [r_high, _, b_high] = convert_grey_with(&["--wb", "9000"]);
+    assert!(b_low > r_low, "3000 K: r {r_low} b {b_low}");
+    assert!(r_high > b_high, "9000 K: r {r_high} b {b_high}");
+}
+
+#[test]
+fn cli_tint_requires_wb() {
+    let output = run(&["--tint".as_ref(), "1.2".as_ref(), "/tmp/fake.arw".as_ref()]);
+    assert_eq!(output.status.code(), Some(2));
+}
