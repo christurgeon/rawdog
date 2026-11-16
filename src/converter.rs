@@ -25,7 +25,7 @@ pub struct ConvertOptions {
 }
 
 /// Convert a single ARW file to the specified output format.
-pub fn convert_arw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<()> {
+pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<()> {
     let ConvertOptions {
         format,
         quality,
@@ -107,7 +107,7 @@ fn encode_jpeg(
 
     // Inject EXIF metadata into the JPEG if available. Failures here are
     // non-fatal: we still produce the output image.
-    let exif_data = exif_utils::extract_exif_from_arw(input, final_img.dimensions(), metadata)
+    let exif_data = exif_utils::extract_exif(input, final_img.dimensions(), metadata)
         .ok()
         .flatten();
     let final_bytes = match exif_data {
@@ -173,7 +173,7 @@ fn encode_png(
         .with_context(|| format!("Failed to encode PNG to {}", output.display()))?;
 
     // Inject EXIF metadata into the PNG if available.
-    let exif_data = exif_utils::extract_exif_from_arw(input, final_img.dimensions(), metadata)
+    let exif_data = exif_utils::extract_exif(input, final_img.dimensions(), metadata)
         .ok()
         .flatten();
     let final_bytes = match exif_data {
@@ -474,12 +474,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // convert_arw error handling tests
+    // convert_raw error handling tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn convert_arw_rejects_nonexistent_input() {
-        let result = convert_arw(
+    fn convert_raw_rejects_nonexistent_input() {
+        let result = convert_raw(
             Path::new("/nonexistent/photo.arw"),
             Path::new("/tmp/out.jpg"),
             &ConvertOptions {
@@ -494,12 +494,12 @@ mod tests {
     }
 
     #[test]
-    fn convert_arw_rejects_non_arw_file() {
+    fn convert_raw_rejects_non_arw_file() {
         // Create a temp file that is not a valid ARW
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), b"not a raw file").unwrap();
 
-        let result = convert_arw(
+        let result = convert_raw(
             tmp.path(),
             Path::new("/tmp/out.jpg"),
             &ConvertOptions {

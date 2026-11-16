@@ -58,7 +58,7 @@ pub fn read_fields_for_output(
 ///
 /// The blob is suitable for injection into JPEG (via img-parts `set_exif`)
 /// or PNG (via eXIf chunk). Returns `None` if no EXIF data could be extracted.
-pub fn extract_exif_from_arw(
+pub fn extract_exif(
     path: &Path,
     dims: (u32, u32),
     meta: &MetadataOptions,
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn extract_exif_returns_none_for_nonexistent_file() {
-        let result = extract_exif_from_arw(Path::new("/nonexistent/photo.arw"), (300, 200), &MetadataOptions::default());
+        let result = extract_exif(Path::new("/nonexistent/photo.arw"), (300, 200), &MetadataOptions::default());
         assert!(result.is_err());
     }
 
@@ -274,7 +274,7 @@ mod tests {
     fn extract_exif_returns_none_for_non_arw_file() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), b"not a raw file").unwrap();
-        let result = extract_exif_from_arw(tmp.path(), (300, 200), &MetadataOptions::default()).unwrap();
+        let result = extract_exif(tmp.path(), (300, 200), &MetadataOptions::default()).unwrap();
         assert!(result.is_none());
     }
 
@@ -344,14 +344,14 @@ mod tests {
         // imagepipe already rotates the pixels, so a copied Orientation of 6
         // would make viewers rotate the image a second time.
         let tmp = write_tiff_with_fields(&[orientation_field(6), description_field()]);
-        let data = extract_exif_from_arw(tmp.path(), (300, 200), &MetadataOptions::default()).unwrap().unwrap();
+        let data = extract_exif(tmp.path(), (300, 200), &MetadataOptions::default()).unwrap().unwrap();
         assert_eq!(orientation_of(&data), Some(1));
     }
 
     #[test]
     fn extract_exif_does_not_add_missing_orientation() {
         let tmp = write_tiff_with_fields(&[description_field()]);
-        let data = extract_exif_from_arw(tmp.path(), (300, 200), &MetadataOptions::default()).unwrap().unwrap();
+        let data = extract_exif(tmp.path(), (300, 200), &MetadataOptions::default()).unwrap().unwrap();
         assert_eq!(orientation_of(&data), None);
     }
 
@@ -575,7 +575,7 @@ mod tests {
             copyright: Some("(c) Test".to_string()),
             ..Default::default()
         };
-        let data = extract_exif_from_arw(tmp.path(), (300, 200), &meta)
+        let data = extract_exif(tmp.path(), (300, 200), &meta)
             .unwrap()
             .unwrap();
         let parsed = exif::Reader::new().read_raw(data).unwrap();

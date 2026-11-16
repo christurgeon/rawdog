@@ -38,7 +38,7 @@ fn cli_nonexistent_input_reports_no_arw_files() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = format!("{stderr}{stdout}");
     assert!(
-        combined.contains("No ARW files") || combined.contains("does not exist"),
+        combined.contains("No RAW files") || combined.contains("does not exist"),
         "Expected missing-file message, got: {combined}"
     );
 }
@@ -55,8 +55,8 @@ fn cli_empty_directory_reports_no_arw_files() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = format!("{stderr}{stdout}");
     assert!(
-        combined.contains("No ARW files"),
-        "Expected 'No ARW files' message, got: {combined}"
+        combined.contains("No RAW files"),
+        "Expected 'No RAW files' message, got: {combined}"
     );
 }
 
@@ -64,7 +64,7 @@ fn cli_empty_directory_reports_no_arw_files() {
 fn cli_directory_with_only_non_arw_files() {
     let tmp = TempDir::new().unwrap();
     fs::write(tmp.path().join("photo.jpg"), b"fake").unwrap();
-    fs::write(tmp.path().join("photo.cr2"), b"fake").unwrap();
+    fs::write(tmp.path().join("photo.xmp"), b"fake").unwrap();
 
     let output = Command::new(rawdog_bin())
         .arg(tmp.path())
@@ -75,8 +75,8 @@ fn cli_directory_with_only_non_arw_files() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = format!("{stderr}{stdout}");
     assert!(
-        combined.contains("No ARW files"),
-        "Expected 'No ARW files', got: {combined}"
+        combined.contains("No RAW files"),
+        "Expected 'No RAW files', got: {combined}"
     );
 }
 
@@ -300,7 +300,7 @@ fn cli_directory_named_like_arw_is_not_an_input() {
 
     let output = run(&[tmp.path().as_ref()]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("No ARW files"), "got: {stderr}");
+    assert!(stderr.contains("No RAW files"), "got: {stderr}");
 }
 
 #[test]

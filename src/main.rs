@@ -24,7 +24,8 @@ pub enum OutputFormat {
 #[derive(Parser)]
 #[command(name = "rawdog", version, about = "Raw files in, images out. No Lightroom, no fuss.")]
 struct Cli {
-    /// One or more ARW files or directories containing ARW files
+    /// One or more RAW files, or directories that contain RAW files.
+    /// Sony ARW and most other camera RAW formats are accepted
     #[arg(required_unless_present = "completions")]
     input: Vec<PathBuf>,
 
@@ -73,7 +74,7 @@ struct Cli {
     #[arg(long)]
     overwrite: bool,
 
-    /// Recurse into subdirectories when scanning for ARW files
+    /// Recurse into subdirectories when scanning for RAW files
     #[arg(short = 'R', long)]
     recursive: bool,
 
@@ -107,16 +108,16 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Collect all ARW files from inputs
-    let files = collect_arw_files(&cli.input, cli.recursive)?;
-    // Same condition under which collect_arw_files warns "does not exist".
+    // Collect all RAW files from inputs
+    let files = collect_raw_files(&cli.input, cli.recursive)?;
+    // Same condition under which collect_raw_files warns "does not exist".
     let missing_inputs = cli.input.iter().any(|p| !p.is_dir() && !p.is_file());
 
     if files.is_empty() {
         if missing_inputs {
-            bail!("No ARW files found: one or more input paths do not exist.");
+            bail!("No RAW files found: one or more input paths do not exist.");
         }
-        bail!("No ARW files found in the provided inputs.");
+        bail!("No RAW files found in the provided inputs.");
     }
 
     let jobs = plan_outputs(&files, cli.output.as_deref(), cli.format)?;
@@ -144,7 +145,7 @@ fn main() -> Result<()> {
     }
 
     if !cli.quiet {
-        println!("Found {} ARW file(s)", files.len());
+        println!("Found {} RAW file(s)", files.len());
     }
 
     let opts = converter::ConvertOptions {
@@ -203,7 +204,7 @@ fn main() -> Result<()> {
         // The RAW decoder can panic on corrupt files. Report that as a
         // failure of this file instead of aborting the batch.
         let result = std::panic::catch_unwind(|| {
-            converter::convert_arw(input_path, output_path, &opts)
+            converter::convert_raw(input_path, output_path, &opts)
         })
         .unwrap_or_else(|_| Err(anyhow!("decoder panicked; the file is probably corrupt")));
 
@@ -265,7 +266,7 @@ struct InputFile {
 /// Paths can be individual files or directories.
 /// When `recursive` is true, directories are scanned recursively.
 /// Inputs that resolve to the same file are kept only once.
-fn collect_arw_files(inputs: &[PathBuf], recursive: bool) -> Result<Vec<InputFile>> {
+fn collect_raw_files(inputs: &[PathBuf], recursive: bool) -> Result<Vec<InputFile>> {
     let mut files = Vec::new();
 
     for path in inputs {
@@ -283,7 +284,7 @@ fn collect_arw_files(inputs: &[PathBuf], recursive: bool) -> Result<Vec<InputFil
                     });
                 for entry in walker {
                     let p = entry.into_path();
-                    if p.is_file() && is_arw(&p) {
+                    if p.is_file() && is_raw(&p) {
                         let rel_dir = p
                             .parent()
                             .and_then(|d| d.strip_prefix(path).ok())
@@ -296,7 +297,7 @@ fn collect_arw_files(inputs: &[PathBuf], recursive: bool) -> Result<Vec<InputFil
                 for entry in std::fs::read_dir(path)? {
                     let entry = entry?;
                     let p = entry.path();
-                    if p.is_file() && is_arw(&p) {
+                    if p.is_file() && is_raw(&p) {
                         files.push(InputFile {
                             path: p,
                             rel_dir: PathBuf::new(),
@@ -364,9 +365,16 @@ fn plan_outputs(
     Ok(jobs)
 }
 
-fn is_arw(path: &Path) -> bool {
+/// File extensions of the RAW formats that the decoder supports.
+const RAW_EXTENSIONS: &[&str] = &[
+    "arw", "srf", "sr2", "dng", "cr2", "crw", "nef", "nrw", "raf", "orf", "rw2", "pef", "srw",
+    "erf", "kdc", "dcr", "dcs", "mef", "mos", "iiq", "3fr", "mrw", "x3f", "ari",
+];
+
+fn is_raw(path: &Path) -> bool {
     path.extension()
-        .map(|ext| ext.eq_ignore_ascii_case("arw"))
+        .and_then(|ext| ext.to_str())
+        .map(|ext| RAW_EXTENSIONS.iter().any(|raw| ext.eq_ignore_ascii_case(raw)))
         .unwrap_or(false)
 }
 
@@ -393,70 +401,77 @@ mod tests {
     use tempfile::TempDir;
 
     // -----------------------------------------------------------------------
-    // is_arw tests
+    // is_raw tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn is_arw_lowercase() {
-        assert!(is_arw(Path::new("photo.arw")));
+    fn is_raw_lowercase() {
+        assert!(is_raw(Path::new("photo.arw")));
     }
 
     #[test]
-    fn is_arw_uppercase() {
-        assert!(is_arw(Path::new("PHOTO.ARW")));
+    fn is_raw_uppercase() {
+        assert!(is_raw(Path::new("PHOTO.ARW")));
     }
 
     #[test]
-    fn is_arw_mixed_case() {
-        assert!(is_arw(Path::new("photo.Arw")));
-        assert!(is_arw(Path::new("photo.aRW")));
-        assert!(is_arw(Path::new("photo.ArW")));
+    fn is_raw_mixed_case() {
+        assert!(is_raw(Path::new("photo.Arw")));
+        assert!(is_raw(Path::new("photo.aRW")));
+        assert!(is_raw(Path::new("photo.ArW")));
     }
 
     #[test]
-    fn is_arw_rejects_non_arw_extensions() {
-        assert!(!is_arw(Path::new("photo.jpg")));
-        assert!(!is_arw(Path::new("photo.cr2")));
-        assert!(!is_arw(Path::new("photo.nef")));
-        assert!(!is_arw(Path::new("photo.tiff")));
-        assert!(!is_arw(Path::new("photo.png")));
+    fn is_raw_rejects_non_arw_extensions() {
+        assert!(!is_raw(Path::new("photo.jpg")));
+        assert!(!is_raw(Path::new("photo.xmp")));
+        assert!(!is_raw(Path::new("photo.heic")));
+        assert!(!is_raw(Path::new("photo.tiff")));
+        assert!(!is_raw(Path::new("photo.png")));
     }
 
     #[test]
-    fn is_arw_no_extension() {
-        assert!(!is_arw(Path::new("photo")));
-        assert!(!is_arw(Path::new("/some/path/noext")));
+    fn is_raw_no_extension() {
+        assert!(!is_raw(Path::new("photo")));
+        assert!(!is_raw(Path::new("/some/path/noext")));
     }
 
     #[test]
-    fn is_arw_empty_path() {
-        assert!(!is_arw(Path::new("")));
+    fn is_raw_empty_path() {
+        assert!(!is_raw(Path::new("")));
     }
 
     #[test]
-    fn is_arw_hidden_file() {
-        assert!(is_arw(Path::new(".hidden.arw")));
+    fn is_raw_hidden_file() {
+        assert!(is_raw(Path::new(".hidden.arw")));
     }
 
     #[test]
-    fn is_arw_dotfile_named_arw() {
+    fn is_raw_dotfile_named_arw() {
         // ".arw" as a dotfile: on Unix, Path sees no stem and extension "arw"
         // actually Path::new(".arw").extension() is None (it is treated as a
         // hidden file with no extension), so this should be false.
-        assert!(!is_arw(Path::new(".arw")));
+        assert!(!is_raw(Path::new(".arw")));
     }
 
     #[test]
-    fn is_arw_double_extension() {
+    fn is_raw_double_extension() {
         // "photo.old.arw" -> extension is "arw", should be true
-        assert!(is_arw(Path::new("photo.old.arw")));
+        assert!(is_raw(Path::new("photo.old.arw")));
     }
 
     #[test]
-    fn is_arw_similar_extension() {
-        assert!(!is_arw(Path::new("photo.arw2")));
-        assert!(!is_arw(Path::new("photo.arwx")));
-        assert!(!is_arw(Path::new("photo.raw")));
+    fn is_raw_similar_extension() {
+        assert!(!is_raw(Path::new("photo.arw2")));
+        assert!(!is_raw(Path::new("photo.arwx")));
+        assert!(!is_raw(Path::new("photo.raw")));
+    }
+
+    #[test]
+    fn is_raw_accepts_other_camera_formats() {
+        for name in ["a.CR2", "a.nef", "a.dng", "a.RAF", "a.orf", "a.rw2", "a.pef", "a.3fr"] {
+            assert!(is_raw(Path::new(name)), "{name}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -540,77 +555,77 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // collect_arw_files tests (non-recursive mode)
+    // collect_raw_files tests (non-recursive mode)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn collect_arw_files_empty_directory() {
+    fn collect_raw_files_empty_directory() {
         let tmp = TempDir::new().unwrap();
         let inputs = vec![tmp.path().to_path_buf()];
-        let files = collect_arw_files(&inputs, false).unwrap();
+        let files = collect_raw_files(&inputs, false).unwrap();
         assert!(files.is_empty());
     }
 
     #[test]
-    fn collect_arw_files_finds_arw_in_directory() {
+    fn collect_raw_files_finds_arw_in_directory() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("photo1.arw"), b"fake").unwrap();
         fs::write(tmp.path().join("photo2.ARW"), b"fake").unwrap();
         fs::write(tmp.path().join("photo3.Arw"), b"fake").unwrap();
 
         let inputs = vec![tmp.path().to_path_buf()];
-        let files = collect_arw_files(&inputs, false).unwrap();
+        let files = collect_raw_files(&inputs, false).unwrap();
         assert_eq!(files.len(), 3);
     }
 
     #[test]
-    fn collect_arw_files_ignores_non_arw_in_directory() {
+    fn collect_raw_files_ignores_non_arw_in_directory() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("photo.arw"), b"fake").unwrap();
         fs::write(tmp.path().join("photo.jpg"), b"fake").unwrap();
-        fs::write(tmp.path().join("photo.cr2"), b"fake").unwrap();
+        fs::write(tmp.path().join("photo.xmp"), b"fake").unwrap();
         fs::write(tmp.path().join("readme.txt"), b"fake").unwrap();
 
         let inputs = vec![tmp.path().to_path_buf()];
-        let files = collect_arw_files(&inputs, false).unwrap();
+        let files = collect_raw_files(&inputs, false).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].path.to_string_lossy().contains("photo.arw"));
     }
 
     #[test]
-    fn collect_arw_files_accepts_individual_files() {
+    fn collect_raw_files_accepts_individual_files() {
         let tmp = TempDir::new().unwrap();
         let arw_path = tmp.path().join("single.arw");
         fs::write(&arw_path, b"fake").unwrap();
 
         let inputs = vec![arw_path.clone()];
-        let files = collect_arw_files(&inputs, false).unwrap();
+        let files = collect_raw_files(&inputs, false).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, arw_path);
     }
 
     #[test]
-    fn collect_arw_files_individual_file_not_filtered_by_ext() {
+    fn collect_raw_files_individual_file_not_filtered_by_ext() {
         let tmp = TempDir::new().unwrap();
         let jpg_path = tmp.path().join("photo.jpg");
         fs::write(&jpg_path, b"fake").unwrap();
 
         // Individual file paths are passed through without extension checking
         let inputs = vec![jpg_path.clone()];
-        let files = collect_arw_files(&inputs, false).unwrap();
+        let files = collect_raw_files(&inputs, false).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, jpg_path);
     }
 
     #[test]
-    fn collect_arw_files_nonexistent_path_is_skipped() {
+    fn collect_raw_files_nonexistent_path_is_skipped() {
         let inputs = vec![PathBuf::from("/nonexistent/path/photo.arw")];
-        let files = collect_arw_files(&inputs, false).unwrap();
+        let files = collect_raw_files(&inputs, false).unwrap();
         assert!(files.is_empty());
     }
 
     #[test]
-    fn collect_arw_files_mixed_dirs_and_files() {
+    fn collect_raw_files_mixed_dirs_and_files() {
         let tmp = TempDir::new().unwrap();
 
         let subdir = tmp.path().join("album");
@@ -623,20 +638,20 @@ mod tests {
         fs::write(&single, b"fake").unwrap();
 
         let inputs = vec![subdir.clone(), single.clone()];
-        let files = collect_arw_files(&inputs, false).unwrap();
+        let files = collect_raw_files(&inputs, false).unwrap();
         // 2 from dir + 1 individual file
         assert_eq!(files.len(), 3);
     }
 
     #[test]
-    fn collect_arw_files_results_are_sorted() {
+    fn collect_raw_files_results_are_sorted() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("z_photo.arw"), b"fake").unwrap();
         fs::write(tmp.path().join("a_photo.arw"), b"fake").unwrap();
         fs::write(tmp.path().join("m_photo.arw"), b"fake").unwrap();
 
         let inputs = vec![tmp.path().to_path_buf()];
-        let files = collect_arw_files(&inputs, false).unwrap();
+        let files = collect_raw_files(&inputs, false).unwrap();
         assert_eq!(files.len(), 3);
 
         let names: Vec<String> = files
@@ -647,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_arw_files_does_not_recurse_by_default() {
+    fn collect_raw_files_does_not_recurse_by_default() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("top.arw"), b"fake").unwrap();
 
@@ -656,13 +671,13 @@ mod tests {
         fs::write(nested.join("deep.arw"), b"fake").unwrap();
 
         let inputs = vec![tmp.path().to_path_buf()];
-        let files = collect_arw_files(&inputs, false).unwrap();
+        let files = collect_raw_files(&inputs, false).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].path.to_string_lossy().contains("top.arw"));
     }
 
     #[test]
-    fn collect_arw_files_recurse_finds_nested() {
+    fn collect_raw_files_recurse_finds_nested() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("top.arw"), b"fake").unwrap();
 
@@ -675,12 +690,12 @@ mod tests {
         fs::write(deep.join("very_deep.arw"), b"fake").unwrap();
 
         let inputs = vec![tmp.path().to_path_buf()];
-        let files = collect_arw_files(&inputs, true).unwrap();
+        let files = collect_raw_files(&inputs, true).unwrap();
         assert_eq!(files.len(), 3);
     }
 
     #[test]
-    fn collect_arw_files_recurse_ignores_non_arw() {
+    fn collect_raw_files_recurse_ignores_non_arw() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("top.arw"), b"fake").unwrap();
         fs::write(tmp.path().join("top.jpg"), b"fake").unwrap();
@@ -691,19 +706,19 @@ mod tests {
         fs::write(nested.join("deep.txt"), b"fake").unwrap();
 
         let inputs = vec![tmp.path().to_path_buf()];
-        let files = collect_arw_files(&inputs, true).unwrap();
+        let files = collect_raw_files(&inputs, true).unwrap();
         assert_eq!(files.len(), 2);
     }
 
     #[test]
-    fn collect_arw_files_removes_duplicate_inputs() {
+    fn collect_raw_files_removes_duplicate_inputs() {
         let tmp = TempDir::new().unwrap();
         let arw = tmp.path().join("photo.arw");
         fs::write(&arw, b"fake").unwrap();
         let dotted = tmp.path().join(".").join("photo.arw");
 
         let inputs = vec![tmp.path().to_path_buf(), arw.clone(), dotted];
-        let files = collect_arw_files(&inputs, false).unwrap();
+        let files = collect_raw_files(&inputs, false).unwrap();
         assert_eq!(files.len(), 1);
     }
 
@@ -721,7 +736,7 @@ mod tests {
         fs::write(input.join("a/deep/x.arw"), b"fake").unwrap();
         fs::write(input.join("b/x.arw"), b"fake").unwrap();
 
-        let files = collect_arw_files(&[input], true).unwrap();
+        let files = collect_raw_files(&[input], true).unwrap();
         let out = Path::new("/out");
         let jobs = plan_outputs(&files, Some(out), OutputFormat::Jpeg).unwrap();
         let outputs: Vec<&Path> = jobs.iter().map(|(_, o)| o.as_path()).collect();
@@ -742,7 +757,7 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("x.arw"), b"fake").unwrap();
 
-        let files = collect_arw_files(&[nested.join("x.arw")], true).unwrap();
+        let files = collect_raw_files(&[nested.join("x.arw")], true).unwrap();
         let jobs = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Png).unwrap();
         assert_eq!(jobs[0].1, PathBuf::from("/out/x.png"));
     }
@@ -753,7 +768,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("a")).unwrap();
         fs::write(tmp.path().join("a/x.arw"), b"fake").unwrap();
 
-        let files = collect_arw_files(&[tmp.path().to_path_buf()], true).unwrap();
+        let files = collect_raw_files(&[tmp.path().to_path_buf()], true).unwrap();
         let jobs = plan_outputs(&files, None, OutputFormat::Jpeg).unwrap();
         assert_eq!(jobs[0].1, tmp.path().join("a/x.jpg"));
     }
@@ -768,7 +783,7 @@ mod tests {
         let a = tmp.path().join("a/x.arw");
         let b = tmp.path().join("b/x.arw");
 
-        let files = collect_arw_files(&[a.clone(), b.clone()], false).unwrap();
+        let files = collect_raw_files(&[a.clone(), b.clone()], false).unwrap();
         let err = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Jpeg)
             .expect_err("expected a conflict error");
         let msg = err.to_string();
@@ -783,14 +798,14 @@ mod tests {
         fs::write(tmp.path().join("x.png"), b"fake").unwrap();
 
         let inputs = vec![tmp.path().join("x.arw"), tmp.path().join(".").join("x.png")];
-        let files = collect_arw_files(&inputs, false).unwrap();
+        let files = collect_raw_files(&inputs, false).unwrap();
         assert!(plan_outputs(&files, None, OutputFormat::Jpeg).is_err());
     }
 
     #[test]
-    fn collect_arw_files_empty_inputs() {
+    fn collect_raw_files_empty_inputs() {
         let inputs: Vec<PathBuf> = vec![];
-        let files = collect_arw_files(&inputs, false).unwrap();
+        let files = collect_raw_files(&inputs, false).unwrap();
         assert!(files.is_empty());
     }
 }
