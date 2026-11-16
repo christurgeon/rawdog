@@ -1,4 +1,4 @@
-use std::io::{BufReader, Cursor, Seek, Write};
+use std::io::{Cursor, Seek, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -16,42 +16,72 @@ pub struct MetadataOptions {
     pub copyright: Option<String>,
 }
 
+/// Read the EXIF data of a source file.
+///
+/// `Ok(None)` means the file has no EXIF data that can be read. Besides
+/// standard TIFF and JPEG containers this reads:
+/// - Fujifilm RAF, which stores its metadata in an embedded JPEG preview;
+/// - Panasonic RW2 and Olympus ORF, which are TIFF files with their own
+///   magic number in the header.
+pub fn read_source_exif(path: &Path) -> Result<Option<exif::Exif>> {
+    let mut data = std::fs::read(path)
+        .with_context(|| format!("Failed to open {} for EXIF extraction", path.display()))?;
+    let reader = {
+        let mut reader = exif::Reader::new();
+        reader.continue_on_error(true);
+        reader
+    };
+
+    let result = if data.starts_with(b"FUJIFILMCCD-RAW") {
+        // Big-endian offset and length of the JPEG preview at bytes 84 and 88.
+        let u32_at = |i: usize| {
+            data.get(i..i + 4)
+                .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        };
+        let jpeg = u32_at(84)
+            .zip(u32_at(88))
+            .and_then(|(offset, len)| data.get(offset..offset.checked_add(len)?));
+        match jpeg {
+            Some(jpeg) => reader.read_from_container(&mut Cursor::new(jpeg)),
+            None => return Ok(None),
+        }
+    } else {
+        match data.get(..4) {
+            // RW2 ("IIU\0") and ORF ("IIRO", "IIRS").
+            Some([b'I', b'I', 0x55, 0x00] | [b'I', b'I', b'R', b'O' | b'S']) => {
+                data[2..4].copy_from_slice(&[0x2a, 0x00]);
+            }
+            // Big-endian ORF ("MMOR").
+            Some([b'M', b'M', b'O', b'R']) => data[2..4].copy_from_slice(&[0x00, 0x2a]),
+            _ => {}
+        }
+        reader.read_from_container(&mut Cursor::new(&data))
+    };
+
+    match result {
+        Ok(exif) => Ok(Some(exif)),
+        // Accept partial results -- some fields are better than none.
+        Err(exif::Error::PartialResult(partial)) => Ok(Some(partial.into_inner().0)),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Read the EXIF fields of a source file, prepared for an output image with
 /// the given pixel dimensions.
 ///
 /// Returns the fields and the source byte order (`true` = little endian), or
-/// `None` if the file has no usable EXIF data.
+/// `None` if there is nothing to write.
 pub fn read_fields_for_output(
     path: &Path,
     dims: (u32, u32),
     meta: &MetadataOptions,
 ) -> Result<Option<(Vec<exif::Field>, bool)>> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("Failed to open {} for EXIF extraction", path.display()))?;
-    let mut reader = BufReader::new(file);
-
-    let exif = match exif::Reader::new()
-        .continue_on_error(true)
-        .read_from_container(&mut reader)
-    {
-        Ok(exif) => exif,
-        Err(exif::Error::PartialResult(partial)) => {
-            // Accept partial results -- some fields are better than none.
-            let (exif, _errors) = partial.into_inner();
-            exif
-        }
-        // No source EXIF. Artist and copyright can still be written.
-        Err(_) => {
-            let fields = fields_for_output(std::iter::empty(), dims, meta);
-            return Ok((!fields.is_empty()).then_some((fields, true)));
-        }
+    // Without source EXIF, artist and copyright can still be written.
+    let (fields, little_endian) = match read_source_exif(path)? {
+        Some(exif) => (fields_for_output(exif.fields(), dims, meta), exif.little_endian()),
+        None => (fields_for_output(std::iter::empty(), dims, meta), true),
     };
-
-    let fields = fields_for_output(exif.fields(), dims, meta);
-    if fields.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some((fields, exif.little_endian())))
+    Ok((!fields.is_empty()).then_some((fields, little_endian)))
 }
 
 /// Extract EXIF from a source ARW (TIFF-based) file as a TIFF byte blob.
@@ -91,27 +121,47 @@ pub fn extract_exif(
 /// for the converted image, and some hold offsets into the source file.
 fn describes_source_layout(tag: exif::Tag) -> bool {
     use exif::{Context, Tag};
-    const SUB_IFDS: Tag = Tag(Context::Tiff, 0x14a);
-    const DNG_PRIVATE_DATA: Tag = Tag(Context::Tiff, 0xc634);
-    [
-        Tag::ImageWidth,
-        Tag::ImageLength,
-        Tag::BitsPerSample,
-        Tag::Compression,
-        Tag::PhotometricInterpretation,
-        Tag::SamplesPerPixel,
-        Tag::RowsPerStrip,
-        Tag::PlanarConfiguration,
-        Tag::YCbCrCoefficients,
-        Tag::YCbCrSubSampling,
-        Tag::YCbCrPositioning,
-        Tag::ReferenceBlackWhite,
-        // The Sony MakerNote uses offsets from the start of the ARW file.
-        Tag::MakerNote,
-        SUB_IFDS,
-        DNG_PRIVATE_DATA,
-    ]
-    .contains(&tag)
+    match tag {
+        // Below the first baseline TIFF tag: maker-specific RAW layout tags
+        // (Panasonic RW2). From PrintIM upward: printer hints, and DNG tags
+        // that would make software treat the output as a DNG file.
+        Tag(Context::Tiff, n) if !(0xfe..0xc4a5).contains(&n) => true,
+        Tag(Context::Tiff, n) => [
+            0xfe,   // NewSubfileType: can mark the image as a preview
+            0xff,   // SubfileType
+            0x14a,  // SubIFDs: offsets into the source file
+            0x2bc,  // XMP packet: large, and can repeat stripped fields
+            0x828d, // CFARepeatPatternDim
+            0x828e, // CFAPattern
+            0x9216, // TIFF/EP standard ID
+            0x9217, // TIFF/EP SensingMethod
+        ]
+        .contains(&n)
+            || [
+                Tag::ImageWidth,
+                Tag::ImageLength,
+                Tag::BitsPerSample,
+                Tag::Compression,
+                Tag::PhotometricInterpretation,
+                Tag::SamplesPerPixel,
+                Tag::RowsPerStrip,
+                Tag::PlanarConfiguration,
+                Tag::YCbCrCoefficients,
+                Tag::YCbCrSubSampling,
+                Tag::YCbCrPositioning,
+                Tag::ReferenceBlackWhite,
+            ]
+            .contains(&tag),
+        _ => [
+            // The Sony MakerNote uses offsets from the start of the ARW file.
+            Tag::MakerNote,
+            Tag::CFAPattern,
+            Tag::SensingMethod,
+            Tag::CompressedBitsPerPixel,
+            Tag::ComponentsConfiguration,
+        ]
+        .contains(&tag),
+    }
 }
 
 /// Prepare source EXIF fields for the converted image.
@@ -207,12 +257,23 @@ pub fn write_tiff_16bit_with_exif<W: Write + Seek>(
         .map_err(|e| anyhow::anyhow!("Failed to write TIFF with EXIF: {}", e))
 }
 
+const JPEG_EXIF_MAX: usize = 65_533 - 6;
+
 /// Inject raw EXIF bytes (a TIFF blob) into an already-encoded JPEG buffer.
 ///
 /// Returns the new JPEG bytes with the EXIF data embedded in an APP1 segment.
 pub fn inject_exif_into_jpeg(jpeg_bytes: &[u8], exif_data: &[u8]) -> Result<Vec<u8>> {
     use img_parts::jpeg::Jpeg;
     use img_parts::ImageEXIF;
+
+    // A JPEG segment holds at most 65,533 bytes, 6 of them for the "Exif"
+    // header. img-parts panics above that size.
+    if exif_data.len() > JPEG_EXIF_MAX {
+        anyhow::bail!(
+            "EXIF data of {} bytes does not fit in a JPEG segment",
+            exif_data.len()
+        );
+    }
 
     let mut jpeg = Jpeg::from_bytes(jpeg_bytes.to_vec().into())
         .map_err(|e| anyhow::anyhow!("Failed to parse JPEG for EXIF injection: {}", e))?;
@@ -583,6 +644,111 @@ mod tests {
             .get_field(exif::Tag::Copyright, exif::In::PRIMARY)
             .unwrap();
         assert_eq!(c.display_value().to_string(), "\"(c) Test\"");
+    }
+
+    #[test]
+    fn fields_for_output_drops_tags_that_describe_the_raw_data() {
+        use exif::{Context, In, Tag, Value};
+        let short = |tag| field(tag, In::PRIMARY, Value::Short(vec![1]));
+        let source = [
+            description_field(),
+            short(Tag(Context::Tiff, 0xfe)),   // NewSubfileType
+            short(Tag(Context::Tiff, 0x2bc)),  // XMP
+            short(Tag(Context::Tiff, 0x828e)), // CFAPattern (TIFF/EP)
+            short(Tag(Context::Tiff, 0xc4a5)), // PrintIM
+            short(Tag(Context::Tiff, 0xc612)), // DNGVersion
+            short(Tag(Context::Tiff, 0x02)),   // Panasonic RW2 sensor width
+            short(Tag::CFAPattern),
+            short(Tag::SensingMethod),
+            short(Tag::ComponentsConfiguration),
+            field(Tag::Model, In::PRIMARY, Value::Ascii(vec![b"Cam".to_vec()])),
+            short(Tag::ISOSpeed),
+        ];
+        let out = fields_for_output(source.iter(), (300, 200), &MetadataOptions::default());
+        assert_eq!(
+            tags(&out),
+            vec![Tag::ImageDescription, Tag::Model, Tag::ISOSpeed]
+        );
+    }
+
+    #[test]
+    fn inject_exif_into_jpeg_rejects_data_larger_than_a_segment() {
+        let img: image::RgbImage = image::ImageBuffer::from_pixel(2, 2, image::Rgb([1u8, 2, 3]));
+        let mut jpeg_buf = Vec::new();
+        img.write_with_encoder(image::codecs::jpeg::JpegEncoder::new(&mut jpeg_buf))
+            .unwrap();
+        assert!(inject_exif_into_jpeg(&jpeg_buf, &vec![0u8; JPEG_EXIF_MAX + 1]).is_err());
+        assert!(inject_exif_into_jpeg(&jpeg_buf, &vec![0u8; JPEG_EXIF_MAX]).is_ok());
+    }
+
+    /// The EXIF blob of a small TIFF file with a Model field.
+    fn tiff_with_model() -> Vec<u8> {
+        let tmp = write_tiff_with_fields(&[field(
+            exif::Tag::Model,
+            exif::In::PRIMARY,
+            exif::Value::Ascii(vec![b"Cam".to_vec()]),
+        )]);
+        std::fs::read(tmp.path()).unwrap()
+    }
+
+    fn model_of(bytes: &[u8]) -> Option<String> {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), bytes).unwrap();
+        let exif = read_source_exif(tmp.path()).unwrap()?;
+        let model = exif.get_field(exif::Tag::Model, exif::In::PRIMARY)?;
+        Some(model.display_value().to_string())
+    }
+
+    #[test]
+    fn read_source_exif_accepts_rw2_and_orf_headers() {
+        let field = field(
+            exif::Tag::Model,
+            exif::In::PRIMARY,
+            exif::Value::Ascii(vec![b"Cam".to_vec()]),
+        );
+        let tiff = |little_endian: bool| {
+            let mut writer = exif::experimental::Writer::new();
+            writer.push_field(&field);
+            let mut buf = Cursor::new(Vec::new());
+            writer.write(&mut buf, little_endian).unwrap();
+            buf.into_inner()
+        };
+
+        // Little endian: plain TIFF, RW2, and the two ORF variants.
+        for magic in [[0x2au8, 0x00], [0x55, 0x00], *b"RO", *b"RS"] {
+            let mut raw = tiff(true);
+            assert_eq!(&raw[..2], b"II");
+            raw[2..4].copy_from_slice(&magic);
+            assert_eq!(model_of(&raw).as_deref(), Some("\"Cam\""), "{magic:?}");
+        }
+        // Big endian: plain TIFF and ORF.
+        for magic in [[0x00u8, 0x2a], *b"OR"] {
+            let mut raw = tiff(false);
+            assert_eq!(&raw[..2], b"MM");
+            raw[2..4].copy_from_slice(&magic);
+            assert_eq!(model_of(&raw).as_deref(), Some("\"Cam\""), "{magic:?}");
+        }
+    }
+
+    #[test]
+    fn read_source_exif_reads_the_jpeg_preview_of_a_raf_file() {
+        // A JPEG that carries EXIF.
+        let img: image::RgbImage = image::ImageBuffer::from_pixel(2, 2, image::Rgb([1u8, 2, 3]));
+        let mut jpeg = Vec::new();
+        img.write_with_encoder(image::codecs::jpeg::JpegEncoder::new(&mut jpeg))
+            .unwrap();
+        let jpeg = inject_exif_into_jpeg(&jpeg, &tiff_with_model()).unwrap();
+
+        let mut raf = b"FUJIFILMCCD-RAW ".to_vec();
+        raf.resize(100, 0);
+        raf[84..88].copy_from_slice(&100u32.to_be_bytes());
+        raf[88..92].copy_from_slice(&(jpeg.len() as u32).to_be_bytes());
+        raf.extend_from_slice(&jpeg);
+        assert_eq!(model_of(&raf).as_deref(), Some("\"Cam\""));
+
+        // A header that points outside the file is not an error.
+        raf[88..92].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(model_of(&raf), None);
     }
 
     #[test]

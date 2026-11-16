@@ -1,6 +1,5 @@
 //! Output file naming from a template such as `{date}/{model}_{stem}`.
 
-use std::io::BufReader;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
@@ -109,16 +108,8 @@ impl NameInfo {
         if !needs_exif {
             return info;
         }
-        let Ok(file) = std::fs::File::open(path) else {
+        let Ok(Some(exif)) = crate::exif::read_source_exif(path) else {
             return info;
-        };
-        let exif = match exif::Reader::new()
-            .continue_on_error(true)
-            .read_from_container(&mut BufReader::new(file))
-        {
-            Ok(exif) => exif,
-            Err(exif::Error::PartialResult(partial)) => partial.into_inner().0,
-            Err(_) => return info,
         };
 
         let ascii = |tag| match exif.get_field(tag, exif::In::PRIMARY).map(|f| &f.value) {
