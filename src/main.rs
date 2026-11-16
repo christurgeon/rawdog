@@ -1,6 +1,7 @@
 mod converter;
 mod exif;
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -67,10 +68,14 @@ fn main() -> Result<()> {
 
     // Collect all ARW files from inputs
     let files = collect_arw_files(&cli.input, cli.recursive)?;
+    // Same condition under which collect_arw_files warns "does not exist".
+    let missing_inputs = cli.input.iter().any(|p| !p.is_dir() && !p.is_file());
 
     if files.is_empty() {
         bail!("No ARW files found in the provided inputs.");
     }
+
+    let jobs = plan_outputs(&files, cli.output.as_deref(), cli.format)?;
 
     println!("Found {} ARW file(s)", files.len());
 
@@ -78,7 +83,7 @@ fn main() -> Result<()> {
     let failed = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
 
-    let pb = ProgressBar::new(files.len() as u64);
+    let pb = ProgressBar::new(jobs.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
@@ -86,8 +91,19 @@ fn main() -> Result<()> {
             .progress_chars("=> "),
     );
 
-    files.par_iter().for_each(|input_path| {
-        let output_path = make_output_path(input_path, cli.output.as_deref(), cli.format);
+    jobs.par_iter().for_each(|(input_path, output_path)| {
+        if output_path.exists() && canonical(output_path) == canonical(input_path) {
+            pb.suspend(|| {
+                eprintln!(
+                    "Error converting {}: output path {} is the same file as the input",
+                    input_path.display(),
+                    output_path.display()
+                );
+            });
+            failed.fetch_add(1, Ordering::Relaxed);
+            pb.inc(1);
+            return;
+        }
 
         // Skip if exists and overwrite is not set
         if !cli.overwrite && output_path.exists() {
@@ -96,8 +112,7 @@ fn main() -> Result<()> {
             return;
         }
 
-        match converter::convert_arw(input_path, &output_path, cli.format, cli.quality, cli.resize)
-        {
+        match converter::convert_arw(input_path, output_path, cli.format, cli.quality, cli.resize) {
             Ok(()) => {
                 succeeded.fetch_add(1, Ordering::Relaxed);
             }
@@ -120,13 +135,26 @@ fn main() -> Result<()> {
 
     println!("{s} succeeded, {f} failed, {sk} skipped");
 
+    if f > 0 || missing_inputs {
+        std::process::exit(1);
+    }
+
     Ok(())
+}
+
+/// An input file and where its output goes relative to the `-o` directory.
+struct InputFile {
+    path: PathBuf,
+    /// Parent of `path` relative to the scanned input directory. Empty for
+    /// explicit file arguments and for files at the top of a scanned directory.
+    rel_dir: PathBuf,
 }
 
 /// Collect all `.arw`/`.ARW` files from the given paths.
 /// Paths can be individual files or directories.
 /// When `recursive` is true, directories are scanned recursively.
-fn collect_arw_files(inputs: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
+/// Inputs that resolve to the same file are kept only once.
+fn collect_arw_files(inputs: &[PathBuf], recursive: bool) -> Result<Vec<InputFile>> {
     let mut files = Vec::new();
 
     for path in inputs {
@@ -145,7 +173,12 @@ fn collect_arw_files(inputs: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>
                 for entry in walker {
                     let p = entry.into_path();
                     if p.is_file() && is_arw(&p) {
-                        files.push(p);
+                        let rel_dir = p
+                            .parent()
+                            .and_then(|d| d.strip_prefix(path).ok())
+                            .unwrap_or(Path::new(""))
+                            .to_path_buf();
+                        files.push(InputFile { path: p, rel_dir });
                     }
                 }
             } else {
@@ -153,19 +186,71 @@ fn collect_arw_files(inputs: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>
                     let entry = entry?;
                     let p = entry.path();
                     if is_arw(&p) {
-                        files.push(p);
+                        files.push(InputFile {
+                            path: p,
+                            rel_dir: PathBuf::new(),
+                        });
                     }
                 }
             }
         } else if path.is_file() {
-            files.push(path.clone());
+            files.push(InputFile {
+                path: path.clone(),
+                rel_dir: PathBuf::new(),
+            });
         } else {
             eprintln!("Warning: {} does not exist, skipping", path.display());
         }
     }
 
-    files.sort();
+    // Stable sort: when one file is reached through several inputs, the
+    // first input argument decides its `rel_dir`.
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut seen = HashSet::new();
+    files.retain(|f| seen.insert(canonical(&f.path)));
     Ok(files)
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Pair each input with its output path. Fails without converting anything
+/// if two inputs would write the same output path.
+fn plan_outputs(
+    files: &[InputFile],
+    output_dir: Option<&Path>,
+    format: OutputFormat,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut jobs = Vec::with_capacity(files.len());
+    let mut claimed: HashMap<PathBuf, &Path> = HashMap::new();
+    let mut conflicts = Vec::new();
+
+    for f in files {
+        let dir = output_dir.map(|d| d.join(&f.rel_dir));
+        let output = make_output_path(&f.path, dir.as_deref(), format);
+        // Compare outputs by where they land on disk, not by how the input was spelled.
+        let key = make_output_path(&canonical(&f.path), dir.as_deref(), format);
+        if let Some(first) = claimed.get(&key) {
+            conflicts.push(format!(
+                "  {} and {} both write {}",
+                first.display(),
+                f.path.display(),
+                output.display()
+            ));
+        } else {
+            claimed.insert(key, &f.path);
+        }
+        jobs.push((f.path.clone(), output));
+    }
+
+    if !conflicts.is_empty() {
+        bail!(
+            "Output path conflicts, nothing converted:\n{}",
+            conflicts.join("\n")
+        );
+    }
+    Ok(jobs)
 }
 
 fn is_arw(path: &Path) -> bool {
@@ -378,7 +463,7 @@ mod tests {
         let inputs = vec![tmp.path().to_path_buf()];
         let files = collect_arw_files(&inputs, false).unwrap();
         assert_eq!(files.len(), 1);
-        assert!(files[0].to_string_lossy().contains("photo.arw"));
+        assert!(files[0].path.to_string_lossy().contains("photo.arw"));
     }
 
     #[test]
@@ -390,7 +475,7 @@ mod tests {
         let inputs = vec![arw_path.clone()];
         let files = collect_arw_files(&inputs, false).unwrap();
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0], arw_path);
+        assert_eq!(files[0].path, arw_path);
     }
 
     #[test]
@@ -403,7 +488,7 @@ mod tests {
         let inputs = vec![jpg_path.clone()];
         let files = collect_arw_files(&inputs, false).unwrap();
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0], jpg_path);
+        assert_eq!(files[0].path, jpg_path);
     }
 
     #[test]
@@ -445,7 +530,7 @@ mod tests {
 
         let names: Vec<String> = files
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, vec!["a_photo.arw", "m_photo.arw", "z_photo.arw"]);
     }
@@ -462,7 +547,7 @@ mod tests {
         let inputs = vec![tmp.path().to_path_buf()];
         let files = collect_arw_files(&inputs, false).unwrap();
         assert_eq!(files.len(), 1);
-        assert!(files[0].to_string_lossy().contains("top.arw"));
+        assert!(files[0].path.to_string_lossy().contains("top.arw"));
     }
 
     #[test]
@@ -497,6 +582,98 @@ mod tests {
         let inputs = vec![tmp.path().to_path_buf()];
         let files = collect_arw_files(&inputs, true).unwrap();
         assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn collect_arw_files_removes_duplicate_inputs() {
+        let tmp = TempDir::new().unwrap();
+        let arw = tmp.path().join("photo.arw");
+        fs::write(&arw, b"fake").unwrap();
+        let dotted = tmp.path().join(".").join("photo.arw");
+
+        let inputs = vec![tmp.path().to_path_buf(), arw.clone(), dotted];
+        let files = collect_arw_files(&inputs, false).unwrap();
+        assert_eq!(files.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // plan_outputs tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plan_outputs_mirrors_scanned_subdirectories_under_output_dir() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("in");
+        fs::create_dir_all(input.join("a/deep")).unwrap();
+        fs::create_dir_all(input.join("b")).unwrap();
+        fs::write(input.join("top.arw"), b"fake").unwrap();
+        fs::write(input.join("a/deep/x.arw"), b"fake").unwrap();
+        fs::write(input.join("b/x.arw"), b"fake").unwrap();
+
+        let files = collect_arw_files(&[input], true).unwrap();
+        let out = Path::new("/out");
+        let jobs = plan_outputs(&files, Some(out), OutputFormat::Jpeg).unwrap();
+        let outputs: Vec<&Path> = jobs.iter().map(|(_, o)| o.as_path()).collect();
+        assert_eq!(
+            outputs,
+            vec![
+                Path::new("/out/a/deep/x.jpg"),
+                Path::new("/out/b/x.jpg"),
+                Path::new("/out/top.jpg"),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_outputs_explicit_files_go_directly_into_output_dir() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("a/b");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("x.arw"), b"fake").unwrap();
+
+        let files = collect_arw_files(&[nested.join("x.arw")], true).unwrap();
+        let jobs = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Png).unwrap();
+        assert_eq!(jobs[0].1, PathBuf::from("/out/x.png"));
+    }
+
+    #[test]
+    fn plan_outputs_without_output_dir_writes_next_to_input() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("a")).unwrap();
+        fs::write(tmp.path().join("a/x.arw"), b"fake").unwrap();
+
+        let files = collect_arw_files(&[tmp.path().to_path_buf()], true).unwrap();
+        let jobs = plan_outputs(&files, None, OutputFormat::Jpeg).unwrap();
+        assert_eq!(jobs[0].1, tmp.path().join("a/x.jpg"));
+    }
+
+    #[test]
+    fn plan_outputs_rejects_two_inputs_with_same_output() {
+        let tmp = TempDir::new().unwrap();
+        for d in ["a", "b"] {
+            fs::create_dir_all(tmp.path().join(d)).unwrap();
+            fs::write(tmp.path().join(d).join("x.arw"), b"fake").unwrap();
+        }
+        let a = tmp.path().join("a/x.arw");
+        let b = tmp.path().join("b/x.arw");
+
+        let files = collect_arw_files(&[a.clone(), b.clone()], false).unwrap();
+        let err = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Jpeg)
+            .expect_err("expected a conflict error");
+        let msg = err.to_string();
+        assert!(msg.contains(&*a.to_string_lossy()), "{msg}");
+        assert!(msg.contains(&*b.to_string_lossy()), "{msg}");
+    }
+
+    #[test]
+    fn plan_outputs_rejects_same_stem_in_same_dir_without_output_dir() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("x.arw"), b"fake").unwrap();
+        fs::write(tmp.path().join("x.png"), b"fake").unwrap();
+
+        let inputs = vec![tmp.path().join("x.arw"), tmp.path().join(".").join("x.png")];
+        let files = collect_arw_files(&inputs, false).unwrap();
+        assert!(plan_outputs(&files, None, OutputFormat::Jpeg).is_err());
     }
 
     #[test]
