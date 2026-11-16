@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -21,10 +22,6 @@ pub fn convert_arw(
     let mut pipeline = Pipeline::new_from_file(input)
         .map_err(|e| anyhow!("Failed to create pipeline for {}: {}", input.display(), e))?;
 
-    // Extract EXIF metadata from the source ARW before conversion.
-    // Failures here are non-fatal: we still produce the output image.
-    let exif_data = exif_utils::extract_exif_from_arw(input).ok().flatten();
-
     // Ensure output directory exists
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)
@@ -36,12 +33,10 @@ pub fn convert_arw(
     let tmp = temp_path_for(output);
     let result = match format {
         OutputFormat::Jpeg => {
-            encode_jpeg(&mut pipeline, input, &tmp, quality, resize, exif_data.as_deref())
+            encode_jpeg(&mut pipeline, input, &tmp, quality, resize)
         }
-        OutputFormat::Tiff => encode_16bit(&mut pipeline, input, &tmp, resize, Format16::Tiff),
-        OutputFormat::Png => {
-            encode_16bit_with_exif(&mut pipeline, input, &tmp, resize, Format16::Png, exif_data.as_deref())
-        }
+        OutputFormat::Tiff => encode_tiff(&mut pipeline, input, &tmp, resize),
+        OutputFormat::Png => encode_png(&mut pipeline, input, &tmp, resize),
     }
     .and_then(|()| {
         std::fs::rename(&tmp, output)
@@ -65,7 +60,6 @@ fn encode_jpeg(
     output: &Path,
     quality: u8,
     resize: Option<u32>,
-    exif_data: Option<&[u8]>,
 ) -> Result<()> {
     let decoded = pipeline
         .output_8bit(None)
@@ -87,10 +81,13 @@ fn encode_jpeg(
         .write_with_encoder(encoder)
         .with_context(|| format!("Failed to encode JPEG to {}", output.display()))?;
 
-    // Inject EXIF metadata into the JPEG if available.
+    // Inject EXIF metadata into the JPEG if available. Failures here are
+    // non-fatal: we still produce the output image.
+    let exif_data = exif_utils::extract_exif_from_arw(input, final_img.dimensions())
+        .ok()
+        .flatten();
     let final_bytes = match exif_data {
-        Some(exif) => exif_utils::inject_exif_into_jpeg(&jpeg_buf, exif)
-            .unwrap_or(jpeg_buf),
+        Some(exif) => exif_utils::inject_exif_into_jpeg(&jpeg_buf, &exif).unwrap_or(jpeg_buf),
         None => jpeg_buf,
     };
 
@@ -100,53 +97,45 @@ fn encode_jpeg(
     Ok(())
 }
 
-enum Format16 {
-    Tiff,
-    Png,
-}
-
-fn encode_16bit(
+fn encode_tiff(
     pipeline: &mut Pipeline,
     input: &Path,
     output: &Path,
     resize: Option<u32>,
-    fmt: Format16,
 ) -> Result<()> {
     let final_img = render_16bit(pipeline, input, resize)?;
 
-    let mut out_file = std::fs::File::create(output)
+    let out_file = std::fs::File::create(output)
         .with_context(|| format!("Failed to create output file {}", output.display()))?;
+    let mut out_file = std::io::BufWriter::new(out_file);
 
-    let label = match fmt {
-        Format16::Tiff => "TIFF",
-        Format16::Png => "PNG",
-    };
-
-    match fmt {
-        Format16::Tiff => {
-            let encoder = TiffEncoder::new(&mut out_file);
-            final_img
-                .write_with_encoder(encoder)
-                .with_context(|| format!("Failed to encode {} to {}", label, output.display()))?;
-        }
-        Format16::Png => {
-            let encoder = PngEncoder::new(&mut out_file);
-            final_img
-                .write_with_encoder(encoder)
-                .with_context(|| format!("Failed to encode {} to {}", label, output.display()))?;
-        }
+    // EXIF failures are non-fatal: fall back to a TIFF without metadata.
+    let fields = exif_utils::read_fields_for_output(input, final_img.dimensions())
+        .ok()
+        .flatten();
+    match fields {
+        Some((fields, _)) => exif_utils::write_tiff_16bit_with_exif(
+            &mut out_file,
+            final_img.dimensions(),
+            final_img.as_raw(),
+            &fields,
+        ),
+        None => final_img
+            .write_with_encoder(TiffEncoder::new(&mut out_file))
+            .map_err(Into::into),
     }
+    .with_context(|| format!("Failed to encode TIFF to {}", output.display()))?;
 
-    Ok(())
+    out_file
+        .flush()
+        .with_context(|| format!("Failed to write output file {}", output.display()))
 }
 
-fn encode_16bit_with_exif(
+fn encode_png(
     pipeline: &mut Pipeline,
     input: &Path,
     output: &Path,
     resize: Option<u32>,
-    _fmt: Format16,
-    exif_data: Option<&[u8]>,
 ) -> Result<()> {
     let final_img = render_16bit(pipeline, input, resize)?;
 
@@ -158,9 +147,11 @@ fn encode_16bit_with_exif(
         .with_context(|| format!("Failed to encode PNG to {}", output.display()))?;
 
     // Inject EXIF metadata into the PNG if available.
+    let exif_data = exif_utils::extract_exif_from_arw(input, final_img.dimensions())
+        .ok()
+        .flatten();
     let final_bytes = match exif_data {
-        Some(exif) => exif_utils::inject_exif_into_png(&buf, exif)
-            .unwrap_or(buf),
+        Some(exif) => exif_utils::inject_exif_into_png(&buf, &exif).unwrap_or(buf),
         None => buf,
     };
 

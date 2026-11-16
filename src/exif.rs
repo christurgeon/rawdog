@@ -1,14 +1,17 @@
-use std::io::{BufReader, Cursor};
+use std::io::{BufReader, Cursor, Seek, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// Extract raw EXIF bytes from a source ARW (TIFF-based) file.
+/// Read the EXIF fields of a source file, prepared for an output image with
+/// the given pixel dimensions.
 ///
-/// Returns the EXIF data as a TIFF byte blob suitable for injection into
-/// JPEG (via img-parts `set_exif`) or PNG (via eXIf chunk). Returns `None`
-/// if no EXIF data could be extracted.
-pub fn extract_exif_from_arw(path: &Path) -> Result<Option<Vec<u8>>> {
+/// Returns the fields and the source byte order (`true` = little endian), or
+/// `None` if the file has no usable EXIF data.
+pub fn read_fields_for_output(
+    path: &Path,
+    dims: (u32, u32),
+) -> Result<Option<(Vec<exif::Field>, bool)>> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open {} for EXIF extraction", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -26,10 +29,21 @@ pub fn extract_exif_from_arw(path: &Path) -> Result<Option<Vec<u8>>> {
         Err(_) => return Ok(None),
     };
 
-    let fields = fields_for_output(exif.fields());
+    let fields = fields_for_output(exif.fields(), dims);
     if fields.is_empty() {
         return Ok(None);
     }
+    Ok(Some((fields, exif.little_endian())))
+}
+
+/// Extract EXIF from a source ARW (TIFF-based) file as a TIFF byte blob.
+///
+/// The blob is suitable for injection into JPEG (via img-parts `set_exif`)
+/// or PNG (via eXIf chunk). Returns `None` if no EXIF data could be extracted.
+pub fn extract_exif_from_arw(path: &Path, dims: (u32, u32)) -> Result<Option<Vec<u8>>> {
+    let Some((fields, little_endian)) = read_fields_for_output(path, dims)? else {
+        return Ok(None);
+    };
 
     // Use the experimental Writer to serialize the parsed fields into a
     // minimal TIFF blob containing only the metadata IFDs.
@@ -40,7 +54,7 @@ pub fn extract_exif_from_arw(path: &Path) -> Result<Option<Vec<u8>>> {
 
     let mut buf = Cursor::new(Vec::new());
     writer
-        .write(&mut buf, exif.little_endian())
+        .write(&mut buf, little_endian)
         .map_err(|e| anyhow::anyhow!("Failed to serialize EXIF data: {}", e))?;
 
     let data = buf.into_inner();
@@ -51,20 +65,101 @@ pub fn extract_exif_from_arw(path: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(data))
 }
 
+/// Tags that describe how the source file stores its data. They are wrong
+/// for the converted image, and some hold offsets into the source file.
+fn describes_source_layout(tag: exif::Tag) -> bool {
+    use exif::{Context, Tag};
+    const SUB_IFDS: Tag = Tag(Context::Tiff, 0x14a);
+    const DNG_PRIVATE_DATA: Tag = Tag(Context::Tiff, 0xc634);
+    [
+        Tag::ImageWidth,
+        Tag::ImageLength,
+        Tag::BitsPerSample,
+        Tag::Compression,
+        Tag::PhotometricInterpretation,
+        Tag::SamplesPerPixel,
+        Tag::RowsPerStrip,
+        Tag::PlanarConfiguration,
+        Tag::YCbCrCoefficients,
+        Tag::YCbCrSubSampling,
+        Tag::YCbCrPositioning,
+        Tag::ReferenceBlackWhite,
+        // The Sony MakerNote uses offsets from the start of the ARW file.
+        Tag::MakerNote,
+        SUB_IFDS,
+        DNG_PRIVATE_DATA,
+    ]
+    .contains(&tag)
+}
+
 /// Prepare source EXIF fields for the converted image.
 ///
-/// imagepipe rotates the pixels according to the RAW orientation, so any
-/// Orientation tag is reset to 1 (normal). A missing tag is not added.
-fn fields_for_output<'a>(fields: impl Iterator<Item = &'a exif::Field>) -> Vec<exif::Field> {
+/// - Only the primary image's fields are kept. The source thumbnail is not
+///   copied, so its IFD would describe data that does not exist.
+/// - Tags that describe the source file layout are dropped.
+/// - imagepipe rotates the pixels according to the RAW orientation, so any
+///   Orientation tag is reset to 1 (normal). A missing tag is not added.
+/// - PixelXDimension and PixelYDimension are set to the output size.
+fn fields_for_output<'a>(
+    fields: impl Iterator<Item = &'a exif::Field>,
+    (width, height): (u32, u32),
+) -> Vec<exif::Field> {
     fields
+        .filter(|f| f.ifd_num == exif::In::PRIMARY && !describes_source_layout(f.tag))
         .map(|field| {
             let mut field = field.clone();
-            if field.tag == exif::Tag::Orientation {
-                field.value = exif::Value::Short(vec![1]);
+            match field.tag {
+                exif::Tag::Orientation => field.value = exif::Value::Short(vec![1]),
+                exif::Tag::PixelXDimension => field.value = exif::Value::Long(vec![width]),
+                exif::Tag::PixelYDimension => field.value = exif::Value::Long(vec![height]),
+                _ => {}
             }
             field
         })
         .collect()
+}
+
+/// Write a 16-bit RGB TIFF file that carries the given EXIF fields.
+///
+/// `fields` must come from `read_fields_for_output`, which removes the
+/// layout tags that this function sets.
+pub fn write_tiff_16bit_with_exif<W: Write + Seek>(
+    w: &mut W,
+    (width, height): (u32, u32),
+    samples: &[u16],
+    fields: &[exif::Field],
+) -> Result<()> {
+    use exif::{Field, In, Tag, Value};
+
+    let layout: Vec<Field> = [
+        (Tag::ImageWidth, Value::Long(vec![width])),
+        (Tag::ImageLength, Value::Long(vec![height])),
+        (Tag::BitsPerSample, Value::Short(vec![16, 16, 16])),
+        (Tag::Compression, Value::Short(vec![1])),
+        (Tag::PhotometricInterpretation, Value::Short(vec![2])),
+        (Tag::SamplesPerPixel, Value::Short(vec![3])),
+        (Tag::RowsPerStrip, Value::Long(vec![height])),
+        (Tag::PlanarConfiguration, Value::Short(vec![1])),
+    ]
+    .into_iter()
+    .map(|(tag, value)| Field {
+        tag,
+        ifd_num: In::PRIMARY,
+        value,
+    })
+    .collect();
+
+    let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let strips = [bytes.as_slice()];
+
+    let mut writer = exif::experimental::Writer::new();
+    for field in layout.iter().chain(fields) {
+        writer.push_field(field);
+    }
+    writer.set_strips(&strips, In::PRIMARY);
+    writer
+        .write(w, true)
+        .map_err(|e| anyhow::anyhow!("Failed to write TIFF with EXIF: {}", e))
 }
 
 /// Inject raw EXIF bytes (a TIFF blob) into an already-encoded JPEG buffer.
@@ -99,6 +194,19 @@ pub fn inject_exif_into_png(png_bytes: &[u8], exif_data: &[u8]) -> Result<Vec<u8
 
     png.set_exif(Some(img_parts::Bytes::from(exif_data.to_vec())));
 
+    // img-parts appends the eXIf chunk after the image data. Some readers,
+    // including macOS ImageIO, only read it when it comes before IDAT.
+    let chunks = png.chunks_mut();
+    if let (Some(exif_pos), Some(idat_pos)) = (
+        chunks.iter().position(|c| c.kind() == *b"eXIf"),
+        chunks.iter().position(|c| c.kind() == *b"IDAT"),
+    ) {
+        if exif_pos > idat_pos {
+            let chunk = chunks.remove(exif_pos);
+            chunks.insert(idat_pos, chunk);
+        }
+    }
+
     let mut output = Vec::with_capacity(png.len());
     png.encoder()
         .write_to(&mut output)
@@ -113,7 +221,7 @@ mod tests {
 
     #[test]
     fn extract_exif_returns_none_for_nonexistent_file() {
-        let result = extract_exif_from_arw(Path::new("/nonexistent/photo.arw"));
+        let result = extract_exif_from_arw(Path::new("/nonexistent/photo.arw"), (300, 200));
         assert!(result.is_err());
     }
 
@@ -121,7 +229,7 @@ mod tests {
     fn extract_exif_returns_none_for_non_arw_file() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), b"not a raw file").unwrap();
-        let result = extract_exif_from_arw(tmp.path()).unwrap();
+        let result = extract_exif_from_arw(tmp.path(), (300, 200)).unwrap();
         assert!(result.is_none());
     }
 
@@ -164,7 +272,7 @@ mod tests {
     #[test]
     fn fields_for_output_resets_orientation() {
         let source = [orientation_field(8), description_field()];
-        let out = fields_for_output(source.iter());
+        let out = fields_for_output(source.iter(), (300, 200));
         assert_eq!(out.len(), 2);
         let orientation = out
             .iter()
@@ -181,7 +289,7 @@ mod tests {
     #[test]
     fn fields_for_output_does_not_add_orientation() {
         let source = [description_field()];
-        let out = fields_for_output(source.iter());
+        let out = fields_for_output(source.iter(), (300, 200));
         assert!(out.iter().all(|f| f.tag != exif::Tag::Orientation));
         assert_eq!(out.len(), 1);
     }
@@ -191,14 +299,14 @@ mod tests {
         // imagepipe already rotates the pixels, so a copied Orientation of 6
         // would make viewers rotate the image a second time.
         let tmp = write_tiff_with_fields(&[orientation_field(6), description_field()]);
-        let data = extract_exif_from_arw(tmp.path()).unwrap().unwrap();
+        let data = extract_exif_from_arw(tmp.path(), (300, 200)).unwrap().unwrap();
         assert_eq!(orientation_of(&data), Some(1));
     }
 
     #[test]
     fn extract_exif_does_not_add_missing_orientation() {
         let tmp = write_tiff_with_fields(&[description_field()]);
-        let data = extract_exif_from_arw(tmp.path()).unwrap().unwrap();
+        let data = extract_exif_from_arw(tmp.path(), (300, 200)).unwrap().unwrap();
         assert_eq!(orientation_of(&data), None);
     }
 
@@ -277,6 +385,81 @@ mod tests {
         let parsed = img_parts::png::Png::from_bytes(result.into()).unwrap();
         let extracted = img_parts::ImageEXIF::exif(&parsed);
         assert!(extracted.is_some());
+    }
+
+    fn field(tag: exif::Tag, ifd_num: exif::In, value: exif::Value) -> exif::Field {
+        exif::Field {
+            tag,
+            ifd_num,
+            value,
+        }
+    }
+
+    #[test]
+    fn fields_for_output_drops_source_layout_and_thumbnail_fields() {
+        use exif::{Context, In, Tag, Value};
+        let source = [
+            description_field(),
+            field(Tag::Compression, In::PRIMARY, Value::Short(vec![6])),
+            field(Tag::MakerNote, In::PRIMARY, Value::Undefined(vec![1, 2, 3], 0)),
+            field(Tag(Context::Tiff, 0x14a), In::PRIMARY, Value::Long(vec![143014])),
+            field(Tag::Compression, In::THUMBNAIL, Value::Short(vec![6])),
+            field(Tag::Model, In::THUMBNAIL, Value::Ascii(vec![b"X".to_vec()])),
+        ];
+        let out = fields_for_output(source.iter(), (300, 200));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].tag, Tag::ImageDescription);
+    }
+
+    #[test]
+    fn fields_for_output_sets_pixel_dimensions_to_output_size() {
+        use exif::{In, Tag, Value};
+        let source = [
+            field(Tag::PixelXDimension, In::PRIMARY, Value::Long(vec![2768])),
+            field(Tag::PixelYDimension, In::PRIMARY, Value::Long(vec![1848])),
+        ];
+        let out = fields_for_output(source.iter(), (300, 200));
+        assert_eq!(out[0].value.get_uint(0), Some(300));
+        assert_eq!(out[1].value.get_uint(0), Some(200));
+    }
+
+    #[test]
+    fn inject_exif_into_png_places_chunk_before_image_data() {
+        let img: image::RgbImage = image::ImageBuffer::from_pixel(2, 2, image::Rgb([1u8, 2, 3]));
+        let mut png_buf = Vec::new();
+        img.write_with_encoder(image::codecs::png::PngEncoder::new(&mut png_buf))
+            .unwrap();
+        let tmp = write_tiff_with_fields(&[description_field()]);
+        let exif_data = std::fs::read(tmp.path()).unwrap();
+
+        let result = inject_exif_into_png(&png_buf, &exif_data).unwrap();
+        let png = img_parts::png::Png::from_bytes(result.into()).unwrap();
+        let kinds: Vec<[u8; 4]> = png.chunks().iter().map(|c| c.kind()).collect();
+        let exif_pos = kinds.iter().position(|k| k == b"eXIf").unwrap();
+        let idat_pos = kinds.iter().position(|k| k == b"IDAT").unwrap();
+        assert!(exif_pos < idat_pos, "chunk order: {kinds:?}");
+    }
+
+    #[test]
+    fn write_tiff_16bit_with_exif_roundtrips_pixels_and_fields() {
+        let samples: Vec<u16> = (0..4 * 3 * 3).map(|i| i * 1000).collect();
+        let mut buf = Cursor::new(Vec::new());
+        write_tiff_16bit_with_exif(&mut buf, (4, 3), &samples, &[description_field()]).unwrap();
+        let bytes = buf.into_inner();
+
+        let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Tiff)
+            .unwrap()
+            .into_rgb16();
+        assert_eq!(decoded.dimensions(), (4, 3));
+        assert_eq!(decoded.as_raw(), &samples);
+
+        let parsed = exif::Reader::new()
+            .read_from_container(&mut Cursor::new(&bytes))
+            .unwrap();
+        let desc = parsed
+            .get_field(exif::Tag::ImageDescription, exif::In::PRIMARY)
+            .unwrap();
+        assert_eq!(desc.display_value().to_string(), "\"RawDog Test\"");
     }
 
     #[test]
