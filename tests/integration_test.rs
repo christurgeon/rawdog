@@ -658,3 +658,18 @@ fn cli_exposure_accepts_a_negative_value_without_leading_zero() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn cli_tint_above_one_is_more_magenta() {
+    // Magenta is red and blue above green. Green is the reference channel
+    // of the white balance, so the shift shows in red and blue.
+    let magenta_cast = |args: &[&str]| {
+        let [r, g, b] = convert_grey_with(args);
+        (r + b) / 2.0 - g
+    };
+    let high = magenta_cast(&["--wb", "5500", "--tint", "1.25"]);
+    let neutral = magenta_cast(&["--wb", "5500"]);
+    let low = magenta_cast(&["--wb", "5500", "--tint", "0.8"]);
+    assert!(high > neutral + 3.0, "{high} vs {neutral}");
+    assert!(low < neutral - 3.0, "{low} vs {neutral}");
+}

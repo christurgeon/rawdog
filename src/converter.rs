@@ -202,7 +202,16 @@ fn write_jpeg(
         .ok()
         .flatten();
     let final_bytes = match exif_data {
-        Some(exif) => exif_utils::inject_exif_into_jpeg(&jpeg_buf, &exif).unwrap_or(jpeg_buf),
+        Some(exif) => match exif_utils::inject_exif_into_jpeg(&jpeg_buf, &exif) {
+            Ok(with_exif) => with_exif,
+            Err(e) => {
+                eprintln!(
+                    "Warning: metadata of {} was not copied: {e}",
+                    input.display()
+                );
+                jpeg_buf
+            }
+        },
         None => jpeg_buf,
     };
 
