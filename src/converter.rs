@@ -12,7 +12,7 @@ use crate::exif as exif_utils;
 use crate::OutputFormat;
 
 /// Settings that apply to every file of a run.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ConvertOptions {
     pub format: OutputFormat,
     /// JPEG quality, 1-100. Ignored for TIFF and PNG.
@@ -21,6 +21,7 @@ pub struct ConvertOptions {
     pub resize: Option<u32>,
     /// Scale during RAW decoding instead of after it. Needs `resize`.
     pub fast: bool,
+    pub metadata: exif_utils::MetadataOptions,
 }
 
 /// Convert a single ARW file to the specified output format.
@@ -30,6 +31,7 @@ pub fn convert_arw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         quality,
         resize,
         fast,
+        ref metadata,
     } = *opts;
 
     let mut pipeline = Pipeline::new_from_file(input)
@@ -54,10 +56,10 @@ pub fn convert_arw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     let tmp = temp_path_for(output);
     let result = match format {
         OutputFormat::Jpeg => {
-            encode_jpeg(&mut pipeline, input, &tmp, quality, resize)
+            encode_jpeg(&mut pipeline, input, &tmp, quality, resize, metadata)
         }
-        OutputFormat::Tiff => encode_tiff(&mut pipeline, input, &tmp, resize),
-        OutputFormat::Png => encode_png(&mut pipeline, input, &tmp, resize),
+        OutputFormat::Tiff => encode_tiff(&mut pipeline, input, &tmp, resize, metadata),
+        OutputFormat::Png => encode_png(&mut pipeline, input, &tmp, resize, metadata),
     }
     .and_then(|()| {
         std::fs::rename(&tmp, output)
@@ -81,6 +83,7 @@ fn encode_jpeg(
     output: &Path,
     quality: u8,
     resize: Option<u32>,
+    metadata: &exif_utils::MetadataOptions,
 ) -> Result<()> {
     let decoded = pipeline
         .output_8bit(None)
@@ -104,7 +107,7 @@ fn encode_jpeg(
 
     // Inject EXIF metadata into the JPEG if available. Failures here are
     // non-fatal: we still produce the output image.
-    let exif_data = exif_utils::extract_exif_from_arw(input, final_img.dimensions())
+    let exif_data = exif_utils::extract_exif_from_arw(input, final_img.dimensions(), metadata)
         .ok()
         .flatten();
     let final_bytes = match exif_data {
@@ -123,6 +126,7 @@ fn encode_tiff(
     input: &Path,
     output: &Path,
     resize: Option<u32>,
+    metadata: &exif_utils::MetadataOptions,
 ) -> Result<()> {
     let final_img = render_16bit(pipeline, input, resize)?;
 
@@ -131,7 +135,7 @@ fn encode_tiff(
     let mut out_file = std::io::BufWriter::new(out_file);
 
     // EXIF failures are non-fatal: fall back to a TIFF without metadata.
-    let fields = exif_utils::read_fields_for_output(input, final_img.dimensions())
+    let fields = exif_utils::read_fields_for_output(input, final_img.dimensions(), metadata)
         .ok()
         .flatten();
     match fields {
@@ -157,6 +161,7 @@ fn encode_png(
     input: &Path,
     output: &Path,
     resize: Option<u32>,
+    metadata: &exif_utils::MetadataOptions,
 ) -> Result<()> {
     let final_img = render_16bit(pipeline, input, resize)?;
 
@@ -168,7 +173,7 @@ fn encode_png(
         .with_context(|| format!("Failed to encode PNG to {}", output.display()))?;
 
     // Inject EXIF metadata into the PNG if available.
-    let exif_data = exif_utils::extract_exif_from_arw(input, final_img.dimensions())
+    let exif_data = exif_utils::extract_exif_from_arw(input, final_img.dimensions(), metadata)
         .ok()
         .flatten();
     let final_bytes = match exif_data {
@@ -482,6 +487,7 @@ mod tests {
                 quality: 92,
                 resize: None,
                 fast: false,
+                metadata: Default::default(),
             },
         );
         assert!(result.is_err());
@@ -501,6 +507,7 @@ mod tests {
                 quality: 92,
                 resize: None,
                 fast: false,
+                metadata: Default::default(),
             },
         );
         assert!(result.is_err());

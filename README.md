@@ -84,6 +84,14 @@ Make small proofs quickly. `--fast` scales during RAW decoding, which is several
 rawdog ./card -r 2048 --fast -o ./proofs
 ```
 
+Export for the web without location data, with your name and copyright:
+
+```sh
+rawdog ./trip -r 2048 --strip-gps --artist "J. Doe" --copyright "(c) 2026 J. Doe"
+```
+
+Camera, lens, exposure, and date metadata are copied to JPEG, PNG, and TIFF output. Use `--strip-metadata` to copy none of it.
+
 Preview what a run will do, without writing files:
 
 ```sh

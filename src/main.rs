@@ -53,6 +53,22 @@ struct Cli {
     #[arg(long, requires = "resize")]
     fast: bool,
 
+    /// Do not copy GPS location to the output
+    #[arg(long)]
+    strip_gps: bool,
+
+    /// Do not copy any metadata to the output
+    #[arg(long)]
+    strip_metadata: bool,
+
+    /// Set the EXIF Artist tag in every output file
+    #[arg(long, value_name = "NAME")]
+    artist: Option<String>,
+
+    /// Set the EXIF Copyright tag in every output file
+    #[arg(long, value_name = "TEXT")]
+    copyright: Option<String>,
+
     /// Overwrite existing output files (default: skip if exists)
     #[arg(long)]
     overwrite: bool,
@@ -136,6 +152,12 @@ fn main() -> Result<()> {
         quality: cli.quality,
         resize: cli.resize,
         fast: cli.fast,
+        metadata: exif::MetadataOptions {
+            strip_all: cli.strip_metadata,
+            strip_gps: cli.strip_gps,
+            artist: cli.artist.clone(),
+            copyright: cli.copyright.clone(),
+        },
     };
 
     let succeeded = AtomicUsize::new(0);
