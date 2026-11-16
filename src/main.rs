@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::{generate, Shell};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -109,9 +109,9 @@ struct Cli {
     #[arg(short = 'n', long)]
     dry_run: bool,
 
-    /// Number of files to convert in parallel (default: one per CPU core).
-    /// Each job holds a full-size image in memory, so lower this for
-    /// high-resolution files on machines with little RAM
+    /// Number of files to convert at the same time. Each file uses all
+    /// CPU cores and holds a full-size image in memory. The default is
+    /// chosen from the installed RAM and the size of the largest input
     #[arg(short, long, value_parser = clap::value_parser!(u32).range(1..))]
     jobs: Option<u32>,
 
@@ -179,12 +179,19 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(jobs) = cli.jobs {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(jobs as usize)
-            .build_global()
-            .context("Failed to configure the thread pool")?;
-    }
+    let workers = match cli.jobs {
+        Some(n) => n as usize,
+        None => {
+            let largest_input = jobs
+                .iter()
+                .filter_map(|(input, _)| std::fs::metadata(input).ok())
+                .map(|m| m.len())
+                .max()
+                .unwrap_or(0);
+            let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+            default_workers(largest_input, cli.fast, total_memory(), cores)
+        }
+    };
 
     if !cli.quiet {
         println!("Found {} RAW file(s)", files.len());
@@ -225,7 +232,7 @@ fn main() -> Result<()> {
     // print a backtrace message for each one.
     std::panic::set_hook(Box::new(|_| {}));
 
-    jobs.par_iter().for_each(|(input_path, output_path)| {
+    let convert_one = |(input_path, output_path): &(PathBuf, PathBuf)| {
         if output_path.exists() && canonical(output_path) == canonical(input_path) {
             pb.suspend(|| {
                 eprintln!(
@@ -265,6 +272,20 @@ fn main() -> Result<()> {
         }
 
         pb.inc(1);
+    };
+
+    // The worker threads only limit how many files are open at once. The
+    // decoder runs its own parallel loops on the global thread pool, so each
+    // file still uses every core.
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..workers.min(jobs.len()) {
+            scope.spawn(|| {
+                while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    convert_one(job);
+                }
+            });
+        }
     });
 
     pb.finish_and_clear();
@@ -282,6 +303,39 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Number of files to convert at the same time when `--jobs` is not given.
+///
+/// Converting more files than fit in memory makes the system swap, which is
+/// many times slower than converting fewer files. Measured peak memory per
+/// file is about 40 times the RAW file size, or 12 times with `--fast`.
+/// The files share 30 percent of the installed memory.
+fn default_workers(largest_input: u64, fast: bool, total_memory: Option<u64>, cores: usize) -> usize {
+    let Some(total_memory) = total_memory else {
+        return cores.min(2);
+    };
+    let per_file = largest_input.max(1) * if fast { 12 } else { 40 };
+    let budget = total_memory / 10 * 3;
+    ((budget / per_file) as usize).clamp(1, cores.max(1))
+}
+
+/// Installed physical memory in bytes, if the platform lets us read it.
+fn total_memory() -> Option<u64> {
+    if cfg!(target_os = "macos") {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    } else if cfg!(target_os = "linux") {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
+        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kib * 1024)
+    } else {
+        None
+    }
 }
 
 /// An existing output is skipped unless `overwrite` is set, or `update` is
@@ -553,6 +607,40 @@ mod tests {
     fn is_raw_accepts_other_camera_formats() {
         for name in ["a.CR2", "a.nef", "a.dng", "a.RAF", "a.orf", "a.rw2", "a.pef", "a.3fr"] {
             assert!(is_raw(Path::new(name)), "{name}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // default_workers tests
+    // -----------------------------------------------------------------------
+
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * MB;
+
+    #[test]
+    fn default_workers_scales_with_memory_and_file_size() {
+        // 25 MB files need about 1 GB each: 8 GB of RAM gives 2 at a time.
+        assert_eq!(default_workers(25 * MB, false, Some(8 * GB), 8), 2);
+        assert_eq!(default_workers(25 * MB, false, Some(16 * GB), 8), 4);
+        // Larger files need more memory each.
+        assert_eq!(default_workers(85 * MB, false, Some(16 * GB), 8), 1);
+        // --fast needs less memory per file.
+        assert_eq!(default_workers(25 * MB, true, Some(8 * GB), 8), 8);
+    }
+
+    #[test]
+    fn default_workers_stays_between_one_and_the_core_count() {
+        assert_eq!(default_workers(500 * MB, false, Some(2 * GB), 8), 1);
+        assert_eq!(default_workers(MB, false, Some(64 * GB), 8), 8);
+        assert_eq!(default_workers(0, false, Some(8 * GB), 4), 4);
+        assert_eq!(default_workers(25 * MB, false, None, 8), 2);
+        assert_eq!(default_workers(25 * MB, false, None, 1), 1);
+    }
+
+    #[test]
+    fn total_memory_is_readable_on_supported_systems() {
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert!(total_memory().unwrap() > 64 * MB);
         }
     }
 
