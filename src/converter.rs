@@ -45,8 +45,7 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         ..
     } = *opts;
 
-    let mut pipeline = Pipeline::new_from_file(input)
-        .map_err(|e| anyhow!("Failed to create pipeline for {}: {}", input.display(), e))?;
+    let mut pipeline = open_pipeline(input)?;
 
     // With a size limit, imagepipe demosaics and scales in one pass when the
     // reduction is 2x or more. This is several times faster than a full
@@ -109,6 +108,129 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// Decode `input` and build the processing pipeline for it.
+///
+/// Decoders are tried in this order:
+/// 1. rawloader, which imagepipe is built on. Its camera list ends in 2018.
+/// 2. rawler, which knows newer cameras and Canon CR3.
+/// 3. imagepipe's raster loader, for JPEG, PNG, and TIFF input.
+///
+/// The RAW decoders come first because most RAW files are TIFF containers,
+/// and a raster loader could open one and return only its preview.
+fn open_pipeline(input: &Path) -> Result<Pipeline> {
+    let raw = match rawloader::decode_file(input) {
+        Ok(raw) => raw,
+        Err(old_decoder) => match decode_with_rawler(input) {
+            Ok(raw) => raw,
+            // imagepipe opens raster files itself, with its own version of
+            // the `image` crate.
+            Err(new_decoder) => {
+                return Pipeline::new_from_file(input).map_err(|_| {
+                    // Both decoders give long messages; one line is enough.
+                    let detail = |e: &str| e.lines().next().unwrap_or_default().to_string();
+                    anyhow!(
+                        "Cannot decode {}: the file is corrupt or its format is not supported \
+                         ({}; {})",
+                        input.display(),
+                        detail(&old_decoder.to_string()),
+                        detail(&new_decoder)
+                    )
+                })
+            }
+        },
+    };
+    Pipeline::new_from_source(ImageSource::Raw(raw))
+        .map_err(|e| anyhow!("Failed to create pipeline for {}: {}", input.display(), e))
+}
+
+/// Decode with rawler and convert the result to the type that imagepipe
+/// takes. The two crates share an ancestor, so the fields map one to one.
+fn decode_with_rawler(input: &Path) -> Result<rawloader::RawImage, String> {
+    use rawler::rawimage::{RawImageData, RawPhotometricInterpretation};
+
+    // rawler can panic on files that are not RAW files.
+    let img = std::panic::catch_unwind(|| rawler::decode_file(input))
+        .map_err(|_| "decoder panicked".to_string())?
+        .map_err(|e| e.to_string())?;
+
+    let cfa = match &img.photometric {
+        RawPhotometricInterpretation::Cfa(config) => rawloader::CFA::new(&config.cfa.name),
+        _ => rawloader::CFA::new(""),
+    };
+
+    // rawler gives levels per position of a 2x2 pattern; imagepipe wants
+    // them per colour.
+    let per_colour = |levels: [f32; 4]| {
+        let mut out = levels.map(|l| l.round() as u16);
+        if cfa.width == 2 && cfa.height == 2 {
+            for (i, level) in levels.iter().enumerate() {
+                out[cfa.color_at(i / 2, i % 2)] = level.round() as u16;
+            }
+        }
+        out
+    };
+
+    // Top, right, bottom, left.
+    let crops = match img.crop_area.or(img.active_area) {
+        Some(r) => [
+            r.p.y,
+            img.width.saturating_sub(r.p.x + r.d.w),
+            img.height.saturating_sub(r.p.y + r.d.h),
+            r.p.x,
+        ],
+        None => [0; 4],
+    };
+
+    // rawler leaves `xyz_to_cam` empty and gives matrices per illuminant.
+    let mut xyz_to_cam = img.xyz_to_cam;
+    if xyz_to_cam.iter().flatten().all(|v| *v == 0.0) {
+        let matrix = img
+            .color_matrix
+            .get(&rawler::imgop::xyz::Illuminant::D65)
+            .or_else(|| img.color_matrix.values().next())
+            .ok_or("no colour matrix for this camera")?;
+        for (i, v) in matrix.iter().take(12).enumerate() {
+            xyz_to_cam[i / 3][i % 3] = *v;
+        }
+    }
+
+    use rawler::Orientation as New;
+    use rawloader::Orientation as Old;
+    let orientation = match img.orientation {
+        New::Normal => Old::Normal,
+        New::HorizontalFlip => Old::HorizontalFlip,
+        New::Rotate180 => Old::Rotate180,
+        New::VerticalFlip => Old::VerticalFlip,
+        New::Transpose => Old::Transpose,
+        New::Rotate90 => Old::Rotate90,
+        New::Transverse => Old::Transverse,
+        New::Rotate270 => Old::Rotate270,
+        New::Unknown => Old::Unknown,
+    };
+
+    Ok(rawloader::RawImage {
+        make: img.make,
+        model: img.model,
+        clean_make: img.clean_make,
+        clean_model: img.clean_model,
+        width: img.width,
+        height: img.height,
+        cpp: img.cpp,
+        wb_coeffs: img.wb_coeffs,
+        whitelevels: per_colour(img.whitelevel.as_bayer_array()),
+        blacklevels: per_colour(img.blacklevel.as_bayer_array()),
+        xyz_to_cam,
+        cfa,
+        crops,
+        blackareas: Vec::new(),
+        orientation,
+        data: match img.data {
+            RawImageData::Integer(data) => rawloader::RawImageData::Integer(data),
+            RawImageData::Float(data) => rawloader::RawImageData::Float(data),
+        },
+    })
 }
 
 /// Tone curve points that apply an exposure change of `ev` stops, followed
