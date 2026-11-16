@@ -73,13 +73,6 @@ Combine options:
 rawdog ./photos/ -o ./jpegs/ -q 95 -r 3000 --overwrite
 ```
 
-## Exit Status
-
-rawdog exits with `0` when every input converted or was skipped. It exits
-non-zero when any conversion failed, when an input path does not exist, when
-no RAW files were found, or when outputs conflict. Valid inputs are still
-converted when some other inputs fail or are missing.
-
 Make small proofs quickly. `--fast` scales during RAW decoding, which is several times faster and slightly softer:
 
 ```sh
@@ -93,6 +86,8 @@ rawdog -R /Volumes/CARD -o ~/Pictures --name "{date}/{model}_{stem}"
 ```
 
 Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), and `{model}`. A file without that metadata gets `unknown`.
+
+The template path is below the `-o` directory. Without `-o` it is below the directory of each input file. With a template, `-R` does not mirror the input tree, so include `{date}` or another field that keeps equal file names apart.
 
 Brighten a dark batch by two thirds of a stop and set the white balance to 3400 K:
 
@@ -141,6 +136,21 @@ Print errors only, for use in scripts:
 ```sh
 rawdog ./photos/ --quiet
 ```
+
+## Existing Files
+
+- An existing output file is skipped. `--overwrite` replaces it, and `--update` replaces it only when the RAW file is newer.
+- rawdog never writes over its own input.
+- rawdog never replaces a file whose name differs from the output name only in letter case. A camera that records RAW+JPEG writes `DSC1.JPG` next to `DSC1.ARW`, and on macOS that file would be replaced by `DSC1.jpg`. Use `-o` or `--name` to write the output somewhere else.
+- Dot-files in a scanned directory are ignored. macOS writes `._NAME` files on memory cards.
+
+## Exit Status
+
+rawdog exits with `0` when every input converted or was skipped. It exits
+non-zero when any conversion failed, when an input path does not exist, when
+no RAW files were found, or when outputs conflict. Valid inputs are still
+converted when some other inputs fail or are missing.
+A refused or failed file also gives a non-zero exit status, with `--dry-run` too.
 
 ## macOS Finder Integration
 

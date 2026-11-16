@@ -64,7 +64,7 @@ struct Cli {
 
     /// Exposure correction in stops, from -5 to 5. Highlights roll off
     /// instead of clipping
-    #[arg(short, long, value_name = "EV", allow_negative_numbers = true,
+    #[arg(short, long, value_name = "EV", allow_hyphen_values = true,
           value_parser = float_in_range::<-5, 5>)]
     exposure: Option<f32>,
 
@@ -152,6 +152,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(dir) = cli.output.as_deref().filter(|d| d.exists() && !d.is_dir()) {
+        bail!("Output path {} exists and is not a directory.", dir.display());
+    }
+
     // Collect all RAW files from inputs
     let files = collect_raw_files(&cli.input, cli.recursive)?;
     // Same condition under which collect_raw_files warns "does not exist".
@@ -171,16 +175,28 @@ fn main() -> Result<()> {
         cli.name.as_ref(),
     )?;
 
+    let dir_names = DirNames::default();
+
     if cli.dry_run {
+        let mut refused = false;
         for (input_path, output_path) in &jobs {
-            let action = if should_skip(input_path, output_path, cli.overwrite, cli.update) {
+            let reason = refusal(input_path, output_path, &dir_names);
+            let action = if reason.is_some() {
+                "refuse "
+            } else if should_skip(input_path, output_path, cli.overwrite, cli.update) {
                 "skip   "
             } else {
                 "convert"
             };
-            println!("{action} {} -> {}", input_path.display(), output_path.display());
+            let note = reason.map(|r| format!(" ({r})")).unwrap_or_default();
+            println!(
+                "{action} {} -> {}{note}",
+                input_path.display(),
+                output_path.display()
+            );
+            refused |= !note.is_empty();
         }
-        if missing_inputs {
+        if missing_inputs || refused {
             std::process::exit(1);
         }
         return Ok(());
@@ -242,13 +258,9 @@ fn main() -> Result<()> {
     std::panic::set_hook(Box::new(|_| {}));
 
     let convert_one = |(input_path, output_path): &(PathBuf, PathBuf)| {
-        if output_path.exists() && canonical(output_path) == canonical(input_path) {
+        if let Some(reason) = refusal(input_path, output_path, &dir_names) {
             pb.suspend(|| {
-                eprintln!(
-                    "Error converting {}: output path {} is the same file as the input",
-                    input_path.display(),
-                    output_path.display()
-                );
+                eprintln!("Error converting {}: {reason}", input_path.display());
             });
             failures.lock().unwrap().push(input_path.clone());
             failed.fetch_add(1, Ordering::Relaxed);
@@ -359,6 +371,56 @@ fn total_memory() -> Option<u64> {
     }
 }
 
+/// The exact file names in each directory, read once per directory.
+#[derive(Default)]
+struct DirNames(Mutex<HashMap<PathBuf, HashSet<std::ffi::OsString>>>);
+
+impl DirNames {
+    /// True if `path` exists under exactly this name. On a case-insensitive
+    /// volume `path.exists()` is also true for a name in another letter case.
+    fn has_exact(&self, path: &Path) -> bool {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return false;
+        };
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let mut cache = self.0.lock().unwrap();
+        let names = cache.entry(parent.to_path_buf()).or_insert_with(|| {
+            std::fs::read_dir(parent)
+                .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
+                .unwrap_or_default()
+        });
+        names.contains(name)
+    }
+}
+
+/// Why this job must not run, if there is a reason. These checks protect
+/// files that rawdog did not write, so `--overwrite` does not disable them.
+fn refusal(input: &Path, output: &Path, dir_names: &DirNames) -> Option<String> {
+    if !output.exists() {
+        return None;
+    }
+    if canonical(output) == canonical(input) {
+        return Some(format!(
+            "output path {} is the same file as the input",
+            output.display()
+        ));
+    }
+    // A camera that records RAW+JPEG writes DSC1.JPG next to DSC1.ARW. On a
+    // case-insensitive volume that file answers to the name DSC1.jpg.
+    if !dir_names.has_exact(output) {
+        return Some(format!(
+            "{} would replace an existing file whose name differs only in letter case \
+             (a camera JPEG?); use -o or --name to write somewhere else",
+            output.display()
+        ));
+    }
+    None
+}
+
 /// An existing output is skipped unless `overwrite` is set, or `update` is
 /// set and the input was modified after the output.
 fn should_skip(input: &Path, output: &Path, overwrite: bool, update: bool) -> bool {
@@ -403,7 +465,7 @@ fn collect_raw_files(inputs: &[PathBuf], recursive: bool) -> Result<Vec<InputFil
                     });
                 for entry in walker {
                     let p = entry.into_path();
-                    if p.is_file() && is_raw(&p) {
+                    if p.is_file() && is_raw(&p) && !is_hidden(&p) {
                         let rel_dir = p
                             .parent()
                             .and_then(|d| d.strip_prefix(path).ok())
@@ -416,7 +478,7 @@ fn collect_raw_files(inputs: &[PathBuf], recursive: bool) -> Result<Vec<InputFil
                 for entry in std::fs::read_dir(path)? {
                     let entry = entry?;
                     let p = entry.path();
-                    if p.is_file() && is_raw(&p) {
+                    if p.is_file() && is_raw(&p) && !is_hidden(&p) {
                         files.push(InputFile {
                             path: p,
                             rel_dir: PathBuf::new(),
@@ -434,12 +496,41 @@ fn collect_raw_files(inputs: &[PathBuf], recursive: bool) -> Result<Vec<InputFil
         }
     }
 
-    // Stable sort: when one file is reached through several inputs, the
-    // first input argument decides its `rel_dir`.
-    files.sort_by(|a, b| a.path.cmp(&b.path));
+    // When one file is reached through several inputs, the first input
+    // argument decides its `rel_dir`.
     let mut seen = HashSet::new();
     files.retain(|f| seen.insert(canonical(&f.path)));
+    files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
+}
+
+/// Dot-files in a scanned directory are not photos. macOS writes a `._NAME`
+/// companion for every file on FAT and exFAT memory cards.
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+}
+
+/// Where an output lands on disk, for conflict detection: symbolic links in
+/// the directory are resolved, and letter case is ignored because common
+/// volumes (APFS, NTFS, exFAT) are case-insensitive.
+fn output_key(output: &Path) -> PathBuf {
+    let mut existing = output.parent().unwrap_or(Path::new(""));
+    let resolved = loop {
+        if let Ok(resolved) = std::fs::canonicalize(if existing.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            existing
+        }) {
+            break resolved;
+        }
+        match existing.parent() {
+            Some(parent) => existing = parent,
+            None => break existing.to_path_buf(),
+        }
+    };
+    let rest = output.strip_prefix(existing).unwrap_or(output);
+    resolved.join(rest.to_string_lossy().to_lowercase())
 }
 
 fn canonical(path: &Path) -> PathBuf {
@@ -472,30 +563,22 @@ fn plan_outputs(
     let mut conflicts = Vec::new();
 
     for (i, f) in files.iter().enumerate() {
-        let (output, key) = match &named {
+        let output = match &named {
             Some(named) => {
                 let mut name = named[i].clone().into_os_string();
                 name.push(".");
                 name.push(extension(format));
-                let base = |input: &Path| match output_dir {
-                    Some(dir) => dir.to_path_buf(),
-                    None => input.parent().unwrap_or(Path::new("")).to_path_buf(),
-                };
-                (
-                    base(&f.path).join(&name),
-                    base(&canonical(&f.path)).join(&name),
-                )
+                match output_dir {
+                    Some(dir) => dir.join(&name),
+                    None => f.path.parent().unwrap_or(Path::new("")).join(&name),
+                }
             }
             None => {
                 let dir = output_dir.map(|d| d.join(&f.rel_dir));
-                (
-                    make_output_path(&f.path, dir.as_deref(), format),
-                    // Compare outputs by where they land on disk, not by how
-                    // the input was spelled.
-                    make_output_path(&canonical(&f.path), dir.as_deref(), format),
-                )
+                make_output_path(&f.path, dir.as_deref(), format)
             }
         };
+        let key = output_key(&output);
         if let Some(first) = claimed.get(&key) {
             conflicts.push(format!(
                 "  {} and {} both write {}",
@@ -629,6 +712,115 @@ mod tests {
         for name in ["a.CR2", "a.nef", "a.dng", "a.RAF", "a.orf", "a.rw2", "a.pef", "a.3fr"] {
             assert!(is_raw(Path::new(name)), "{name}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // refusal, output_key, and scan filter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn refusal_for_same_file_and_none_for_new_or_own_outputs() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("a.png");
+        fs::write(&input, b"x").unwrap();
+        let names = DirNames::default();
+        assert!(refusal(&input, &input, &names).unwrap().contains("same file"));
+        assert!(refusal(&input, &tmp.path().join("new.jpg"), &names).is_none());
+
+        let own = tmp.path().join("a.jpg");
+        fs::write(&own, b"x").unwrap();
+        assert!(refusal(&input, &own, &DirNames::default()).is_none());
+    }
+
+    #[test]
+    fn refusal_protects_a_file_that_differs_only_in_letter_case() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("DSC1.ARW");
+        fs::write(&input, b"x").unwrap();
+        fs::write(tmp.path().join("DSC1.JPG"), b"camera jpeg").unwrap();
+        let output = tmp.path().join("DSC1.jpg");
+
+        let reason = refusal(&input, &output, &DirNames::default());
+        if output.exists() {
+            // Case-insensitive volume: the camera file is in the way.
+            assert!(reason.unwrap().contains("letter case"));
+        } else {
+            assert!(reason.is_none());
+        }
+    }
+
+    #[test]
+    fn output_key_ignores_letter_case_and_resolves_symlinked_directories() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        assert_eq!(
+            output_key(&real.join("IMG.jpg")),
+            output_key(&real.join("img.jpg"))
+        );
+        // Directories that do not exist yet.
+        assert_eq!(
+            output_key(&real.join("New/Sub/IMG.jpg")),
+            output_key(&real.join("new/sub/img.jpg"))
+        );
+        assert_ne!(output_key(&real.join("a.jpg")), output_key(&real.join("b.jpg")));
+
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert_eq!(output_key(&link.join("a.jpg")), output_key(&real.join("a.jpg")));
+        }
+    }
+
+    #[test]
+    fn plan_outputs_detects_conflicts_that_differ_only_in_letter_case() {
+        let tmp = TempDir::new().unwrap();
+        for dir in ["a", "b"] {
+            fs::create_dir(tmp.path().join(dir)).unwrap();
+        }
+        fs::write(tmp.path().join("a/img.arw"), b"fake").unwrap();
+        fs::write(tmp.path().join("b/IMG.arw"), b"fake").unwrap();
+        let files = collect_raw_files(
+            &[tmp.path().join("a/img.arw"), tmp.path().join("b/IMG.arw")],
+            false,
+        )
+        .unwrap();
+        let out = tmp.path().join("out");
+        assert!(plan_outputs(&files, Some(&out), OutputFormat::Jpeg, None).is_err());
+    }
+
+    #[test]
+    fn collect_raw_files_skips_dot_files_in_scans_but_not_explicit_files() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("DSC1.ARW"), b"fake").unwrap();
+        fs::write(tmp.path().join("._DSC1.ARW"), b"fake").unwrap();
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("._DSC2.ARW"), b"fake").unwrap();
+
+        for recursive in [false, true] {
+            let files = collect_raw_files(&[tmp.path().to_path_buf()], recursive).unwrap();
+            assert_eq!(files.len(), 1, "recursive {recursive}");
+        }
+        let explicit = collect_raw_files(&[tmp.path().join("._DSC1.ARW")], false).unwrap();
+        assert_eq!(explicit.len(), 1);
+    }
+
+    #[test]
+    fn collect_raw_files_first_argument_decides_the_output_subdirectory() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("a");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("x.arw"), b"fake").unwrap();
+
+        let scanned_first =
+            collect_raw_files(&[tmp.path().to_path_buf(), sub.join("x.arw")], true).unwrap();
+        assert_eq!(scanned_first[0].rel_dir, PathBuf::from("a"));
+
+        let explicit_first =
+            collect_raw_files(&[sub.join("x.arw"), tmp.path().to_path_buf()], true).unwrap();
+        assert_eq!(explicit_first[0].rel_dir, PathBuf::new());
     }
 
     // -----------------------------------------------------------------------

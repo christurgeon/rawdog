@@ -163,9 +163,12 @@ impl NameTemplate {
                         Token::Time => taken(|(_, _, _, h, m, s)| format!("{h:02}{m:02}{s:02}")),
                         Token::Model => info.model.clone().unwrap_or_else(unknown),
                     };
-                    // A value must not add path components.
+                    // A value must not add path components, and must not
+                    // be the name of the current or the parent directory.
+                    let dots_only = !value.is_empty() && value.chars().all(|c| c == '.');
                     out.extend(value.chars().map(|c| match c {
                         '/' | '\\' | ':' | '\0' => '_',
+                        '.' if dots_only => '_',
                         c => c,
                     }));
                 }
@@ -225,6 +228,16 @@ mod tests {
             model: Some("../Evil/Cam".to_string()),
         };
         assert_eq!(expand("{model}_{stem}", &info), PathBuf::from(".._Evil_Cam_a"));
+    }
+
+    #[test]
+    fn a_value_of_dots_cannot_name_the_parent_directory() {
+        let info = NameInfo {
+            stem: "a".to_string(),
+            taken: None,
+            model: Some("..".to_string()),
+        };
+        assert_eq!(expand("{model}/{stem}", &info), PathBuf::from("__/a"));
     }
 
     #[test]
