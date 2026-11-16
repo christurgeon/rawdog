@@ -11,6 +11,9 @@ use imagepipe::{ImageSource, Pipeline, SplineFunc};
 use crate::exif as exif_utils;
 use crate::OutputFormat;
 
+/// Smallest `resize` value for which `fast` scales in the decoder.
+const FAST_MIN_EDGE: u32 = 16;
+
 /// Settings that apply to every file of a run.
 #[derive(Clone)]
 pub struct ConvertOptions {
@@ -48,15 +51,20 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     // With a size limit, imagepipe demosaics and scales in one pass when the
     // reduction is 2x or more. This is several times faster than a full
     // demosaic followed by a Lanczos resize, and slightly softer.
-    // One extra pixel is requested because `trim_fast_edge` removes the last
-    // row and column.
+    // Two extra pixels are requested because `trim_fast_edge` removes one
+    // pixel from every side. Very small sizes use the normal path.
     if let (true, Some(max_edge)) = (fast, resize) {
-        pipeline.globals.settings.maxwidth = max_edge as usize + 1;
-        pipeline.globals.settings.maxheight = max_edge as usize + 1;
+        if max_edge >= FAST_MIN_EDGE {
+            pipeline.globals.settings.maxwidth = max_edge as usize + 2;
+            pipeline.globals.settings.maxheight = max_edge as usize + 2;
+        }
     }
 
     if let Some((kelvin, tint)) = white_balance {
-        pipeline.ops.tolab.set_temp(kelvin, tint);
+        // imagepipe divides the green reference by its tint value, so a
+        // higher value gives a greener image. `--tint` is defined the other
+        // way: above 1 is more magenta.
+        pipeline.ops.tolab.set_temp(kelvin, 1.0 / tint);
     }
     if let Some(ev) = exposure {
         let curve = &mut pipeline.ops.basecurve;
@@ -70,19 +78,32 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     }
 
     // Write to a temporary file and rename it, so an interrupted or failed
-    // run never leaves a partial file that a later run would skip.
+    // run never leaves a partial file that a later run would skip. The file
+    // is created before decoding, so an unwritable directory fails quickly.
     let tmp = temp_path_for(output);
-    let result = match format {
-        OutputFormat::Jpeg => {
-            encode_jpeg(&mut pipeline, input, &tmp, opts)
-        }
-        OutputFormat::Tiff => encode_tiff(&mut pipeline, input, &tmp, opts),
-        OutputFormat::Png => encode_png(&mut pipeline, input, &tmp, opts),
-    }
-    .and_then(|()| {
-        std::fs::rename(&tmp, output)
-            .with_context(|| format!("Failed to write output file {}", output.display()))
-    });
+    let unwritable = || format!("Failed to write output file {}", output.display());
+    let result = std::fs::File::create(&tmp)
+        .with_context(unwritable)
+        .and_then(|file| {
+            let mut out = std::io::BufWriter::new(file);
+            match format {
+                OutputFormat::Jpeg => {
+                    let img = render_8bit(&mut pipeline, input, opts)?;
+                    write_jpeg(&img, input, &mut out, opts).with_context(unwritable)?;
+                }
+                OutputFormat::Tiff => {
+                    let img = render_16bit_sharpened(&mut pipeline, input, opts)?;
+                    write_tiff(&img, input, &mut out, opts).with_context(unwritable)?;
+                }
+                OutputFormat::Png => {
+                    let img = render_16bit_sharpened(&mut pipeline, input, opts)?;
+                    write_png(&img, input, &mut out, opts).with_context(unwritable)?;
+                }
+            }
+            out.flush().with_context(unwritable)?;
+            drop(out);
+            std::fs::rename(&tmp, output).with_context(unwritable)
+        });
 
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -132,12 +153,7 @@ fn temp_path_for(output: &Path) -> PathBuf {
     output.with_file_name(format!(".{name}.rawdog-tmp"))
 }
 
-fn encode_jpeg(
-    pipeline: &mut Pipeline,
-    input: &Path,
-    output: &Path,
-    opts: &ConvertOptions,
-) -> Result<()> {
+fn render_8bit(pipeline: &mut Pipeline, input: &Path, opts: &ConvertOptions) -> Result<RgbImage> {
     let decoded = pipeline
         .output_8bit(None)
         .map_err(|e| anyhow!("Failed to process {}: {}", input.display(), e))?;
@@ -148,22 +164,41 @@ fn encode_jpeg(
     let img: RgbImage = ImageBuffer::from_raw(width, height, decoded.data)
         .context("Failed to construct image buffer from decoded data")?;
 
-    let mut final_img = maybe_resize_8bit(trim_fast_edge(img, opts.resize, opts.fast), opts.resize);
+    let mut img = maybe_resize_8bit(trim_fast_edge(img, opts.resize, opts.fast), opts.resize);
     if let Some(amount) = opts.sharpen {
-        sharpen(&mut final_img, amount);
+        sharpen(&mut img, amount);
     }
+    Ok(img)
+}
 
+fn render_16bit_sharpened(
+    pipeline: &mut Pipeline,
+    input: &Path,
+    opts: &ConvertOptions,
+) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
+    let mut img = render_16bit(pipeline, input, opts.resize, opts.fast)?;
+    if let Some(amount) = opts.sharpen {
+        sharpen(&mut img, amount);
+    }
+    Ok(img)
+}
+
+fn write_jpeg(
+    img: &RgbImage,
+    input: &Path,
+    out: &mut impl Write,
+    opts: &ConvertOptions,
+) -> Result<()> {
     // Encode JPEG to an in-memory buffer so we can inject EXIF metadata
     // before writing to disk.
     let mut jpeg_buf = Vec::new();
     let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, opts.quality);
-    final_img
-        .write_with_encoder(encoder)
-        .with_context(|| format!("Failed to encode JPEG to {}", output.display()))?;
+    img.write_with_encoder(encoder)
+        .context("Failed to encode JPEG")?;
 
     // Inject EXIF metadata into the JPEG if available. Failures here are
     // non-fatal: we still produce the output image.
-    let exif_data = exif_utils::extract_exif(input, final_img.dimensions(), &opts.metadata)
+    let exif_data = exif_utils::extract_exif(input, img.dimensions(), &opts.metadata)
         .ok()
         .flatten();
     let final_bytes = match exif_data {
@@ -171,69 +206,44 @@ fn encode_jpeg(
         None => jpeg_buf,
     };
 
-    std::fs::write(output, &final_bytes)
-        .with_context(|| format!("Failed to write output file {}", output.display()))?;
-
+    out.write_all(&final_bytes)?;
     Ok(())
 }
 
-fn encode_tiff(
-    pipeline: &mut Pipeline,
+fn write_tiff(
+    img: &ImageBuffer<Rgb<u16>, Vec<u16>>,
     input: &Path,
-    output: &Path,
+    out: &mut (impl Write + std::io::Seek),
     opts: &ConvertOptions,
 ) -> Result<()> {
-    let mut final_img = render_16bit(pipeline, input, opts.resize, opts.fast)?;
-    if let Some(amount) = opts.sharpen {
-        sharpen(&mut final_img, amount);
-    }
-
-    let out_file = std::fs::File::create(output)
-        .with_context(|| format!("Failed to create output file {}", output.display()))?;
-    let mut out_file = std::io::BufWriter::new(out_file);
-
     // EXIF failures are non-fatal: fall back to a TIFF without metadata.
-    let fields = exif_utils::read_fields_for_output(input, final_img.dimensions(), &opts.metadata)
+    let fields = exif_utils::read_fields_for_output(input, img.dimensions(), &opts.metadata)
         .ok()
         .flatten();
     match fields {
-        Some((fields, _)) => exif_utils::write_tiff_16bit_with_exif(
-            &mut out_file,
-            final_img.dimensions(),
-            final_img.as_raw(),
-            &fields,
-        ),
-        None => final_img
-            .write_with_encoder(TiffEncoder::new(&mut out_file))
+        Some((fields, _)) => {
+            exif_utils::write_tiff_16bit_with_exif(out, img.dimensions(), img.as_raw(), &fields)
+        }
+        None => img
+            .write_with_encoder(TiffEncoder::new(out))
             .map_err(Into::into),
     }
-    .with_context(|| format!("Failed to encode TIFF to {}", output.display()))?;
-
-    out_file
-        .flush()
-        .with_context(|| format!("Failed to write output file {}", output.display()))
+    .context("Failed to encode TIFF")
 }
 
-fn encode_png(
-    pipeline: &mut Pipeline,
+fn write_png(
+    img: &ImageBuffer<Rgb<u16>, Vec<u16>>,
     input: &Path,
-    output: &Path,
+    out: &mut impl Write,
     opts: &ConvertOptions,
 ) -> Result<()> {
-    let mut final_img = render_16bit(pipeline, input, opts.resize, opts.fast)?;
-    if let Some(amount) = opts.sharpen {
-        sharpen(&mut final_img, amount);
-    }
-
     // Encode PNG to an in-memory buffer so we can inject EXIF metadata.
     let mut buf = Vec::new();
-    let encoder = PngEncoder::new(&mut buf);
-    final_img
-        .write_with_encoder(encoder)
-        .with_context(|| format!("Failed to encode PNG to {}", output.display()))?;
+    img.write_with_encoder(PngEncoder::new(&mut buf))
+        .context("Failed to encode PNG")?;
 
     // Inject EXIF metadata into the PNG if available.
-    let exif_data = exif_utils::extract_exif(input, final_img.dimensions(), &opts.metadata)
+    let exif_data = exif_utils::extract_exif(input, img.dimensions(), &opts.metadata)
         .ok()
         .flatten();
     let final_bytes = match exif_data {
@@ -241,9 +251,7 @@ fn encode_png(
         None => buf,
     };
 
-    std::fs::write(output, &final_bytes)
-        .with_context(|| format!("Failed to write output file {}", output.display()))?;
-
+    out.write_all(&final_bytes)?;
     Ok(())
 }
 
@@ -336,10 +344,11 @@ fn srgb_encode_lut() -> Vec<u16> {
         .collect()
 }
 
-/// Remove the last row and column of an image that imagepipe scaled in
-/// `fast` mode. Its scaled demosaic leaves the red channel empty there.
+/// Remove one pixel from every side of an image that imagepipe scaled in
+/// `fast` mode. Its scaled demosaic leaves the red channel empty in the last
+/// sensor row and column, and the image rotation can put those on any side.
 ///
-/// The pipeline was asked for a long edge of `resize + 1`, so the result has
+/// The pipeline was asked for a long edge of `resize + 2`, so the result has
 /// a long edge of `resize`. An image that was not scaled is returned as it is.
 fn trim_fast_edge<P>(
     img: ImageBuffer<P, Vec<P::Subpixel>>,
@@ -351,8 +360,13 @@ where
 {
     let (width, height) = img.dimensions();
     match resize {
-        Some(max_edge) if fast && width.max(height) == max_edge + 1 && width.min(height) > 1 => {
-            image::imageops::crop_imm(&img, 0, 0, width - 1, height - 1).to_image()
+        Some(max_edge)
+            if fast
+                && max_edge >= FAST_MIN_EDGE
+                && width.max(height) == max_edge + 2
+                && width.min(height) > 2 =>
+        {
+            image::imageops::crop_imm(&img, 1, 1, width - 2, height - 2).to_image()
         }
         _ => img,
     }
@@ -596,21 +610,24 @@ mod tests {
     }
 
     #[test]
-    fn trim_fast_edge_removes_last_row_and_column_of_scaled_images() {
-        let img = ImageBuffer::from_fn(101, 51, |x, y| Rgb([x as u8, y as u8, 0]));
+    fn trim_fast_edge_removes_one_pixel_from_every_side_of_scaled_images() {
+        let img = ImageBuffer::from_fn(102, 52, |x, y| Rgb([x as u8, y as u8, 0]));
         let out = trim_fast_edge(img, Some(100), true);
         assert_eq!(out.dimensions(), (100, 50));
-        assert_eq!(out.get_pixel(99, 49), &Rgb([99u8, 49, 0]));
+        assert_eq!(out.get_pixel(0, 0), &Rgb([1u8, 1, 0]));
+        assert_eq!(out.get_pixel(99, 49), &Rgb([100u8, 50, 0]));
     }
 
     #[test]
     fn trim_fast_edge_leaves_other_images_unchanged() {
         // Not fast.
-        assert_eq!(trim_fast_edge(make_8bit_image(101, 51), Some(100), false).dimensions(), (101, 51));
+        assert_eq!(trim_fast_edge(make_8bit_image(102, 52), Some(100), false).dimensions(), (102, 52));
         // Smaller than the limit, so the pipeline did not scale it.
         assert_eq!(trim_fast_edge(make_8bit_image(80, 40), Some(100), true).dimensions(), (80, 40));
         // No limit.
-        assert_eq!(trim_fast_edge(make_16bit_image(101, 51), None, true).dimensions(), (101, 51));
+        assert_eq!(trim_fast_edge(make_16bit_image(102, 52), None, true).dimensions(), (102, 52));
+        // Below the smallest size that uses decoder scaling.
+        assert_eq!(trim_fast_edge(make_8bit_image(10, 6), Some(8), true).dimensions(), (10, 6));
     }
 
     // -----------------------------------------------------------------------
