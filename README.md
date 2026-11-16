@@ -122,7 +122,7 @@ Convert again only the files whose RAW is newer than the existing output:
 rawdog ./photos/ --update
 ```
 
-Limit memory use by converting two files at a time:
+Set how many files are converted at the same time. By default rawdog chooses this from the installed RAM and the size of the largest input, because too many large files at once make the system swap:
 
 ```sh
 rawdog ./photos/ -j 2
