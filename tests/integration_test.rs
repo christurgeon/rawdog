@@ -242,3 +242,84 @@ fn cli_help_flag_shows_usage() {
     assert!(stdout.contains("--quality"));
     assert!(stdout.contains("--output"));
 }
+
+fn run(args: &[&std::ffi::OsStr]) -> std::process::Output {
+    Command::new(rawdog_bin())
+        .args(args)
+        .output()
+        .expect("failed to run rawdog")
+}
+
+#[test]
+fn cli_version_flag_prints_version() {
+    let output = run(&["--version".as_ref()]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("rawdog "), "got: {stdout}");
+}
+
+#[test]
+fn cli_format_aliases_are_accepted() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [50, 100, 150]);
+
+    let output = run(&[input.as_ref(), "-f".as_ref(), "jpg".as_ref()]);
+    assert!(output.status.success());
+    assert!(tmp.path().join("in.jpg").is_file());
+
+    let output = run(&[input.as_ref(), "-f".as_ref(), "tif".as_ref()]);
+    assert!(output.status.success());
+    assert!(tmp.path().join("in.tiff").is_file());
+}
+
+#[test]
+fn cli_resize_zero_is_rejected() {
+    let output = run(&["-r".as_ref(), "0".as_ref(), "/tmp/fake.arw".as_ref()]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn cli_resize_extreme_aspect_ratio_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("wide.png");
+    image::RgbImage::from_pixel(1000, 2, image::Rgb([9, 9, 9]))
+        .save(&input)
+        .unwrap();
+
+    let output = run(&[input.as_ref(), "-r".as_ref(), "100".as_ref()]);
+    assert!(output.status.success());
+    let (w, h) = image::image_dimensions(tmp.path().join("wide.jpg")).unwrap();
+    assert_eq!((w, h), (100, 1));
+}
+
+#[test]
+fn cli_directory_named_like_arw_is_not_an_input() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join("folder.arw")).unwrap();
+
+    let output = run(&[tmp.path().as_ref()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("No ARW files"), "got: {stderr}");
+}
+
+#[test]
+fn cli_leaves_no_temporary_files() {
+    let tmp = TempDir::new().unwrap();
+    let good = tmp.path().join("good.png");
+    write_png(&good, [1, 2, 3]);
+    let bad = tmp.path().join("bad.arw");
+    fs::write(&bad, b"not a raw file").unwrap();
+
+    run(&[good.as_ref(), bad.as_ref()]);
+
+    let names: Vec<String> = files_under(tmp.path())
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert!(names.contains(&"good.jpg".to_string()), "got: {names:?}");
+    assert!(
+        names.iter().all(|n| !n.contains("rawdog-tmp")),
+        "got: {names:?}"
+    );
+}

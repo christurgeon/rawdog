@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use image::codecs::jpeg::JpegEncoder;
@@ -31,15 +31,32 @@ pub fn convert_arw(
             .with_context(|| format!("Failed to create output directory {}", parent.display()))?;
     }
 
-    match format {
+    // Write to a temporary file and rename it, so an interrupted or failed
+    // run never leaves a partial file that a later run would skip.
+    let tmp = temp_path_for(output);
+    let result = match format {
         OutputFormat::Jpeg => {
-            encode_jpeg(&mut pipeline, input, output, quality, resize, exif_data.as_deref())
+            encode_jpeg(&mut pipeline, input, &tmp, quality, resize, exif_data.as_deref())
         }
-        OutputFormat::Tiff => encode_16bit(&mut pipeline, input, output, resize, Format16::Tiff),
+        OutputFormat::Tiff => encode_16bit(&mut pipeline, input, &tmp, resize, Format16::Tiff),
         OutputFormat::Png => {
-            encode_16bit_with_exif(&mut pipeline, input, output, resize, Format16::Png, exif_data.as_deref())
+            encode_16bit_with_exif(&mut pipeline, input, &tmp, resize, Format16::Png, exif_data.as_deref())
         }
     }
+    .and_then(|()| {
+        std::fs::rename(&tmp, output)
+            .with_context(|| format!("Failed to write output file {}", output.display()))
+    });
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn temp_path_for(output: &Path) -> PathBuf {
+    let name = output.file_name().unwrap_or_default().to_string_lossy();
+    output.with_file_name(format!(".{name}.rawdog-tmp"))
 }
 
 fn encode_jpeg(
@@ -211,8 +228,8 @@ fn maybe_resize_8bit(
         let long_edge = width.max(height);
         if long_edge > max_edge {
             let scale = max_edge as f64 / long_edge as f64;
-            let new_w = (width as f64 * scale).round() as u32;
-            let new_h = (height as f64 * scale).round() as u32;
+            let new_w = ((width as f64 * scale).round() as u32).max(1);
+            let new_h = ((height as f64 * scale).round() as u32).max(1);
             return image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Lanczos3);
         }
     }
@@ -228,8 +245,8 @@ fn maybe_resize_16bit(
         let long_edge = width.max(height);
         if long_edge > max_edge {
             let scale = max_edge as f64 / long_edge as f64;
-            let new_w = (width as f64 * scale).round() as u32;
-            let new_h = (height as f64 * scale).round() as u32;
+            let new_w = ((width as f64 * scale).round() as u32).max(1);
+            let new_h = ((height as f64 * scale).round() as u32).max(1);
             return image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Lanczos3);
         }
     }
@@ -307,6 +324,14 @@ mod tests {
         let (w, h) = result.dimensions();
         assert_eq!(w, 3000);
         assert_eq!(h, 2000);
+    }
+
+    #[test]
+    fn resize_extreme_aspect_ratio_keeps_short_edge_at_least_one() {
+        let result = maybe_resize_8bit(make_8bit_image(1000, 2), Some(100));
+        assert_eq!(result.dimensions(), (100, 1));
+        let result = maybe_resize_16bit(make_16bit_image(2, 1000), Some(100));
+        assert_eq!(result.dimensions(), (1, 100));
     }
 
     // -----------------------------------------------------------------------
