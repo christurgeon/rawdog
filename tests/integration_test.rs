@@ -10,16 +10,7 @@ use tempfile::TempDir;
 
 /// Helper: path to the built binary.
 fn rawdog_bin() -> std::path::PathBuf {
-    // `cargo test` places the binary in target/debug
-    let mut path = std::env::current_exe()
-        .unwrap()
-        .parent() // deps/
-        .unwrap()
-        .parent() // debug/
-        .unwrap()
-        .to_path_buf();
-    path.push("rawdog");
-    path
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_rawdog"))
 }
 
 #[test]
@@ -114,6 +105,128 @@ fn cli_invalid_format_value() {
     assert!(
         stderr.contains("invalid value") || stderr.contains("possible values"),
         "Expected invalid format error, got: {stderr}"
+    );
+}
+
+/// Write a small PNG. imagepipe falls back to `image::open` for non-RAW files,
+/// so an explicit PNG argument goes through the full convert path.
+fn write_png(path: &std::path::Path, rgb: [u8; 3]) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    image::RgbImage::from_pixel(8, 8, image::Rgb(rgb))
+        .save(path)
+        .unwrap();
+}
+
+fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .map(|e| e.unwrap().into_path())
+        .filter(|p| p.is_file())
+        .collect()
+}
+
+#[test]
+fn cli_output_collision_is_an_error_and_converts_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let a = tmp.path().join("a/x.png");
+    let b = tmp.path().join("b/x.png");
+    write_png(&a, [200, 10, 10]);
+    write_png(&b, [10, 200, 10]);
+    let out = tmp.path().join("out");
+
+    let output = Command::new(rawdog_bin())
+        .arg(&a)
+        .arg(&b)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("failed to run rawdog");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "expected failure, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&*a.to_string_lossy()) && stderr.contains(&*b.to_string_lossy()),
+        "expected both conflicting inputs in error, got: {stderr}"
+    );
+    assert!(files_under(&out).is_empty(), "nothing should be converted");
+}
+
+#[test]
+fn cli_failed_conversion_exits_nonzero_after_summary() {
+    let tmp = TempDir::new().unwrap();
+    let bad = tmp.path().join("bad.arw");
+    fs::write(&bad, b"not a raw file").unwrap();
+
+    let output = Command::new(rawdog_bin())
+        .arg(&bad)
+        .output()
+        .expect("failed to run rawdog");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("0 succeeded, 1 failed, 0 skipped"),
+        "got: {stdout}"
+    );
+    assert!(!output.status.success(), "expected non-zero exit");
+}
+
+#[test]
+fn cli_missing_input_exits_nonzero_but_converts_valid_inputs() {
+    let tmp = TempDir::new().unwrap();
+    let good = tmp.path().join("good.png");
+    write_png(&good, [120, 120, 120]);
+    let out = tmp.path().join("out");
+
+    let output = Command::new(rawdog_bin())
+        .arg(&good)
+        .arg(tmp.path().join("missing.arw"))
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("failed to run rawdog");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("does not exist"), "got: {stderr}");
+    assert!(
+        stdout.contains("1 succeeded, 0 failed, 0 skipped"),
+        "got: {stdout}"
+    );
+    assert!(out.join("good.jpg").is_file());
+    assert!(!output.status.success(), "expected non-zero exit");
+}
+
+#[test]
+fn cli_overwrite_refuses_to_replace_its_own_input() {
+    let tmp = TempDir::new().unwrap();
+    let same = tmp.path().join("same.png");
+    write_png(&same, [10, 20, 30]);
+    let before = fs::read(&same).unwrap();
+
+    let output = Command::new(rawdog_bin())
+        .arg(&same)
+        .args(["-f", "png", "--overwrite"])
+        .output()
+        .expect("failed to run rawdog");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("same file as the input"), "got: {stderr}");
+    assert!(
+        stdout.contains("0 succeeded, 1 failed, 0 skipped"),
+        "got: {stdout}"
+    );
+    assert!(!output.status.success(), "expected non-zero exit");
+    assert_eq!(
+        fs::read(&same).unwrap(),
+        before,
+        "input must not be modified"
     );
 }
 

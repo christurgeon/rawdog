@@ -26,7 +26,7 @@ pub fn extract_exif_from_arw(path: &Path) -> Result<Option<Vec<u8>>> {
         Err(_) => return Ok(None),
     };
 
-    let fields: Vec<&exif::Field> = exif.fields().collect();
+    let fields = fields_for_output(exif.fields());
     if fields.is_empty() {
         return Ok(None);
     }
@@ -49,6 +49,22 @@ pub fn extract_exif_from_arw(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 
     Ok(Some(data))
+}
+
+/// Prepare source EXIF fields for the converted image.
+///
+/// imagepipe rotates the pixels according to the RAW orientation, so any
+/// Orientation tag is reset to 1 (normal). A missing tag is not added.
+fn fields_for_output<'a>(fields: impl Iterator<Item = &'a exif::Field>) -> Vec<exif::Field> {
+    fields
+        .map(|field| {
+            let mut field = field.clone();
+            if field.tag == exif::Tag::Orientation {
+                field.value = exif::Value::Short(vec![1]);
+            }
+            field
+        })
+        .collect()
 }
 
 /// Inject raw EXIF bytes (a TIFF blob) into an already-encoded JPEG buffer.
@@ -107,6 +123,83 @@ mod tests {
         std::fs::write(tmp.path(), b"not a raw file").unwrap();
         let result = extract_exif_from_arw(tmp.path()).unwrap();
         assert!(result.is_none());
+    }
+
+    fn orientation_field(value: u16) -> exif::Field {
+        exif::Field {
+            tag: exif::Tag::Orientation,
+            ifd_num: exif::In::PRIMARY,
+            value: exif::Value::Short(vec![value]),
+        }
+    }
+
+    fn description_field() -> exif::Field {
+        exif::Field {
+            tag: exif::Tag::ImageDescription,
+            ifd_num: exif::In::PRIMARY,
+            value: exif::Value::Ascii(vec![b"RawDog Test".to_vec()]),
+        }
+    }
+
+    /// Serialize fields as a TIFF file, which is the container format of ARW.
+    fn write_tiff_with_fields(fields: &[exif::Field]) -> tempfile::NamedTempFile {
+        let mut writer = exif::experimental::Writer::new();
+        for f in fields {
+            writer.push_field(f);
+        }
+        let mut buf = Cursor::new(Vec::new());
+        writer.write(&mut buf, true).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".arw").tempfile().unwrap();
+        std::fs::write(tmp.path(), buf.into_inner()).unwrap();
+        tmp
+    }
+
+    fn orientation_of(exif_data: &[u8]) -> Option<u32> {
+        let parsed = exif::Reader::new().read_raw(exif_data.to_vec()).unwrap();
+        parsed
+            .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+            .and_then(|f| f.value.get_uint(0))
+    }
+
+    #[test]
+    fn fields_for_output_resets_orientation() {
+        let source = [orientation_field(8), description_field()];
+        let out = fields_for_output(source.iter());
+        assert_eq!(out.len(), 2);
+        let orientation = out
+            .iter()
+            .find(|f| f.tag == exif::Tag::Orientation)
+            .unwrap();
+        assert_eq!(orientation.value.get_uint(0), Some(1));
+        let desc = out
+            .iter()
+            .find(|f| f.tag == exif::Tag::ImageDescription)
+            .unwrap();
+        assert_eq!(desc.display_value().to_string(), "\"RawDog Test\"");
+    }
+
+    #[test]
+    fn fields_for_output_does_not_add_orientation() {
+        let source = [description_field()];
+        let out = fields_for_output(source.iter());
+        assert!(out.iter().all(|f| f.tag != exif::Tag::Orientation));
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn extract_exif_resets_orientation_to_normal() {
+        // imagepipe already rotates the pixels, so a copied Orientation of 6
+        // would make viewers rotate the image a second time.
+        let tmp = write_tiff_with_fields(&[orientation_field(6), description_field()]);
+        let data = extract_exif_from_arw(tmp.path()).unwrap().unwrap();
+        assert_eq!(orientation_of(&data), Some(1));
+    }
+
+    #[test]
+    fn extract_exif_does_not_add_missing_orientation() {
+        let tmp = write_tiff_with_fields(&[description_field()]);
+        let data = extract_exif_from_arw(tmp.path()).unwrap().unwrap();
+        assert_eq!(orientation_of(&data), None);
     }
 
     #[test]

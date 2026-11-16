@@ -30,6 +30,17 @@ Specify an output directory:
 rawdog ./photos/ -o ./jpegs/
 ```
 
+Convert a directory tree recursively. With `-o`, the subdirectory layout under
+the input directory is mirrored under the output directory:
+
+```sh
+rawdog -R ./photos/ -o ./jpegs/   # photos/2024/a.ARW -> jpegs/2024/a.jpg
+```
+
+Files given directly on the command line go straight into `-o`. If two inputs
+would write the same output file, rawdog reports the conflict and converts
+nothing.
+
 Resize the long edge to 2048px:
 
 ```sh
@@ -59,6 +70,13 @@ Combine options:
 ```sh
 rawdog ./photos/ -o ./jpegs/ -q 95 -r 3000 --overwrite
 ```
+
+## Exit Status
+
+rawdog exits with `0` when every input converted or was skipped. It exits
+non-zero when any conversion failed, when an input path does not exist, when
+no ARW files were found, or when outputs conflict. Valid inputs are still
+converted when some other inputs fail or are missing.
 
 ## macOS Finder Integration
 
