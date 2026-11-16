@@ -2,7 +2,9 @@
 
 Raw files in, images out. No Lightroom, no fuss.
 
-A no-nonsense Sony ARW converter supporting JPEG, TIFF, and PNG output.
+A no-nonsense RAW converter supporting JPEG, TIFF, and PNG output. Built for Sony ARW; it also accepts most other camera RAW formats (DNG, CR2, NEF, RAF, ORF, RW2, PEF, and more).
+
+Camera support comes from the [rawloader](https://github.com/pedrocr/rawloader) library. Its camera list stops at about 2018, so files from newer bodies can fail to decode.
 
 ## Installation
 
@@ -18,7 +20,7 @@ Convert a single file:
 rawdog photo.ARW
 ```
 
-Convert all ARW files in a directory:
+Convert all RAW files in a directory:
 
 ```sh
 rawdog ./photos/
@@ -75,7 +77,7 @@ rawdog ./photos/ -o ./jpegs/ -q 95 -r 3000 --overwrite
 
 rawdog exits with `0` when every input converted or was skipped. It exits
 non-zero when any conversion failed, when an input path does not exist, when
-no ARW files were found, or when outputs conflict. Valid inputs are still
+no RAW files were found, or when outputs conflict. Valid inputs are still
 converted when some other inputs fail or are missing.
 
 Make small proofs quickly. `--fast` scales during RAW decoding, which is several times faster and slightly softer:
