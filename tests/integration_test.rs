@@ -673,3 +673,24 @@ fn cli_tint_above_one_is_more_magenta() {
     assert!(high > neutral + 3.0, "{high} vs {neutral}");
     assert!(low < neutral - 3.0, "{low} vs {neutral}");
 }
+
+#[test]
+fn cli_preview_conflicts_with_development_options() {
+    for other in [&["--fast", "-r", "100"][..], &["--exposure", "1"], &["--wb", "5000"]] {
+        let mut args: Vec<&std::ffi::OsStr> = vec!["--preview".as_ref(), "/tmp/fake.arw".as_ref()];
+        args.extend(other.iter().map(|a| a.as_ref() as &std::ffi::OsStr));
+        assert_eq!(run(&args).status.code(), Some(2), "{other:?}");
+    }
+}
+
+#[test]
+fn cli_preview_fails_cleanly_for_a_file_without_a_preview() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [1, 2, 3]);
+    let output = run(&[input.as_ref(), "--preview".as_ref()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("preview"), "got: {stderr}");
+    assert!(!output.status.success());
+    assert!(!tmp.path().join("in.jpg").exists());
+}

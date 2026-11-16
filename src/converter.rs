@@ -31,6 +31,9 @@ pub struct ConvertOptions {
     pub white_balance: Option<(f32, f32)>,
     /// Strength of output sharpening, applied after the resize.
     pub sharpen: Option<f32>,
+    /// Use the JPEG preview that the camera embedded in the RAW file
+    /// instead of developing the RAW data.
+    pub preview: bool,
     pub metadata: exif_utils::MetadataOptions,
 }
 
@@ -45,30 +48,35 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         ..
     } = *opts;
 
-    let mut pipeline = open_pipeline(input)?;
+    let mut source = if opts.preview {
+        Source::Preview(load_preview(input)?)
+    } else {
+        let mut pipeline = open_pipeline(input)?;
 
-    // With a size limit, imagepipe demosaics and scales in one pass when the
-    // reduction is 2x or more. This is several times faster than a full
-    // demosaic followed by a Lanczos resize, and slightly softer.
-    // Two extra pixels are requested because `trim_fast_edge` removes one
-    // pixel from every side. Very small sizes use the normal path.
-    if let (true, Some(max_edge)) = (fast, resize) {
-        if max_edge >= FAST_MIN_EDGE {
-            pipeline.globals.settings.maxwidth = max_edge as usize + 2;
-            pipeline.globals.settings.maxheight = max_edge as usize + 2;
+        // With a size limit, imagepipe demosaics and scales in one pass when
+        // the reduction is 2x or more. This is several times faster than a
+        // full demosaic followed by a Lanczos resize, and slightly softer.
+        // Two extra pixels are requested because `trim_fast_edge` removes
+        // one pixel from every side. Very small sizes use the normal path.
+        if let (true, Some(max_edge)) = (fast, resize) {
+            if max_edge >= FAST_MIN_EDGE {
+                pipeline.globals.settings.maxwidth = max_edge as usize + 2;
+                pipeline.globals.settings.maxheight = max_edge as usize + 2;
+            }
         }
-    }
 
-    if let Some((kelvin, tint)) = white_balance {
-        // imagepipe divides the green reference by its tint value, so a
-        // higher value gives a greener image. `--tint` is defined the other
-        // way: above 1 is more magenta.
-        pipeline.ops.tolab.set_temp(kelvin, 1.0 / tint);
-    }
-    if let Some(ev) = exposure {
-        let curve = &mut pipeline.ops.basecurve;
-        curve.points = exposure_curve(ev, &curve.get_spline());
-    }
+        if let Some((kelvin, tint)) = white_balance {
+            // imagepipe divides the green reference by its tint value, so a
+            // higher value gives a greener image. `--tint` is defined the
+            // other way: above 1 is more magenta.
+            pipeline.ops.tolab.set_temp(kelvin, 1.0 / tint);
+        }
+        if let Some(ev) = exposure {
+            let curve = &mut pipeline.ops.basecurve;
+            curve.points = exposure_curve(ev, &curve.get_spline());
+        }
+        Source::Developed(Box::new(pipeline))
+    };
 
     // Ensure output directory exists
     if let Some(parent) = output.parent() {
@@ -87,15 +95,15 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
             let mut out = std::io::BufWriter::new(file);
             match format {
                 OutputFormat::Jpeg => {
-                    let img = render_8bit(&mut pipeline, input, opts)?;
+                    let img = source.rgb8(input, opts)?;
                     write_jpeg(&img, input, &mut out, opts).with_context(unwritable)?;
                 }
                 OutputFormat::Tiff => {
-                    let img = render_16bit_sharpened(&mut pipeline, input, opts)?;
+                    let img = source.rgb16(input, opts)?;
                     write_tiff(&img, input, &mut out, opts).with_context(unwritable)?;
                 }
                 OutputFormat::Png => {
-                    let img = render_16bit_sharpened(&mut pipeline, input, opts)?;
+                    let img = source.rgb16(input, opts)?;
                     write_png(&img, input, &mut out, opts).with_context(unwritable)?;
                 }
             }
@@ -108,6 +116,96 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// Where the pixels of one conversion come from.
+enum Source {
+    /// The RAW data, developed by imagepipe.
+    Developed(Box<Pipeline>),
+    /// The camera's embedded JPEG preview, already upright.
+    Preview(RgbImage),
+}
+
+impl Source {
+    /// The final 8-bit image: resized and sharpened.
+    fn rgb8(&mut self, input: &Path, opts: &ConvertOptions) -> Result<RgbImage> {
+        match self {
+            Source::Developed(pipeline) => render_8bit(pipeline, input, opts),
+            Source::Preview(img) => {
+                let mut img = maybe_resize_8bit(std::mem::take(img), opts.resize);
+                if let Some(amount) = opts.sharpen {
+                    sharpen(&mut img, amount);
+                }
+                Ok(img)
+            }
+        }
+    }
+
+    /// The final 16-bit image: resized and sharpened.
+    fn rgb16(
+        &mut self,
+        input: &Path,
+        opts: &ConvertOptions,
+    ) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
+        match self {
+            Source::Developed(pipeline) => render_16bit_sharpened(pipeline, input, opts),
+            Source::Preview(img) => {
+                let wide = image::DynamicImage::ImageRgb8(std::mem::take(img)).into_rgb16();
+                let mut img = maybe_resize_16bit(wide, opts.resize);
+                if let Some(amount) = opts.sharpen {
+                    sharpen(&mut img, amount);
+                }
+                Ok(img)
+            }
+        }
+    }
+}
+
+/// Load the JPEG preview that the camera stored in a RAW file, rotated
+/// upright. Its size depends on the camera: about 1616x1080 for Sony, full
+/// resolution for many Canon and Nikon bodies.
+fn load_preview(input: &Path) -> Result<RgbImage> {
+    use rawler::decoders::RawDecodeParams;
+    use rawler::rawsource::RawSource;
+
+    let load = || -> std::result::Result<Option<RgbImage>, String> {
+        let source = RawSource::new(input).map_err(|e| e.to_string())?;
+        let decoder = rawler::get_decoder(&source).map_err(|e| e.to_string())?;
+        let params = RawDecodeParams::default();
+        let Some(mut preview) = decoder
+            .preview_image(&source, &params)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        // The preview is stored as the sensor recorded it.
+        let orientation = decoder
+            .raw_metadata(&source, &params)
+            .ok()
+            .and_then(|m| m.exif.orientation)
+            .and_then(|n| u8::try_from(n).ok())
+            .and_then(image::metadata::Orientation::from_exif);
+        if let Some(orientation) = orientation {
+            preview.apply_orientation(orientation);
+        }
+        Ok(Some(preview.into_rgb8()))
+    };
+
+    // rawler can panic on files that are not RAW files.
+    let first_line = |e: String| e.lines().next().unwrap_or_default().to_string();
+    match std::panic::catch_unwind(load) {
+        Ok(Ok(Some(preview))) => Ok(preview),
+        Ok(Ok(None)) => Err(anyhow!(
+            "{} has no embedded preview; convert it without --preview",
+            input.display()
+        )),
+        Ok(Err(e)) => Err(anyhow!(
+            "Cannot read a preview from {}: {}",
+            input.display(),
+            first_line(e)
+        )),
+        Err(_) => Err(anyhow!("Cannot read a preview from {}", input.display())),
+    }
 }
 
 /// Decode `input` and build the processing pipeline for it.
@@ -762,6 +860,47 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Source::Preview tests
+    // -----------------------------------------------------------------------
+
+    fn preview_opts(resize: Option<u32>) -> ConvertOptions {
+        ConvertOptions {
+            format: crate::OutputFormat::Jpeg,
+            quality: 92,
+            resize,
+            fast: false,
+            exposure: None,
+            white_balance: None,
+            sharpen: None,
+            preview: true,
+            metadata: Default::default(),
+        }
+    }
+
+    #[test]
+    fn preview_source_is_resized_for_8_bit_output() {
+        let mut source = Source::Preview(make_8bit_image(400, 200));
+        let img = source.rgb8(Path::new("x.arw"), &preview_opts(Some(100))).unwrap();
+        assert_eq!(img.dimensions(), (100, 50));
+    }
+
+    #[test]
+    fn preview_source_is_widened_for_16_bit_output() {
+        let mut source = Source::Preview(ImageBuffer::from_pixel(8, 4, Rgb([0u8, 128, 255])));
+        let img = source.rgb16(Path::new("x.arw"), &preview_opts(None)).unwrap();
+        assert_eq!(img.dimensions(), (8, 4));
+        assert_eq!(img.get_pixel(0, 0), &Rgb([0u16, 128 * 257, 65535]));
+    }
+
+    #[test]
+    fn load_preview_reports_a_file_that_is_not_raw() {
+        let tmp = tempfile::Builder::new().suffix(".arw").tempfile().unwrap();
+        std::fs::write(tmp.path(), b"not a raw file").unwrap();
+        let err = load_preview(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("preview"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
     // sharpen tests
     // -----------------------------------------------------------------------
 
@@ -859,6 +998,7 @@ mod tests {
                 exposure: None,
                 white_balance: None,
                 sharpen: None,
+                preview: false,
                 metadata: Default::default(),
             },
         );
@@ -882,6 +1022,7 @@ mod tests {
                 exposure: None,
                 white_balance: None,
                 sharpen: None,
+                preview: false,
                 metadata: Default::default(),
             },
         );
