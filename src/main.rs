@@ -5,6 +5,7 @@ mod naming;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Result};
 use clap::{CommandFactory, Parser, ValueEnum};
@@ -76,6 +77,12 @@ struct Cli {
     /// more green
     #[arg(long, requires = "wb", default_value_t = 1.0, value_parser = tint_value)]
     tint: f32,
+
+    /// Sharpen the output after the resize, from 0 to 3. Without a value
+    /// the amount is 0.5, which suits images resized for screens
+    #[arg(long, value_name = "AMOUNT", num_args = 0..=1, default_missing_value = "0.5",
+          value_parser = float_in_range::<0, 3>)]
+    sharpen: Option<f32>,
 
     /// Do not copy GPS location to the output
     #[arg(long)]
@@ -204,6 +211,7 @@ fn main() -> Result<()> {
         fast: cli.fast,
         exposure: cli.exposure,
         white_balance: cli.wb.map(|kelvin| (kelvin, cli.tint)),
+        sharpen: cli.sharpen,
         metadata: exif::MetadataOptions {
             strip_all: cli.strip_metadata,
             strip_gps: cli.strip_gps,
@@ -212,6 +220,7 @@ fn main() -> Result<()> {
         },
     };
 
+    let failures: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     let succeeded = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
@@ -223,7 +232,7 @@ fn main() -> Result<()> {
     };
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} (ETA {eta}) {msg}")
             .expect("invalid progress bar template")
             .progress_chars("=> "),
     );
@@ -241,6 +250,7 @@ fn main() -> Result<()> {
                     output_path.display()
                 );
             });
+            failures.lock().unwrap().push(input_path.clone());
             failed.fetch_add(1, Ordering::Relaxed);
             pb.inc(1);
             return;
@@ -267,6 +277,7 @@ fn main() -> Result<()> {
                 pb.suspend(|| {
                     eprintln!("Error converting {}: {:#}", input_path.display(), e);
                 });
+                failures.lock().unwrap().push(input_path.clone());
                 failed.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -296,6 +307,16 @@ fn main() -> Result<()> {
 
     if !cli.quiet {
         println!("{s} succeeded, {f} failed, {sk} skipped");
+    }
+
+    // Errors scroll away in a long run, so repeat which files failed.
+    let mut failures = failures.into_inner().unwrap();
+    if failures.len() > 1 {
+        failures.sort();
+        eprintln!("Failed files:");
+        for path in failures {
+            eprintln!("  {}", path.display());
+        }
     }
 
     if f > 0 || missing_inputs {

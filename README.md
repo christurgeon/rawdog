@@ -102,6 +102,14 @@ rawdog ./reception --exposure 0.67 --wb 3400
 
 `--exposure` rolls off highlights instead of clipping them. `--wb` replaces the as-shot white balance of every file; add `--tint` to correct a green or magenta cast.
 
+Resized images look soft. Add output sharpening:
+
+```sh
+rawdog ./trip -r 2048 --sharpen
+```
+
+`--sharpen` takes an optional amount from 0 to 3; the default is 0.5.
+
 Export for the web without location data, with your name and copyright:
 
 ```sh
