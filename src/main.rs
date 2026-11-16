@@ -611,7 +611,7 @@ fn extension(format: OutputFormat) -> &'static str {
 
 /// File extensions of the RAW formats that the decoder supports.
 const RAW_EXTENSIONS: &[&str] = &[
-    "arw", "srf", "sr2", "dng", "cr2", "crw", "nef", "nrw", "raf", "orf", "rw2", "pef", "srw",
+    "arw", "srf", "sr2", "dng", "cr2", "cr3", "crw", "nef", "nrw", "raf", "orf", "rw2", "pef", "srw",
     "erf", "kdc", "dcr", "dcs", "mef", "mos", "iiq", "3fr", "mrw", "x3f", "ari",
 ];
 
