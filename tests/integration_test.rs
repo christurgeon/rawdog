@@ -537,3 +537,26 @@ fn cli_tint_requires_wb() {
     let output = run(&["--tint".as_ref(), "1.2".as_ref(), "/tmp/fake.arw".as_ref()]);
     assert_eq!(output.status.code(), Some(2));
 }
+
+#[test]
+fn cli_name_template_places_output_and_rejects_bad_templates() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [1, 2, 3]);
+    let out = tmp.path().join("out");
+
+    let output = run(&[
+        input.as_ref(),
+        "-o".as_ref(),
+        out.as_ref(),
+        "--name".as_ref(),
+        "web/{stem}_small".as_ref(),
+    ]);
+    assert!(output.status.success());
+    assert!(out.join("web/in_small.jpg").is_file());
+
+    for bad in ["../{stem}", "{nope}", "/abs/{stem}"] {
+        let output = run(&[input.as_ref(), "--name".as_ref(), bad.as_ref()]);
+        assert_eq!(output.status.code(), Some(2), "{bad}");
+    }
+}

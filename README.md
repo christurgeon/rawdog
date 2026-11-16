@@ -86,6 +86,14 @@ Make small proofs quickly. `--fast` scales during RAW decoding, which is several
 rawdog ./card -r 2048 --fast -o ./proofs
 ```
 
+Import a card into folders by capture date, with the camera model in each file name:
+
+```sh
+rawdog -R /Volumes/CARD -o ~/Pictures --name "{date}/{model}_{stem}"
+```
+
+Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), and `{model}`. A file without that metadata gets `unknown`.
+
 Brighten a dark batch by two thirds of a stop and set the white balance to 3400 K:
 
 ```sh
