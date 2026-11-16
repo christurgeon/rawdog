@@ -47,9 +47,11 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     // With a size limit, imagepipe demosaics and scales in one pass when the
     // reduction is 2x or more. This is several times faster than a full
     // demosaic followed by a Lanczos resize, and slightly softer.
+    // One extra pixel is requested because `trim_fast_edge` removes the last
+    // row and column.
     if let (true, Some(max_edge)) = (fast, resize) {
-        pipeline.globals.settings.maxwidth = max_edge as usize;
-        pipeline.globals.settings.maxheight = max_edge as usize;
+        pipeline.globals.settings.maxwidth = max_edge as usize + 1;
+        pipeline.globals.settings.maxheight = max_edge as usize + 1;
     }
 
     if let Some((kelvin, tint)) = white_balance {
@@ -71,10 +73,10 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     let tmp = temp_path_for(output);
     let result = match format {
         OutputFormat::Jpeg => {
-            encode_jpeg(&mut pipeline, input, &tmp, quality, resize, metadata)
+            encode_jpeg(&mut pipeline, input, &tmp, quality, resize, fast, metadata)
         }
-        OutputFormat::Tiff => encode_tiff(&mut pipeline, input, &tmp, resize, metadata),
-        OutputFormat::Png => encode_png(&mut pipeline, input, &tmp, resize, metadata),
+        OutputFormat::Tiff => encode_tiff(&mut pipeline, input, &tmp, resize, fast, metadata),
+        OutputFormat::Png => encode_png(&mut pipeline, input, &tmp, resize, fast, metadata),
     }
     .and_then(|()| {
         std::fs::rename(&tmp, output)
@@ -135,6 +137,7 @@ fn encode_jpeg(
     output: &Path,
     quality: u8,
     resize: Option<u32>,
+    fast: bool,
     metadata: &exif_utils::MetadataOptions,
 ) -> Result<()> {
     let decoded = pipeline
@@ -147,7 +150,7 @@ fn encode_jpeg(
     let img: RgbImage = ImageBuffer::from_raw(width, height, decoded.data)
         .context("Failed to construct image buffer from decoded data")?;
 
-    let final_img = maybe_resize_8bit(img, resize);
+    let final_img = maybe_resize_8bit(trim_fast_edge(img, resize, fast), resize);
 
     // Encode JPEG to an in-memory buffer so we can inject EXIF metadata
     // before writing to disk.
@@ -178,9 +181,10 @@ fn encode_tiff(
     input: &Path,
     output: &Path,
     resize: Option<u32>,
+    fast: bool,
     metadata: &exif_utils::MetadataOptions,
 ) -> Result<()> {
-    let final_img = render_16bit(pipeline, input, resize)?;
+    let final_img = render_16bit(pipeline, input, resize, fast)?;
 
     let out_file = std::fs::File::create(output)
         .with_context(|| format!("Failed to create output file {}", output.display()))?;
@@ -213,9 +217,10 @@ fn encode_png(
     input: &Path,
     output: &Path,
     resize: Option<u32>,
+    fast: bool,
     metadata: &exif_utils::MetadataOptions,
 ) -> Result<()> {
-    let final_img = render_16bit(pipeline, input, resize)?;
+    let final_img = render_16bit(pipeline, input, resize, fast)?;
 
     // Encode PNG to an in-memory buffer so we can inject EXIF metadata.
     let mut buf = Vec::new();
@@ -243,6 +248,7 @@ fn render_16bit(
     pipeline: &mut Pipeline,
     input: &Path,
     resize: Option<u32>,
+    fast: bool,
 ) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
     // imagepipe's full pipeline (always used for RAW files) returns linear
     // 16-bit data, while its raster fast path returns the source file's
@@ -263,7 +269,7 @@ fn render_16bit(
             .context("Failed to construct 16-bit image buffer from decoded data")?;
 
     // Resize in linear light, then encode.
-    let mut img = maybe_resize_16bit(img, resize);
+    let mut img = maybe_resize_16bit(trim_fast_edge(img, resize, fast), resize);
     if is_linear {
         let lut = srgb_encode_lut();
         for v in img.iter_mut() {
@@ -286,6 +292,28 @@ fn srgb_encode_lut() -> Vec<u16> {
             (encoded * 65535.0).round().clamp(0.0, 65535.0) as u16
         })
         .collect()
+}
+
+/// Remove the last row and column of an image that imagepipe scaled in
+/// `fast` mode. Its scaled demosaic leaves the red channel empty there.
+///
+/// The pipeline was asked for a long edge of `resize + 1`, so the result has
+/// a long edge of `resize`. An image that was not scaled is returned as it is.
+fn trim_fast_edge<P>(
+    img: ImageBuffer<P, Vec<P::Subpixel>>,
+    resize: Option<u32>,
+    fast: bool,
+) -> ImageBuffer<P, Vec<P::Subpixel>>
+where
+    P: image::Pixel + 'static,
+{
+    let (width, height) = img.dimensions();
+    match resize {
+        Some(max_edge) if fast && width.max(height) == max_edge + 1 && width.min(height) > 1 => {
+            image::imageops::crop_imm(&img, 0, 0, width - 1, height - 1).to_image()
+        }
+        _ => img,
+    }
 }
 
 fn maybe_resize_8bit(
@@ -492,7 +520,7 @@ mod tests {
 
         let mut p16 = Pipeline::new_from_file(&png).unwrap();
         p16.globals.settings.use_fastpath = false;
-        let out16 = render_16bit(&mut p16, &png, None).unwrap();
+        let out16 = render_16bit(&mut p16, &png, None, false).unwrap();
 
         let (m8, m16) = (mean_u8(&out8.data), mean_u16_as_u8(out16.as_raw()));
         assert!(
@@ -509,7 +537,7 @@ mod tests {
         let png = write_gradient_png(tmp.path());
 
         let mut p16 = Pipeline::new_from_file(&png).unwrap();
-        let out16 = render_16bit(&mut p16, &png, None).unwrap();
+        let out16 = render_16bit(&mut p16, &png, None, false).unwrap();
         let expected = image::open(&png).unwrap().to_rgb16();
         assert_eq!(out16.as_raw(), expected.as_raw());
     }
@@ -523,6 +551,24 @@ mod tests {
         assert!((lut[32768] as f64 / 65535.0 - 0.7354).abs() < 0.001);
         // The linear segment below 0.0031308 has a slope of 12.92.
         assert_eq!(lut[100], (100.0f64 * 12.92).round() as u16);
+    }
+
+    #[test]
+    fn trim_fast_edge_removes_last_row_and_column_of_scaled_images() {
+        let img = ImageBuffer::from_fn(101, 51, |x, y| Rgb([x as u8, y as u8, 0]));
+        let out = trim_fast_edge(img, Some(100), true);
+        assert_eq!(out.dimensions(), (100, 50));
+        assert_eq!(out.get_pixel(99, 49), &Rgb([99u8, 49, 0]));
+    }
+
+    #[test]
+    fn trim_fast_edge_leaves_other_images_unchanged() {
+        // Not fast.
+        assert_eq!(trim_fast_edge(make_8bit_image(101, 51), Some(100), false).dimensions(), (101, 51));
+        // Smaller than the limit, so the pipeline did not scale it.
+        assert_eq!(trim_fast_edge(make_8bit_image(80, 40), Some(100), true).dimensions(), (80, 40));
+        // No limit.
+        assert_eq!(trim_fast_edge(make_16bit_image(101, 51), None, true).dimensions(), (101, 51));
     }
 
     // -----------------------------------------------------------------------

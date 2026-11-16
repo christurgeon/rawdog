@@ -432,7 +432,9 @@ fn cli_fast_resizes_to_the_requested_long_edge() {
         ]);
         assert!(output.status.success(), "{format}");
         let (w, h) = image::image_dimensions(out.join(name)).unwrap();
-        assert_eq!((w, h), (100, 50), "{name}");
+        // The decoder rounds the short edge, so it can be one pixel smaller.
+        assert_eq!(w, 100, "{name}");
+        assert!((49..=50).contains(&h), "{name}: height {h}");
     }
 }
 
