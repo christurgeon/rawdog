@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::{generate, Shell};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -55,6 +55,24 @@ struct Cli {
     /// Recurse into subdirectories when scanning for ARW files
     #[arg(short = 'R', long)]
     recursive: bool,
+
+    /// Also convert when the input file is newer than the existing output
+    #[arg(short, long, conflicts_with = "overwrite")]
+    update: bool,
+
+    /// Print what would be converted, then exit without writing anything
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+
+    /// Number of files to convert in parallel (default: one per CPU core).
+    /// Each job holds a full-size image in memory, so lower this for
+    /// high-resolution files on machines with little RAM
+    #[arg(short, long, value_parser = clap::value_parser!(u32).range(1..))]
+    jobs: Option<u32>,
+
+    /// Print errors only
+    #[arg(long)]
+    quiet: bool,
 }
 
 fn main() -> Result<()> {
@@ -82,13 +100,41 @@ fn main() -> Result<()> {
 
     let jobs = plan_outputs(&files, cli.output.as_deref(), cli.format)?;
 
-    println!("Found {} ARW file(s)", files.len());
+    if cli.dry_run {
+        for (input_path, output_path) in &jobs {
+            let action = if should_skip(input_path, output_path, cli.overwrite, cli.update) {
+                "skip   "
+            } else {
+                "convert"
+            };
+            println!("{action} {} -> {}", input_path.display(), output_path.display());
+        }
+        if missing_inputs {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if let Some(jobs) = cli.jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs as usize)
+            .build_global()
+            .context("Failed to configure the thread pool")?;
+    }
+
+    if !cli.quiet {
+        println!("Found {} ARW file(s)", files.len());
+    }
 
     let succeeded = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
 
-    let pb = ProgressBar::new(jobs.len() as u64);
+    let pb = if cli.quiet {
+        ProgressBar::hidden()
+    } else {
+        ProgressBar::new(jobs.len() as u64)
+    };
     pb.set_style(
         ProgressStyle::default_bar()
             .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
@@ -114,8 +160,7 @@ fn main() -> Result<()> {
             return;
         }
 
-        // Skip if exists and overwrite is not set
-        if !cli.overwrite && output_path.exists() {
+        if should_skip(input_path, output_path, cli.overwrite, cli.update) {
             skipped.fetch_add(1, Ordering::Relaxed);
             pb.inc(1);
             return;
@@ -149,13 +194,29 @@ fn main() -> Result<()> {
     let f = failed.load(Ordering::Relaxed);
     let sk = skipped.load(Ordering::Relaxed);
 
-    println!("{s} succeeded, {f} failed, {sk} skipped");
+    if !cli.quiet {
+        println!("{s} succeeded, {f} failed, {sk} skipped");
+    }
 
     if f > 0 || missing_inputs {
         std::process::exit(1);
     }
 
     Ok(())
+}
+
+/// An existing output is skipped unless `overwrite` is set, or `update` is
+/// set and the input was modified after the output.
+fn should_skip(input: &Path, output: &Path, overwrite: bool, update: bool) -> bool {
+    if overwrite || !output.exists() {
+        return false;
+    }
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let input_is_newer = match (modified(input), modified(output)) {
+        (Some(i), Some(o)) => i > o,
+        _ => false,
+    };
+    !(update && input_is_newer)
 }
 
 /// An input file and where its output goes relative to the `-o` directory.

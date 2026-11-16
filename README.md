@@ -78,6 +78,30 @@ non-zero when any conversion failed, when an input path does not exist, when
 no ARW files were found, or when outputs conflict. Valid inputs are still
 converted when some other inputs fail or are missing.
 
+Preview what a run will do, without writing files:
+
+```sh
+rawdog -R ./card -o ./jpegs --dry-run
+```
+
+Convert again only the files whose RAW is newer than the existing output:
+
+```sh
+rawdog ./photos/ --update
+```
+
+Limit memory use by converting two files at a time:
+
+```sh
+rawdog ./photos/ -j 2
+```
+
+Print errors only, for use in scripts:
+
+```sh
+rawdog ./photos/ --quiet
+```
+
 ## macOS Finder Integration
 
 You can add a right-click Quick Action so you can select ARW files in Finder and convert them without opening a terminal.
