@@ -113,6 +113,14 @@ rawdog ./trip -r 2048 --strip-gps --artist "J. Doe" --copyright "(c) 2026 J. Doe
 
 Camera, lens, exposure, and date metadata are copied to JPEG, PNG, and TIFF output. Use `--strip-metadata` to copy none of it.
 
+Cull a card quickly. `--preview` writes the JPEG preview that the camera embedded in each RAW file, with the camera's own colours, and does not develop the RAW data:
+
+```sh
+rawdog -R /Volumes/CARD --preview -o ./proofs
+```
+
+The preview size depends on the camera: 1616x1080 for Sony bodies, full resolution for many Canon and Nikon bodies.
+
 Preview what a run will do, without writing files:
 
 ```sh

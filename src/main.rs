@@ -100,6 +100,12 @@ struct Cli {
     #[arg(long, value_name = "TEXT")]
     copyright: Option<String>,
 
+    /// Use the JPEG preview that the camera embedded in each RAW file,
+    /// without developing the RAW data. Very fast, with the camera's own
+    /// colours; the size depends on the camera (1616x1080 for Sony)
+    #[arg(long, conflicts_with_all = ["fast", "exposure", "wb"])]
+    preview: bool,
+
     /// Overwrite existing output files (default: skip if exists)
     #[arg(long)]
     overwrite: bool,
@@ -212,7 +218,7 @@ fn main() -> Result<()> {
                 .max()
                 .unwrap_or(0);
             let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-            default_workers(largest_input, cli.fast, total_memory(), cores)
+            default_workers(largest_input, cli.fast || cli.preview, total_memory(), cores)
         }
     };
 
@@ -228,6 +234,7 @@ fn main() -> Result<()> {
         exposure: cli.exposure,
         white_balance: cli.wb.map(|kelvin| (kelvin, cli.tint)),
         sharpen: cli.sharpen,
+        preview: cli.preview,
         metadata: exif::MetadataOptions {
             strip_all: cli.strip_metadata,
             strip_gps: cli.strip_gps,
