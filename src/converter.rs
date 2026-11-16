@@ -26,6 +26,8 @@ pub struct ConvertOptions {
     /// White balance as (colour temperature in kelvin, tint). Replaces the
     /// as-shot white balance.
     pub white_balance: Option<(f32, f32)>,
+    /// Strength of output sharpening, applied after the resize.
+    pub sharpen: Option<f32>,
     pub metadata: exif_utils::MetadataOptions,
 }
 
@@ -33,12 +35,11 @@ pub struct ConvertOptions {
 pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<()> {
     let ConvertOptions {
         format,
-        quality,
         resize,
         fast,
         exposure,
         white_balance,
-        ref metadata,
+        ..
     } = *opts;
 
     let mut pipeline = Pipeline::new_from_file(input)
@@ -73,10 +74,10 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     let tmp = temp_path_for(output);
     let result = match format {
         OutputFormat::Jpeg => {
-            encode_jpeg(&mut pipeline, input, &tmp, quality, resize, fast, metadata)
+            encode_jpeg(&mut pipeline, input, &tmp, opts)
         }
-        OutputFormat::Tiff => encode_tiff(&mut pipeline, input, &tmp, resize, fast, metadata),
-        OutputFormat::Png => encode_png(&mut pipeline, input, &tmp, resize, fast, metadata),
+        OutputFormat::Tiff => encode_tiff(&mut pipeline, input, &tmp, opts),
+        OutputFormat::Png => encode_png(&mut pipeline, input, &tmp, opts),
     }
     .and_then(|()| {
         std::fs::rename(&tmp, output)
@@ -135,10 +136,7 @@ fn encode_jpeg(
     pipeline: &mut Pipeline,
     input: &Path,
     output: &Path,
-    quality: u8,
-    resize: Option<u32>,
-    fast: bool,
-    metadata: &exif_utils::MetadataOptions,
+    opts: &ConvertOptions,
 ) -> Result<()> {
     let decoded = pipeline
         .output_8bit(None)
@@ -150,19 +148,22 @@ fn encode_jpeg(
     let img: RgbImage = ImageBuffer::from_raw(width, height, decoded.data)
         .context("Failed to construct image buffer from decoded data")?;
 
-    let final_img = maybe_resize_8bit(trim_fast_edge(img, resize, fast), resize);
+    let mut final_img = maybe_resize_8bit(trim_fast_edge(img, opts.resize, opts.fast), opts.resize);
+    if let Some(amount) = opts.sharpen {
+        sharpen(&mut final_img, amount);
+    }
 
     // Encode JPEG to an in-memory buffer so we can inject EXIF metadata
     // before writing to disk.
     let mut jpeg_buf = Vec::new();
-    let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, quality);
+    let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, opts.quality);
     final_img
         .write_with_encoder(encoder)
         .with_context(|| format!("Failed to encode JPEG to {}", output.display()))?;
 
     // Inject EXIF metadata into the JPEG if available. Failures here are
     // non-fatal: we still produce the output image.
-    let exif_data = exif_utils::extract_exif(input, final_img.dimensions(), metadata)
+    let exif_data = exif_utils::extract_exif(input, final_img.dimensions(), &opts.metadata)
         .ok()
         .flatten();
     let final_bytes = match exif_data {
@@ -180,18 +181,19 @@ fn encode_tiff(
     pipeline: &mut Pipeline,
     input: &Path,
     output: &Path,
-    resize: Option<u32>,
-    fast: bool,
-    metadata: &exif_utils::MetadataOptions,
+    opts: &ConvertOptions,
 ) -> Result<()> {
-    let final_img = render_16bit(pipeline, input, resize, fast)?;
+    let mut final_img = render_16bit(pipeline, input, opts.resize, opts.fast)?;
+    if let Some(amount) = opts.sharpen {
+        sharpen(&mut final_img, amount);
+    }
 
     let out_file = std::fs::File::create(output)
         .with_context(|| format!("Failed to create output file {}", output.display()))?;
     let mut out_file = std::io::BufWriter::new(out_file);
 
     // EXIF failures are non-fatal: fall back to a TIFF without metadata.
-    let fields = exif_utils::read_fields_for_output(input, final_img.dimensions(), metadata)
+    let fields = exif_utils::read_fields_for_output(input, final_img.dimensions(), &opts.metadata)
         .ok()
         .flatten();
     match fields {
@@ -216,11 +218,12 @@ fn encode_png(
     pipeline: &mut Pipeline,
     input: &Path,
     output: &Path,
-    resize: Option<u32>,
-    fast: bool,
-    metadata: &exif_utils::MetadataOptions,
+    opts: &ConvertOptions,
 ) -> Result<()> {
-    let final_img = render_16bit(pipeline, input, resize, fast)?;
+    let mut final_img = render_16bit(pipeline, input, opts.resize, opts.fast)?;
+    if let Some(amount) = opts.sharpen {
+        sharpen(&mut final_img, amount);
+    }
 
     // Encode PNG to an in-memory buffer so we can inject EXIF metadata.
     let mut buf = Vec::new();
@@ -230,7 +233,7 @@ fn encode_png(
         .with_context(|| format!("Failed to encode PNG to {}", output.display()))?;
 
     // Inject EXIF metadata into the PNG if available.
-    let exif_data = exif_utils::extract_exif(input, final_img.dimensions(), metadata)
+    let exif_data = exif_utils::extract_exif(input, final_img.dimensions(), &opts.metadata)
         .ok()
         .flatten();
     let final_bytes = match exif_data {
@@ -277,6 +280,45 @@ fn render_16bit(
         }
     }
     Ok(img)
+}
+
+/// A sample type that `sharpen` can process.
+trait Sample: image::Primitive {
+    fn as_f32(self) -> f32;
+    fn from_f32(v: f32) -> Self;
+}
+
+impl Sample for u8 {
+    fn as_f32(self) -> f32 {
+        self as f32
+    }
+    fn from_f32(v: f32) -> Self {
+        v.round().clamp(0.0, u8::MAX as f32) as u8
+    }
+}
+
+impl Sample for u16 {
+    fn as_f32(self) -> f32 {
+        self as f32
+    }
+    fn from_f32(v: f32) -> Self {
+        v.round().clamp(0.0, u16::MAX as f32) as u16
+    }
+}
+
+/// Unsharp mask: add `amount` times the difference between the image and a
+/// blurred copy of it. The radius suits images that were resized for screens.
+fn sharpen<S>(img: &mut ImageBuffer<Rgb<S>, Vec<S>>, amount: f32)
+where
+    S: Sample,
+    Rgb<S>: image::Pixel<Subpixel = S> + 'static,
+{
+    const SIGMA: f32 = 1.0;
+    let blurred = image::imageops::blur(img, SIGMA);
+    for (v, b) in img.iter_mut().zip(blurred.iter()) {
+        let (v_f, b_f) = (v.as_f32(), b.as_f32());
+        *v = S::from_f32(v_f + amount * (v_f - b_f));
+    }
 }
 
 /// Lookup table that maps linear 16-bit samples to sRGB-encoded 16-bit samples.
@@ -572,6 +614,47 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // sharpen tests
+    // -----------------------------------------------------------------------
+
+    /// Left half dark, right half bright.
+    fn edge_image<S>(dark: S, bright: S) -> ImageBuffer<Rgb<S>, Vec<S>>
+    where
+        S: Sample,
+        Rgb<S>: image::Pixel<Subpixel = S>,
+    {
+        ImageBuffer::from_fn(16, 4, |x, _| Rgb([if x < 8 { dark } else { bright }; 3]))
+    }
+
+    #[test]
+    fn sharpen_increases_contrast_at_an_edge_only() {
+        let mut img = edge_image(100u8, 150u8);
+        sharpen(&mut img, 1.0);
+        // Next to the edge, the dark side gets darker and the bright side brighter.
+        assert!(img.get_pixel(7, 1)[0] < 100);
+        assert!(img.get_pixel(8, 1)[0] > 150);
+        // Far from the edge, nothing changes.
+        assert_eq!(img.get_pixel(0, 1)[0], 100);
+        assert_eq!(img.get_pixel(15, 1)[0], 150);
+    }
+
+    #[test]
+    fn sharpen_clamps_at_the_sample_limits() {
+        let mut img = edge_image(0u16, u16::MAX);
+        sharpen(&mut img, 3.0);
+        assert_eq!(img.get_pixel(7, 1)[0], 0);
+        assert_eq!(img.get_pixel(8, 1)[0], u16::MAX);
+    }
+
+    #[test]
+    fn sharpen_zero_amount_changes_nothing() {
+        let mut img = edge_image(100u8, 150u8);
+        let before = img.clone();
+        sharpen(&mut img, 0.0);
+        assert_eq!(img, before);
+    }
+
+    // -----------------------------------------------------------------------
     // exposure_curve tests
     // -----------------------------------------------------------------------
 
@@ -627,6 +710,7 @@ mod tests {
                 fast: false,
                 exposure: None,
                 white_balance: None,
+                sharpen: None,
                 metadata: Default::default(),
             },
         );
@@ -649,6 +733,7 @@ mod tests {
                 fast: false,
                 exposure: None,
                 white_balance: None,
+                sharpen: None,
                 metadata: Default::default(),
             },
         );

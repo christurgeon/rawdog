@@ -560,3 +560,49 @@ fn cli_name_template_places_output_and_rejects_bad_templates() {
         assert_eq!(output.status.code(), Some(2), "{bad}");
     }
 }
+
+#[test]
+fn cli_sharpen_accepts_no_value_or_a_value_in_range() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    image::RgbImage::from_fn(32, 32, |x, _| image::Rgb([if x < 16 { 60 } else { 180 }; 3]))
+        .save(&input)
+        .unwrap();
+    let plain = tmp.path().join("plain");
+    let sharp = tmp.path().join("sharp");
+
+    assert!(run(&[input.as_ref(), "-f".as_ref(), "png".as_ref(), "-o".as_ref(), plain.as_ref()])
+        .status
+        .success());
+    // The flag without a value must not consume the next argument.
+    assert!(run(&[
+        input.as_ref(),
+        "-f".as_ref(),
+        "png".as_ref(),
+        "-o".as_ref(),
+        sharp.as_ref(),
+        "--sharpen".as_ref(),
+    ])
+    .status
+    .success());
+
+    let px = |dir: &std::path::Path, x| image::open(dir.join("in.png")).unwrap().to_rgb8().get_pixel(x, 8)[0];
+    assert!(px(&sharp, 15) < px(&plain, 15));
+    assert!(px(&sharp, 16) > px(&plain, 16));
+
+    let output = run(&[input.as_ref(), "--sharpen".as_ref(), "9".as_ref()]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn cli_lists_failed_files_when_more_than_one_fails() {
+    let tmp = TempDir::new().unwrap();
+    for name in ["a.arw", "b.arw"] {
+        fs::write(tmp.path().join(name), b"not a raw file").unwrap();
+    }
+    let output = run(&[tmp.path().as_ref()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let list = stderr.split("Failed files:").nth(1).expect("no failure list");
+    assert!(list.contains("a.arw") && list.contains("b.arw"), "got: {stderr}");
+    assert!(!output.status.success());
+}
