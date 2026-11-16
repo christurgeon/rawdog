@@ -48,6 +48,11 @@ struct Cli {
     #[arg(short, long, value_parser = clap::value_parser!(u32).range(1..))]
     resize: Option<u32>,
 
+    /// Scale during RAW decoding when --resize is set. Several times
+    /// faster and slightly softer; intended for proofs and culling
+    #[arg(long, requires = "resize")]
+    fast: bool,
+
     /// Overwrite existing output files (default: skip if exists)
     #[arg(long)]
     overwrite: bool,
@@ -126,6 +131,13 @@ fn main() -> Result<()> {
         println!("Found {} ARW file(s)", files.len());
     }
 
+    let opts = converter::ConvertOptions {
+        format: cli.format,
+        quality: cli.quality,
+        resize: cli.resize,
+        fast: cli.fast,
+    };
+
     let succeeded = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
@@ -169,7 +181,7 @@ fn main() -> Result<()> {
         // The RAW decoder can panic on corrupt files. Report that as a
         // failure of this file instead of aborting the batch.
         let result = std::panic::catch_unwind(|| {
-            converter::convert_arw(input_path, output_path, cli.format, cli.quality, cli.resize)
+            converter::convert_arw(input_path, output_path, &opts)
         })
         .unwrap_or_else(|_| Err(anyhow!("decoder panicked; the file is probably corrupt")));
 

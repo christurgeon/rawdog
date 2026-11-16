@@ -403,3 +403,35 @@ fn cli_update_converts_only_when_input_is_newer() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("1 succeeded, 0 failed, 0 skipped"), "got: {stdout}");
 }
+
+#[test]
+fn cli_fast_requires_resize() {
+    let output = run(&["--fast".as_ref(), "/tmp/fake.arw".as_ref()]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn cli_fast_resizes_to_the_requested_long_edge() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("big.png");
+    image::RgbImage::from_pixel(400, 200, image::Rgb([90, 90, 90]))
+        .save(&input)
+        .unwrap();
+    let out = tmp.path().join("out");
+
+    for (format, name) in [("jpeg", "big.jpg"), ("png", "big.png"), ("tiff", "big.tiff")] {
+        let output = run(&[
+            input.as_ref(),
+            "-o".as_ref(),
+            out.as_ref(),
+            "-r".as_ref(),
+            "100".as_ref(),
+            "--fast".as_ref(),
+            "-f".as_ref(),
+            format.as_ref(),
+        ]);
+        assert!(output.status.success(), "{format}");
+        let (w, h) = image::image_dimensions(out.join(name)).unwrap();
+        assert_eq!((w, h), (100, 50), "{name}");
+    }
+}

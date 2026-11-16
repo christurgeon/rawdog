@@ -11,16 +11,37 @@ use imagepipe::{ImageSource, Pipeline};
 use crate::exif as exif_utils;
 use crate::OutputFormat;
 
+/// Settings that apply to every file of a run.
+#[derive(Clone, Copy)]
+pub struct ConvertOptions {
+    pub format: OutputFormat,
+    /// JPEG quality, 1-100. Ignored for TIFF and PNG.
+    pub quality: u8,
+    /// Maximum length of the long edge in pixels.
+    pub resize: Option<u32>,
+    /// Scale during RAW decoding instead of after it. Needs `resize`.
+    pub fast: bool,
+}
+
 /// Convert a single ARW file to the specified output format.
-pub fn convert_arw(
-    input: &Path,
-    output: &Path,
-    format: OutputFormat,
-    quality: u8,
-    resize: Option<u32>,
-) -> Result<()> {
+pub fn convert_arw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<()> {
+    let ConvertOptions {
+        format,
+        quality,
+        resize,
+        fast,
+    } = *opts;
+
     let mut pipeline = Pipeline::new_from_file(input)
         .map_err(|e| anyhow!("Failed to create pipeline for {}: {}", input.display(), e))?;
+
+    // With a size limit, imagepipe demosaics and scales in one pass when the
+    // reduction is 2x or more. This is several times faster than a full
+    // demosaic followed by a Lanczos resize, and slightly softer.
+    if let (true, Some(max_edge)) = (fast, resize) {
+        pipeline.globals.settings.maxwidth = max_edge as usize;
+        pipeline.globals.settings.maxheight = max_edge as usize;
+    }
 
     // Ensure output directory exists
     if let Some(parent) = output.parent() {
@@ -456,9 +477,12 @@ mod tests {
         let result = convert_arw(
             Path::new("/nonexistent/photo.arw"),
             Path::new("/tmp/out.jpg"),
-            crate::OutputFormat::Jpeg,
-            92,
-            None,
+            &ConvertOptions {
+                format: crate::OutputFormat::Jpeg,
+                quality: 92,
+                resize: None,
+                fast: false,
+            },
         );
         assert!(result.is_err());
     }
@@ -472,9 +496,12 @@ mod tests {
         let result = convert_arw(
             tmp.path(),
             Path::new("/tmp/out.jpg"),
-            crate::OutputFormat::Jpeg,
-            92,
-            None,
+            &ConvertOptions {
+                format: crate::OutputFormat::Jpeg,
+                quality: 92,
+                resize: None,
+                fast: false,
+            },
         );
         assert!(result.is_err());
     }
