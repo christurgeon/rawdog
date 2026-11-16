@@ -416,11 +416,11 @@ mod tests {
 
     #[test]
     fn resize_8bit_preserves_aspect_ratio() {
-        let img = make_8bit_image(6000, 4000);
-        let result = maybe_resize_8bit(img, Some(3000));
+        let img = make_8bit_image(600, 400);
+        let result = maybe_resize_8bit(img, Some(300));
         let (w, h) = result.dimensions();
-        assert_eq!(w, 3000);
-        assert_eq!(h, 2000);
+        assert_eq!(w, 300);
+        assert_eq!(h, 200);
     }
 
     #[test]
@@ -479,11 +479,11 @@ mod tests {
 
     #[test]
     fn resize_16bit_preserves_aspect_ratio() {
-        let img = make_16bit_image(6000, 4000);
-        let result = maybe_resize_16bit(img, Some(3000));
+        let img = make_16bit_image(600, 400);
+        let result = maybe_resize_16bit(img, Some(300));
         let (w, h) = result.dimensions();
-        assert_eq!(w, 3000);
-        assert_eq!(h, 2000);
+        assert_eq!(w, 300);
+        assert_eq!(h, 200);
     }
 
     // -----------------------------------------------------------------------
