@@ -606,3 +606,55 @@ fn cli_lists_failed_files_when_more_than_one_fails() {
     assert!(list.contains("a.arw") && list.contains("b.arw"), "got: {stderr}");
     assert!(!output.status.success());
 }
+
+#[test]
+fn cli_dry_run_reports_a_refused_job() {
+    let tmp = TempDir::new().unwrap();
+    let same = tmp.path().join("same.png");
+    write_png(&same, [1, 2, 3]);
+
+    let output = run(&[
+        same.as_ref(),
+        "-f".as_ref(),
+        "png".as_ref(),
+        "--overwrite".as_ref(),
+        "-n".as_ref(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("refuse"), "got: {stdout}");
+    assert!(stdout.contains("same file"), "got: {stdout}");
+    assert!(!output.status.success());
+}
+
+#[test]
+fn cli_output_that_is_a_file_is_rejected_before_any_work() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [1, 2, 3]);
+    let not_a_dir = tmp.path().join("afile");
+    fs::write(&not_a_dir, b"x").unwrap();
+
+    for extra in [None, Some("-n")] {
+        let mut args: Vec<&std::ffi::OsStr> = vec![input.as_ref(), "-o".as_ref(), not_a_dir.as_ref()];
+        args.extend(extra.map(|e| e.as_ref() as &std::ffi::OsStr));
+        let output = run(&args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("not a directory"), "got: {stderr}");
+        assert!(!output.status.success());
+    }
+}
+
+#[test]
+fn cli_exposure_accepts_a_negative_value_without_leading_zero() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    image::RgbImage::from_pixel(64, 64, image::Rgb([100, 100, 100]))
+        .save(&input)
+        .unwrap();
+    let output = run(&[input.as_ref(), "-e".as_ref(), "-.5".as_ref()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
