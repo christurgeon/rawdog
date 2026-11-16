@@ -323,3 +323,83 @@ fn cli_leaves_no_temporary_files() {
         "got: {names:?}"
     );
 }
+
+#[test]
+fn cli_dry_run_lists_jobs_and_writes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [1, 2, 3]);
+    let out = tmp.path().join("out");
+
+    let output = run(&[input.as_ref(), "-o".as_ref(), out.as_ref(), "--dry-run".as_ref()]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("convert"), "got: {stdout}");
+    assert!(stdout.contains("in.jpg"), "got: {stdout}");
+    assert!(files_under(&out).is_empty());
+}
+
+#[test]
+fn cli_dry_run_marks_existing_outputs_as_skipped() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [1, 2, 3]);
+    assert!(run(&[input.as_ref()]).status.success());
+
+    let output = run(&[input.as_ref(), "-n".as_ref()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("skip"), "got: {stdout}");
+}
+
+#[test]
+fn cli_jobs_limits_are_validated_and_applied() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [1, 2, 3]);
+
+    let output = run(&[input.as_ref(), "-j".as_ref(), "0".as_ref()]);
+    assert_eq!(output.status.code(), Some(2));
+
+    let output = run(&[input.as_ref(), "-j".as_ref(), "1".as_ref()]);
+    assert!(output.status.success());
+    assert!(tmp.path().join("in.jpg").is_file());
+}
+
+#[test]
+fn cli_quiet_prints_nothing_on_success() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [1, 2, 3]);
+
+    let output = run(&[input.as_ref(), "--quiet".as_ref()]);
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    assert!(tmp.path().join("in.jpg").is_file());
+}
+
+#[test]
+fn cli_update_converts_only_when_input_is_newer() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [1, 2, 3]);
+    let jpg = tmp.path().join("in.jpg");
+    assert!(run(&[input.as_ref()]).status.success());
+
+    // Output is newer than the input: skipped.
+    let output = run(&[input.as_ref(), "--update".as_ref()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("0 succeeded, 0 failed, 1 skipped"), "got: {stdout}");
+
+    // Make the output older than the input: converted again.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+    fs::File::options()
+        .write(true)
+        .open(&jpg)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let output = run(&[input.as_ref(), "--update".as_ref()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("1 succeeded, 0 failed, 0 skipped"), "got: {stdout}");
+}
