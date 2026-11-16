@@ -435,3 +435,40 @@ fn cli_fast_resizes_to_the_requested_long_edge() {
         assert_eq!((w, h), (100, 50), "{name}");
     }
 }
+
+#[test]
+fn cli_copyright_and_artist_are_written_to_every_format() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [1, 2, 3]);
+    let out = tmp.path().join("out");
+
+    for (format, name) in [("jpeg", "in.jpg"), ("png", "in.png"), ("tiff", "in.tiff")] {
+        let output = run(&[
+            input.as_ref(),
+            "-o".as_ref(),
+            out.as_ref(),
+            "-f".as_ref(),
+            format.as_ref(),
+            "--artist".as_ref(),
+            "A. Tester".as_ref(),
+            "--copyright".as_ref(),
+            "(c) Test".as_ref(),
+        ]);
+        assert!(output.status.success(), "{format}");
+
+        let file = fs::File::open(out.join(name)).unwrap();
+        let parsed = exif::Reader::new()
+            .read_from_container(&mut std::io::BufReader::new(file))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let text = |tag| {
+            parsed
+                .get_field(tag, exif::In::PRIMARY)
+                .unwrap_or_else(|| panic!("{name}: missing {tag}"))
+                .display_value()
+                .to_string()
+        };
+        assert_eq!(text(exif::Tag::Artist), "\"A. Tester\"", "{name}");
+        assert_eq!(text(exif::Tag::Copyright), "\"(c) Test\"", "{name}");
+    }
+}

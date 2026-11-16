@@ -3,6 +3,19 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+/// What to do with metadata when it is copied to the output.
+#[derive(Clone, Default)]
+pub struct MetadataOptions {
+    /// Copy no source metadata.
+    pub strip_all: bool,
+    /// Do not copy GPS fields.
+    pub strip_gps: bool,
+    /// Value for the Artist tag. Replaces the source value.
+    pub artist: Option<String>,
+    /// Value for the Copyright tag. Replaces the source value.
+    pub copyright: Option<String>,
+}
+
 /// Read the EXIF fields of a source file, prepared for an output image with
 /// the given pixel dimensions.
 ///
@@ -11,6 +24,7 @@ use anyhow::{Context, Result};
 pub fn read_fields_for_output(
     path: &Path,
     dims: (u32, u32),
+    meta: &MetadataOptions,
 ) -> Result<Option<(Vec<exif::Field>, bool)>> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open {} for EXIF extraction", path.display()))?;
@@ -26,10 +40,14 @@ pub fn read_fields_for_output(
             let (exif, _errors) = partial.into_inner();
             exif
         }
-        Err(_) => return Ok(None),
+        // No source EXIF. Artist and copyright can still be written.
+        Err(_) => {
+            let fields = fields_for_output(std::iter::empty(), dims, meta);
+            return Ok((!fields.is_empty()).then_some((fields, true)));
+        }
     };
 
-    let fields = fields_for_output(exif.fields(), dims);
+    let fields = fields_for_output(exif.fields(), dims, meta);
     if fields.is_empty() {
         return Ok(None);
     }
@@ -40,8 +58,12 @@ pub fn read_fields_for_output(
 ///
 /// The blob is suitable for injection into JPEG (via img-parts `set_exif`)
 /// or PNG (via eXIf chunk). Returns `None` if no EXIF data could be extracted.
-pub fn extract_exif_from_arw(path: &Path, dims: (u32, u32)) -> Result<Option<Vec<u8>>> {
-    let Some((fields, little_endian)) = read_fields_for_output(path, dims)? else {
+pub fn extract_exif_from_arw(
+    path: &Path,
+    dims: (u32, u32),
+    meta: &MetadataOptions,
+) -> Result<Option<Vec<u8>>> {
+    let Some((fields, little_endian)) = read_fields_for_output(path, dims, meta)? else {
         return Ok(None);
     };
 
@@ -100,12 +122,34 @@ fn describes_source_layout(tag: exif::Tag) -> bool {
 /// - imagepipe rotates the pixels according to the RAW orientation, so any
 ///   Orientation tag is reset to 1 (normal). A missing tag is not added.
 /// - PixelXDimension and PixelYDimension are set to the output size.
+/// - `meta` can remove GPS fields or all source fields, and can set the
+///   Artist and Copyright tags.
 fn fields_for_output<'a>(
     fields: impl Iterator<Item = &'a exif::Field>,
     (width, height): (u32, u32),
+    meta: &MetadataOptions,
 ) -> Vec<exif::Field> {
+    use exif::{Context, Tag};
+
+    let replaced = |tag: Tag| {
+        (tag == Tag::Artist && meta.artist.is_some())
+            || (tag == Tag::Copyright && meta.copyright.is_some())
+    };
+    let text_field = |tag: Tag, text: &String| exif::Field {
+        tag,
+        ifd_num: exif::In::PRIMARY,
+        value: exif::Value::Ascii(vec![text.as_bytes().to_vec()]),
+    };
+    let added = [
+        meta.artist.as_ref().map(|t| text_field(Tag::Artist, t)),
+        meta.copyright.as_ref().map(|t| text_field(Tag::Copyright, t)),
+    ];
+
     fields
+        .filter(|_| !meta.strip_all)
         .filter(|f| f.ifd_num == exif::In::PRIMARY && !describes_source_layout(f.tag))
+        .filter(|f| !(meta.strip_gps && f.tag.context() == Context::Gps))
+        .filter(|f| !replaced(f.tag))
         .map(|field| {
             let mut field = field.clone();
             match field.tag {
@@ -116,6 +160,7 @@ fn fields_for_output<'a>(
             }
             field
         })
+        .chain(added.into_iter().flatten())
         .collect()
 }
 
@@ -221,7 +266,7 @@ mod tests {
 
     #[test]
     fn extract_exif_returns_none_for_nonexistent_file() {
-        let result = extract_exif_from_arw(Path::new("/nonexistent/photo.arw"), (300, 200));
+        let result = extract_exif_from_arw(Path::new("/nonexistent/photo.arw"), (300, 200), &MetadataOptions::default());
         assert!(result.is_err());
     }
 
@@ -229,7 +274,7 @@ mod tests {
     fn extract_exif_returns_none_for_non_arw_file() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), b"not a raw file").unwrap();
-        let result = extract_exif_from_arw(tmp.path(), (300, 200)).unwrap();
+        let result = extract_exif_from_arw(tmp.path(), (300, 200), &MetadataOptions::default()).unwrap();
         assert!(result.is_none());
     }
 
@@ -272,7 +317,7 @@ mod tests {
     #[test]
     fn fields_for_output_resets_orientation() {
         let source = [orientation_field(8), description_field()];
-        let out = fields_for_output(source.iter(), (300, 200));
+        let out = fields_for_output(source.iter(), (300, 200), &MetadataOptions::default());
         assert_eq!(out.len(), 2);
         let orientation = out
             .iter()
@@ -289,7 +334,7 @@ mod tests {
     #[test]
     fn fields_for_output_does_not_add_orientation() {
         let source = [description_field()];
-        let out = fields_for_output(source.iter(), (300, 200));
+        let out = fields_for_output(source.iter(), (300, 200), &MetadataOptions::default());
         assert!(out.iter().all(|f| f.tag != exif::Tag::Orientation));
         assert_eq!(out.len(), 1);
     }
@@ -299,14 +344,14 @@ mod tests {
         // imagepipe already rotates the pixels, so a copied Orientation of 6
         // would make viewers rotate the image a second time.
         let tmp = write_tiff_with_fields(&[orientation_field(6), description_field()]);
-        let data = extract_exif_from_arw(tmp.path(), (300, 200)).unwrap().unwrap();
+        let data = extract_exif_from_arw(tmp.path(), (300, 200), &MetadataOptions::default()).unwrap().unwrap();
         assert_eq!(orientation_of(&data), Some(1));
     }
 
     #[test]
     fn extract_exif_does_not_add_missing_orientation() {
         let tmp = write_tiff_with_fields(&[description_field()]);
-        let data = extract_exif_from_arw(tmp.path(), (300, 200)).unwrap().unwrap();
+        let data = extract_exif_from_arw(tmp.path(), (300, 200), &MetadataOptions::default()).unwrap().unwrap();
         assert_eq!(orientation_of(&data), None);
     }
 
@@ -406,7 +451,7 @@ mod tests {
             field(Tag::Compression, In::THUMBNAIL, Value::Short(vec![6])),
             field(Tag::Model, In::THUMBNAIL, Value::Ascii(vec![b"X".to_vec()])),
         ];
-        let out = fields_for_output(source.iter(), (300, 200));
+        let out = fields_for_output(source.iter(), (300, 200), &MetadataOptions::default());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].tag, Tag::ImageDescription);
     }
@@ -418,7 +463,7 @@ mod tests {
             field(Tag::PixelXDimension, In::PRIMARY, Value::Long(vec![2768])),
             field(Tag::PixelYDimension, In::PRIMARY, Value::Long(vec![1848])),
         ];
-        let out = fields_for_output(source.iter(), (300, 200));
+        let out = fields_for_output(source.iter(), (300, 200), &MetadataOptions::default());
         assert_eq!(out[0].value.get_uint(0), Some(300));
         assert_eq!(out[1].value.get_uint(0), Some(200));
     }
@@ -460,6 +505,84 @@ mod tests {
             .get_field(exif::Tag::ImageDescription, exif::In::PRIMARY)
             .unwrap();
         assert_eq!(desc.display_value().to_string(), "\"RawDog Test\"");
+    }
+
+    fn gps_field() -> exif::Field {
+        field(
+            exif::Tag::GPSLatitudeRef,
+            exif::In::PRIMARY,
+            exif::Value::Ascii(vec![b"N".to_vec()]),
+        )
+    }
+
+    fn tags(fields: &[exif::Field]) -> Vec<exif::Tag> {
+        fields.iter().map(|f| f.tag).collect()
+    }
+
+    #[test]
+    fn fields_for_output_strip_gps_removes_only_gps() {
+        let source = [description_field(), gps_field()];
+        let meta = MetadataOptions {
+            strip_gps: true,
+            ..Default::default()
+        };
+        let out = fields_for_output(source.iter(), (300, 200), &meta);
+        assert_eq!(tags(&out), vec![exif::Tag::ImageDescription]);
+
+        let out = fields_for_output(source.iter(), (300, 200), &MetadataOptions::default());
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn fields_for_output_strip_all_keeps_only_requested_attribution() {
+        let source = [description_field(), gps_field()];
+        let meta = MetadataOptions {
+            strip_all: true,
+            copyright: Some("(c) Test".to_string()),
+            ..Default::default()
+        };
+        let out = fields_for_output(source.iter(), (300, 200), &meta);
+        assert_eq!(tags(&out), vec![exif::Tag::Copyright]);
+
+        let meta = MetadataOptions {
+            strip_all: true,
+            ..Default::default()
+        };
+        assert!(fields_for_output(source.iter(), (300, 200), &meta).is_empty());
+    }
+
+    #[test]
+    fn fields_for_output_artist_replaces_source_value() {
+        let source = [field(
+            exif::Tag::Artist,
+            exif::In::PRIMARY,
+            exif::Value::Ascii(vec![b"Old".to_vec()]),
+        )];
+        let meta = MetadataOptions {
+            artist: Some("New".to_string()),
+            ..Default::default()
+        };
+        let out = fields_for_output(source.iter(), (300, 200), &meta);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].display_value().to_string(), "\"New\"");
+    }
+
+    #[test]
+    fn extract_exif_adds_copyright_when_source_has_no_exif() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"not a raw file").unwrap();
+        let meta = MetadataOptions {
+            copyright: Some("(c) Test".to_string()),
+            ..Default::default()
+        };
+        let data = extract_exif_from_arw(tmp.path(), (300, 200), &meta)
+            .unwrap()
+            .unwrap();
+        let parsed = exif::Reader::new().read_raw(data).unwrap();
+        let c = parsed
+            .get_field(exif::Tag::Copyright, exif::In::PRIMARY)
+            .unwrap();
+        assert_eq!(c.display_value().to_string(), "\"(c) Test\"");
     }
 
     #[test]
