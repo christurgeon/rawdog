@@ -78,6 +78,12 @@ non-zero when any conversion failed, when an input path does not exist, when
 no ARW files were found, or when outputs conflict. Valid inputs are still
 converted when some other inputs fail or are missing.
 
+Make small proofs quickly. `--fast` scales during RAW decoding, which is several times faster and slightly softer:
+
+```sh
+rawdog ./card -r 2048 --fast -o ./proofs
+```
+
 Preview what a run will do, without writing files:
 
 ```sh
