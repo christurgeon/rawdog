@@ -77,11 +77,100 @@ pub fn read_fields_for_output(
     meta: &MetadataOptions,
 ) -> Result<Option<(Vec<exif::Field>, bool)>> {
     // Without source EXIF, artist and copyright can still be written.
-    let (fields, little_endian) = match read_source_exif(path)? {
-        Some(exif) => (fields_for_output(exif.fields(), dims, meta), exif.little_endian()),
-        None => (fields_for_output(std::iter::empty(), dims, meta), true),
+    let (source, little_endian) = read_source_fields(path)?.unwrap_or_default();
+    let fields = fields_for_output(source.iter(), dims, meta);
+    Ok((!fields.is_empty()).then_some((fields, little_endian || source.is_empty())))
+}
+
+/// Read the metadata fields of a source file, with the source byte order.
+///
+/// Files whose EXIF container cannot be parsed (Canon CR3) get the main
+/// fields from the RAW decoder instead.
+pub fn read_source_fields(path: &Path) -> Result<Option<(Vec<exif::Field>, bool)>> {
+    if let Some(exif) = read_source_exif(path)? {
+        return Ok(Some((exif.fields().cloned().collect(), exif.little_endian())));
+    }
+    Ok(decoder_fields(path)
+        .filter(|fields| !fields.is_empty())
+        .map(|fields| (fields, true)))
+}
+
+/// Build EXIF fields from the metadata that the rawler decoder reads.
+fn decoder_fields(path: &Path) -> Option<Vec<exif::Field>> {
+    use exif::{Field, In, Tag, Value};
+    use rawler::decoders::RawDecodeParams;
+    use rawler::rawsource::RawSource;
+
+    // rawler can panic on files that are not RAW files.
+    let meta = std::panic::catch_unwind(|| {
+        let source = RawSource::new(path).ok()?;
+        let decoder = rawler::get_decoder(&source).ok()?;
+        decoder.raw_metadata(&source, &RawDecodeParams::default()).ok()
+    })
+    .ok()??;
+    let e = meta.exif;
+
+    let mut fields = Vec::new();
+    let mut push = |tag: Tag, value: Option<Value>| {
+        if let Some(value) = value {
+            fields.push(Field {
+                tag,
+                ifd_num: In::PRIMARY,
+                value,
+            });
+        }
     };
-    Ok((!fields.is_empty()).then_some((fields, little_endian)))
+    let text = |s: Option<String>| {
+        s.map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|s| Value::Ascii(vec![s.into_bytes()]))
+    };
+    let short = |v: Option<u16>| v.map(|v| Value::Short(vec![v]));
+    let rational = |v: Option<rawler::formats::tiff::Rational>| {
+        v.map(|r| Value::Rational(vec![exif::Rational { num: r.n, denom: r.d }]))
+    };
+    let srational = |v: Option<rawler::formats::tiff::SRational>| {
+        v.map(|r| Value::SRational(vec![exif::SRational { num: r.n, denom: r.d }]))
+    };
+    let triple = |v: Option<[rawler::formats::tiff::Rational; 3]>| {
+        v.map(|v| {
+            Value::Rational(
+                v.iter()
+                    .map(|r| exif::Rational { num: r.n, denom: r.d })
+                    .collect(),
+            )
+        })
+    };
+
+    push(Tag::Make, text(Some(meta.make)));
+    push(Tag::Model, text(Some(meta.model)));
+    push(Tag::Artist, text(e.artist));
+    push(Tag::Copyright, text(e.copyright));
+    push(Tag::DateTimeOriginal, text(e.date_time_original));
+    push(Tag::DateTimeDigitized, text(e.create_date));
+    push(Tag::DateTime, text(e.modify_date));
+    push(Tag::ExposureTime, rational(e.exposure_time));
+    push(Tag::FNumber, rational(e.fnumber));
+    push(Tag::ExposureProgram, short(e.exposure_program));
+    push(Tag::PhotographicSensitivity, short(e.iso_speed_ratings));
+    push(Tag::ExposureBiasValue, srational(e.exposure_bias));
+    push(Tag::MeteringMode, short(e.metering_mode));
+    push(Tag::Flash, short(e.flash));
+    push(Tag::FocalLength, rational(e.focal_length));
+    push(Tag::WhiteBalance, short(e.white_balance));
+    push(Tag::BodySerialNumber, text(e.serial_number));
+    push(Tag::LensMake, text(e.lens_make));
+    push(Tag::LensModel, text(e.lens_model));
+    push(Tag::LensSerialNumber, text(e.lens_serial_number));
+    if let Some(gps) = e.gps {
+        push(Tag::GPSLatitudeRef, text(gps.gps_latitude_ref));
+        push(Tag::GPSLatitude, triple(gps.gps_latitude));
+        push(Tag::GPSLongitudeRef, text(gps.gps_longitude_ref));
+        push(Tag::GPSLongitude, triple(gps.gps_longitude));
+        push(Tag::GPSAltitudeRef, gps.gps_altitude_ref.map(|v| Value::Byte(vec![v])));
+        push(Tag::GPSAltitude, rational(gps.gps_altitude));
+    }
+    Some(fields)
 }
 
 /// Extract EXIF from a source ARW (TIFF-based) file as a TIFF byte blob.
