@@ -1,5 +1,6 @@
 mod converter;
 mod exif;
+mod gallery;
 mod naming;
 mod report;
 
@@ -8,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::{generate, Shell};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -75,6 +76,12 @@ struct Cli {
     /// skipped, failed, excluded), message, seconds
     #[arg(long, value_name = "FILE")]
     report: Option<PathBuf>,
+
+    /// Write gallery.html into the output directory: a proof page of the
+    /// output images with file name, capture time, camera, and rating.
+    /// Needs -o and JPEG or PNG output; replaces an earlier gallery.html
+    #[arg(long, requires = "output")]
+    gallery: bool,
 
     /// Output format
     #[arg(short, long, value_enum, default_value_t = OutputFormat::Jpeg)]
@@ -171,6 +178,52 @@ fn float_in_range<const MIN: i32, const MAX: i32>(s: &str) -> Result<f32, String
     }
 }
 
+/// Write `dir/gallery.html` for the outputs that exist after the run.
+fn write_gallery(dir: &Path, records: &[report::Record], quiet: bool) -> Result<()> {
+    let mut shown: Vec<&report::Record> = records
+        .iter()
+        .filter(|r| matches!(r.status, report::Status::Converted | report::Status::Skipped))
+        .filter(|r| r.output.as_deref().is_some_and(Path::exists))
+        .collect();
+    shown.sort_by(|a, b| a.output.cmp(&b.output));
+    let entries: Vec<gallery::Entry> = shown
+        .par_iter()
+        .map(|r| {
+            let info = naming::NameInfo::read(&r.input, true);
+            gallery::Entry {
+                image: r.output.clone().unwrap_or_default(),
+                caption: gallery::Caption {
+                    name: r
+                        .input
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    taken: info.taken.map(|(y, mo, d, h, mi, _)| {
+                        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
+                    }),
+                    model: info.model,
+                    rating: info.rating,
+                },
+            }
+        })
+        .collect();
+    let title = dir
+        .canonicalize()
+        .ok()
+        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "Gallery".to_string());
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("Failed to create output directory {}", dir.display()))?;
+    let page = dir.join("gallery.html");
+    std::fs::write(&page, gallery::render(&title, dir, &entries))
+        .with_context(|| format!("Failed to write {}", page.display()))?;
+    if !quiet {
+        println!("Gallery: {}", page.display());
+    }
+    Ok(())
+}
+
 fn write_report(path: &Path, records: &mut [report::Record]) -> Result<()> {
     report::write(path, records)
         .map_err(|e| anyhow!("Failed to write report {}: {e}", path.display()))
@@ -262,6 +315,10 @@ fn main() -> Result<()> {
         let name = cmd.get_name().to_string();
         generate(shell, &mut cmd, name, &mut std::io::stdout());
         return Ok(());
+    }
+
+    if cli.gallery && matches!(cli.format, OutputFormat::Tiff | OutputFormat::Original) {
+        bail!("--gallery needs JPEG or PNG output; browsers do not show TIFF or RAW files.");
     }
 
     if matches!(cli.format, OutputFormat::Original) {
@@ -433,7 +490,7 @@ fn main() -> Result<()> {
     let failures: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     let records: Mutex<Vec<report::Record>> = Mutex::new(excluded_records);
     let record = |input: &Path, output: &Path, status, message: String, seconds: f64| {
-        if cli.report.is_some() {
+        if cli.report.is_some() || cli.gallery {
             records.lock().unwrap().push(report::Record {
                 input: input.to_path_buf(),
                 output: Some(output.to_path_buf()),
@@ -547,8 +604,12 @@ fn main() -> Result<()> {
         println!("{s} succeeded, {f} failed, {sk} skipped");
     }
 
+    let mut records = records.into_inner().unwrap();
     if let Some(path) = &cli.report {
-        write_report(path, &mut records.into_inner().unwrap())?;
+        write_report(path, &mut records)?;
+    }
+    if let (true, Some(dir)) = (cli.gallery, cli.output.as_deref()) {
+        write_gallery(dir, &records, cli.quiet)?;
     }
 
     // Errors scroll away in a long run, so repeat which files failed.
