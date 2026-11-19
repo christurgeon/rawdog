@@ -1,13 +1,15 @@
 mod converter;
 mod exif;
+mod gallery;
 mod naming;
+mod report;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::{generate, Shell};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -21,6 +23,9 @@ pub enum OutputFormat {
     #[value(alias = "tif")]
     Tiff,
     Png,
+    /// Copy the RAW file itself, unchanged. With --name, this files a card
+    /// into a dated folder layout
+    Original,
 }
 
 #[derive(Parser)]
@@ -65,6 +70,18 @@ struct Cli {
     /// (not case-sensitive), for example "7M4" or "Z 6"
     #[arg(long, value_name = "MODEL")]
     camera: Option<String>,
+
+    /// Write what happened to each file to this file: JSON if the name ends
+    /// in .json, otherwise CSV. Columns: input, output, status (converted,
+    /// skipped, failed, excluded), message, seconds
+    #[arg(long, value_name = "FILE")]
+    report: Option<PathBuf>,
+
+    /// Write gallery.html into the output directory: a proof page of the
+    /// output images with file name, capture time, camera, and rating.
+    /// Needs -o and JPEG or PNG output; replaces an earlier gallery.html
+    #[arg(long, requires = "output")]
+    gallery: bool,
 
     /// Output format
     #[arg(short, long, value_enum, default_value_t = OutputFormat::Jpeg)]
@@ -167,6 +184,57 @@ fn float_in_range<const MIN: i32, const MAX: i32>(s: &str) -> Result<f32, String
     }
 }
 
+/// Write `dir/gallery.html` for the outputs that exist after the run.
+fn write_gallery(dir: &Path, records: &[report::Record], quiet: bool) -> Result<()> {
+    let mut shown: Vec<&report::Record> = records
+        .iter()
+        .filter(|r| matches!(r.status, report::Status::Converted | report::Status::Skipped))
+        .filter(|r| r.output.as_deref().is_some_and(Path::exists))
+        .collect();
+    shown.sort_by(|a, b| a.output.cmp(&b.output));
+    let entries: Vec<gallery::Entry> = shown
+        .par_iter()
+        .map(|r| {
+            let info = naming::NameInfo::read(&r.input, true);
+            gallery::Entry {
+                image: r.output.clone().unwrap_or_default(),
+                caption: gallery::Caption {
+                    name: r
+                        .input
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    taken: info.taken.map(|(y, mo, d, h, mi, _)| {
+                        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
+                    }),
+                    model: info.model,
+                    rating: info.rating,
+                },
+            }
+        })
+        .collect();
+    let title = dir
+        .canonicalize()
+        .ok()
+        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "Gallery".to_string());
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("Failed to create output directory {}", dir.display()))?;
+    let page = dir.join("gallery.html");
+    std::fs::write(&page, gallery::render(&title, dir, &entries))
+        .with_context(|| format!("Failed to write {}", page.display()))?;
+    if !quiet {
+        println!("Gallery: {}", page.display());
+    }
+    Ok(())
+}
+
+fn write_report(path: &Path, records: &mut [report::Record]) -> Result<()> {
+    report::write(path, records)
+        .map_err(|e| anyhow!("Failed to write report {}: {e}", path.display()))
+}
+
 fn parse_date(s: &str) -> Result<(u16, u8, u8), String> {
     let err = || "must be a date as YYYY-MM-DD".to_string();
     let mut parts = s.split('-');
@@ -255,6 +323,36 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if cli.gallery && matches!(cli.format, OutputFormat::Tiff | OutputFormat::Original) {
+        bail!("--gallery needs JPEG or PNG output; browsers do not show TIFF or RAW files.");
+    }
+
+    if matches!(cli.format, OutputFormat::Original) {
+        let image_options = [
+            ("--resize", cli.resize.is_some()),
+            ("--fast", cli.fast),
+            ("--preview", cli.preview),
+            ("--exposure", cli.exposure.is_some()),
+            ("--wb", cli.wb.is_some()),
+            ("--sharpen", cli.sharpen.is_some()),
+            ("--strip-gps", cli.strip_gps),
+            ("--strip-metadata", cli.strip_metadata),
+            ("--artist", cli.artist.is_some()),
+            ("--copyright", cli.copyright.is_some()),
+        ];
+        let used: Vec<&str> = image_options
+            .iter()
+            .filter(|(_, set)| *set)
+            .map(|(name, _)| *name)
+            .collect();
+        if !used.is_empty() {
+            bail!(
+                "-f original copies files unchanged, so {} cannot be used with it.",
+                used.join(", ")
+            );
+        }
+    }
+
     if let Some(dir) = cli.output.as_deref().filter(|d| d.exists() && !d.is_dir()) {
         bail!("Output path {} exists and is not a directory.", dir.display());
     }
@@ -277,6 +375,7 @@ fn main() -> Result<()> {
         until: cli.until,
         camera: cli.camera.clone(),
     };
+    let mut excluded_records = Vec::new();
     let files = if selection.is_active() {
         let excluded: Vec<Option<String>> = files
             .par_iter()
@@ -284,6 +383,16 @@ fn main() -> Result<()> {
             .collect();
         let (kept, dropped): (Vec<_>, Vec<_>) =
             files.into_iter().zip(excluded).partition(|(_, reason)| reason.is_none());
+        excluded_records = dropped
+            .iter()
+            .map(|(f, reason)| report::Record {
+                input: f.path.clone(),
+                output: None,
+                status: report::Status::Excluded,
+                message: reason.clone().unwrap_or_default(),
+                seconds: 0.0,
+            })
+            .collect();
         if cli.dry_run {
             for (f, reason) in &dropped {
                 println!("exclude {} ({})", f.path.display(), reason.as_deref().unwrap_or(""));
@@ -294,6 +403,9 @@ fn main() -> Result<()> {
         if kept.is_empty() {
             if !cli.quiet {
                 println!("No RAW files match the selection options.");
+            }
+            if let Some(path) = &cli.report {
+                write_report(path, &mut excluded_records)?;
             }
             if missing_inputs {
                 std::process::exit(1);
@@ -349,7 +461,13 @@ fn main() -> Result<()> {
                 .max()
                 .unwrap_or(0);
             let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-            default_workers(largest_input, cli.fast || cli.preview, total_memory(), cores)
+            if matches!(cli.format, OutputFormat::Original) {
+                // Copies need little memory; more of them only compete for
+                // the same disk.
+                cores.min(4)
+            } else {
+                default_workers(largest_input, cli.fast || cli.preview, total_memory(), cores)
+            }
         }
     };
 
@@ -377,6 +495,18 @@ fn main() -> Result<()> {
     };
 
     let failures: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    let records: Mutex<Vec<report::Record>> = Mutex::new(excluded_records);
+    let record = |input: &Path, output: &Path, status, message: String, seconds: f64| {
+        if cli.report.is_some() || cli.gallery {
+            records.lock().unwrap().push(report::Record {
+                input: input.to_path_buf(),
+                output: Some(output.to_path_buf()),
+                status,
+                message,
+                seconds,
+            });
+        }
+    };
     let succeeded = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
@@ -409,6 +539,7 @@ fn main() -> Result<()> {
             pb.suspend(|| {
                 eprintln!("Error converting {}: {reason}", input_path.display());
             });
+            record(input_path, output_path, report::Status::Failed, reason, 0.0);
             failures.lock().unwrap().push(input_path.clone());
             failed.fetch_add(1, Ordering::Relaxed);
             pb.inc(1);
@@ -416,6 +547,13 @@ fn main() -> Result<()> {
         }
 
         if should_skip(input_path, output_path, cli.overwrite, cli.update) {
+            record(
+                input_path,
+                output_path,
+                report::Status::Skipped,
+                "output exists".to_string(),
+                0.0,
+            );
             skipped.fetch_add(1, Ordering::Relaxed);
             pb.inc(1);
             return;
@@ -423,6 +561,7 @@ fn main() -> Result<()> {
 
         // The RAW decoder can panic on corrupt files. Report that as a
         // failure of this file instead of aborting the batch.
+        let started = std::time::Instant::now();
         let result = std::panic::catch_unwind(|| {
             converter::convert_raw(input_path, output_path, &opts)
         })
@@ -430,12 +569,16 @@ fn main() -> Result<()> {
 
         match result {
             Ok(()) => {
+                let seconds = started.elapsed().as_secs_f64();
+                record(input_path, output_path, report::Status::Converted, String::new(), seconds);
                 succeeded.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
                 pb.suspend(|| {
                     eprintln!("Error converting {}: {:#}", input_path.display(), e);
                 });
+                let seconds = started.elapsed().as_secs_f64();
+                record(input_path, output_path, report::Status::Failed, format!("{e:#}"), seconds);
                 failures.lock().unwrap().push(input_path.clone());
                 failed.fetch_add(1, Ordering::Relaxed);
             }
@@ -466,6 +609,14 @@ fn main() -> Result<()> {
 
     if !cli.quiet {
         println!("{s} succeeded, {f} failed, {sk} skipped");
+    }
+
+    let mut records = records.into_inner().unwrap();
+    if let Some(path) = &cli.report {
+        write_report(path, &mut records)?;
+    }
+    if let (true, Some(dir)) = (cli.gallery, cli.output.as_deref()) {
+        write_gallery(dir, &records, cli.quiet)?;
     }
 
     // Errors scroll away in a long run, so repeat which files failed.
@@ -714,7 +865,7 @@ fn plan_outputs(
             Some(named) => {
                 let mut name = named[i].clone().into_os_string();
                 name.push(".");
-                name.push(extension(format));
+                name.push(output_extension(&f.path, format));
                 match output_dir {
                     Some(dir) => dir.join(&name),
                     None => f.path.parent().unwrap_or(Path::new("")).join(&name),
@@ -748,11 +899,16 @@ fn plan_outputs(
     Ok(jobs)
 }
 
-fn extension(format: OutputFormat) -> &'static str {
+fn output_extension(input: &Path, format: OutputFormat) -> String {
     match format {
-        OutputFormat::Jpeg => "jpg",
-        OutputFormat::Tiff => "tiff",
-        OutputFormat::Png => "png",
+        OutputFormat::Jpeg => "jpg".to_string(),
+        OutputFormat::Tiff => "tiff".to_string(),
+        OutputFormat::Png => "png".to_string(),
+        OutputFormat::Original => input
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
     }
 }
 
@@ -772,7 +928,7 @@ fn is_raw(path: &Path) -> bool {
 /// Build the output path for a given input ARW file.
 fn make_output_path(input: &Path, output_dir: Option<&Path>, format: OutputFormat) -> PathBuf {
     let stem = input.file_stem().unwrap_or_default();
-    let ext = extension(format);
+    let ext = output_extension(input, format);
     let file_name = format!("{}.{}", stem.to_string_lossy(), ext);
 
     match output_dir {
@@ -1092,6 +1248,13 @@ mod tests {
         let input = Path::new("/photos/DSC00001.ARW");
         let result = make_output_path(input, None, OutputFormat::Tiff);
         assert_eq!(result, PathBuf::from("/photos/DSC00001.tiff"));
+    }
+
+    #[test]
+    fn make_output_path_original_keeps_the_input_extension() {
+        let input = Path::new("/card/DSC00001.ARW");
+        let result = make_output_path(input, Some(Path::new("/archive")), OutputFormat::Original);
+        assert_eq!(result, PathBuf::from("/archive/DSC00001.ARW"));
     }
 
     #[test]

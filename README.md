@@ -93,6 +93,12 @@ The template path is below the `-o` directory. Without `-o` it is below the dire
 
 RAW files are developed with a tone curve that gives brightness and contrast close to the camera's own JPEG. Use `--look flat` for the darker, flatter result of earlier versions, which leaves more room for editing afterwards.
 
+Import a card: copy the RAW files themselves into dated folders. Each copy is compared byte for byte with the original and keeps its modification time; the card is never changed. XMP sidecars (`NAME.xmp` from Lightroom or Capture One, `NAME.ARW.xmp` from darktable) are copied with their RAW file, and a sidecar that already exists in the archive is kept. Image options such as `-r` cannot be used with `-f original`:
+
+```sh
+rawdog -R /Volumes/CARD -f original -o ~/Archive --name "{year}/{date}/{stem}"
+```
+
 Convert only your picks. Ratings come from sidecar XMP files written by Lightroom, Capture One, or darktable, or from the rating set in the camera:
 
 ```sh
@@ -155,6 +161,18 @@ Set how many files are converted at the same time. By default rawdog chooses thi
 
 ```sh
 rawdog ./photos/ -j 2
+```
+
+Make proofs for a client: `--gallery` writes `gallery.html` into the output directory, a page of the output images with file name, capture time, camera, and rating. It works offline and on a phone:
+
+```sh
+rawdog ./wedding -r 1600 --fast -o ./proofs --gallery
+```
+
+Keep a record of a large run. The report lists each file with its output, its status (converted, skipped, failed, or excluded), the error message, and the time taken; it is JSON if the name ends in `.json`, otherwise CSV:
+
+```sh
+rawdog -R /Volumes/CARD -o ./jpegs --report run.csv
 ```
 
 Print errors only, for use in scripts:

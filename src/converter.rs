@@ -52,6 +52,10 @@ pub enum Look {
 
 /// Convert a single ARW file to the specified output format.
 pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<()> {
+    if matches!(opts.format, OutputFormat::Original) {
+        return copy_original(input, output);
+    }
+
     let ConvertOptions {
         format,
         resize,
@@ -122,6 +126,7 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
                     let img = source.rgb16(input, opts)?;
                     write_tiff(&img, input, &mut out, opts).with_context(unwritable)?;
                 }
+                OutputFormat::Original => unreachable!("handled by copy_original"),
                 OutputFormat::Png => {
                     let img = source.rgb16(input, opts)?;
                     write_png(&img, input, &mut out, opts).with_context(unwritable)?;
@@ -483,6 +488,113 @@ fn exposure_curve(ev: f32, base: &SplineFunc) -> Vec<(f32, f32)> {
         .collect()
 }
 
+/// Copy `input` to `output` unchanged, with its modification time.
+///
+/// The copy goes to a temporary file, is compared byte for byte with the
+/// source, and only then gets its final name. The source is never changed.
+fn copy_original(input: &Path, output: &Path) -> Result<()> {
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create output directory {}", parent.display()))?;
+    }
+    let tmp = temp_path_for(output);
+    let _guard = TempFileGuard::register(&tmp);
+    let unwritable = || format!("Failed to write output file {}", output.display());
+
+    let result = (|| -> Result<()> {
+        std::fs::copy(input, &tmp).with_context(unwritable)?;
+        let copy = std::fs::File::options()
+            .write(true)
+            .open(&tmp)
+            .with_context(unwritable)?;
+        copy.sync_all().with_context(unwritable)?;
+        if let Ok(modified) = std::fs::metadata(input).and_then(|m| m.modified()) {
+            copy.set_modified(modified).with_context(unwritable)?;
+        }
+        drop(copy);
+        if !same_contents(input, &tmp)? {
+            return Err(anyhow!(
+                "The copy of {} differs from the original; the disk may be failing",
+                input.display()
+            ));
+        }
+        std::fs::rename(&tmp, output).with_context(unwritable)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+    copy_sidecars(input, output)
+}
+
+/// Copy the XMP sidecars of `input` next to `output`, in the same naming
+/// style: `NAME.xmp` (Lightroom, Capture One) or `NAME.EXT.xmp` (darktable).
+/// They hold ratings and edits, which an archive must keep. An existing
+/// sidecar at the destination is kept, because it may hold newer edits.
+fn copy_sidecars(input: &Path, output: &Path) -> Result<()> {
+    let mut pairs = Vec::new();
+    for ext in ["xmp", "XMP"] {
+        pairs.push((input.with_extension(ext), output.with_extension(ext)));
+    }
+    let with_suffix = |p: &Path| {
+        let mut name = p.as_os_str().to_owned();
+        name.push(".xmp");
+        PathBuf::from(name)
+    };
+    pairs.push((with_suffix(input), with_suffix(output)));
+
+    for (source, destination) in pairs {
+        if !source.is_file() || destination.exists() {
+            continue;
+        }
+        let tmp = temp_path_for(&destination);
+        let _guard = TempFileGuard::register(&tmp);
+        let copied = std::fs::copy(&source, &tmp)
+            .map_err(anyhow::Error::from)
+            .and_then(|_| same_contents(&source, &tmp))
+            .and_then(|same| {
+                if same {
+                    std::fs::rename(&tmp, &destination).map_err(Into::into)
+                } else {
+                    Err(anyhow!("the copy differs from the original"))
+                }
+            });
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(anyhow!(
+                "Copied {} but not its sidecar {}: {e:#}",
+                input.display(),
+                source.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// True if the two files have the same bytes.
+fn same_contents(a: &Path, b: &Path) -> Result<bool> {
+    use std::io::Read;
+    let open = |p: &Path| {
+        std::fs::File::open(p).with_context(|| format!("Failed to read {}", p.display()))
+    };
+    let (mut fa, mut fb) = (open(a)?, open(b)?);
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
+}
+
 /// Temporary files that are being written, so that an interrupt can remove
 /// them. Without this, Ctrl-C leaves hidden `.NAME.rawdog-tmp` files.
 static ACTIVE_TEMP_FILES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
@@ -512,9 +624,13 @@ impl Drop for TempFileGuard {
 pub fn remove_active_temp_files() {
     // A conversion thread can hold the lock; do not wait for it.
     if let Ok(active) = ACTIVE_TEMP_FILES.try_lock() {
-        for path in active.iter() {
-            let _ = std::fs::remove_file(path);
-        }
+        remove_files(&active);
+    }
+}
+
+fn remove_files(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -1028,19 +1144,76 @@ mod tests {
     }
 
     #[test]
-    fn remove_active_temp_files_removes_only_files_in_use() {
+    fn temp_file_guard_registers_only_files_in_use() {
+        // Other tests run in parallel and register their own files, so this
+        // test checks its own paths only and never removes the whole list.
         let tmp = tempfile::TempDir::new().unwrap();
         let in_use = tmp.path().join(".a.jpg.rawdog-tmp");
         let finished = tmp.path().join(".b.jpg.rawdog-tmp");
-        std::fs::write(&in_use, b"x").unwrap();
-        std::fs::write(&finished, b"x").unwrap();
+        let active = || ACTIVE_TEMP_FILES.lock().unwrap().clone();
 
-        let _active = TempFileGuard::register(&in_use);
+        let _guard = TempFileGuard::register(&in_use);
         drop(TempFileGuard::register(&finished));
-        remove_active_temp_files();
+        assert!(active().contains(&in_use));
+        assert!(!active().contains(&finished));
 
+        std::fs::write(&in_use, b"x").unwrap();
+        remove_files(std::slice::from_ref(&in_use));
         assert!(!in_use.exists());
-        assert!(finished.exists());
+    }
+
+    #[test]
+    fn copy_original_copies_bytes_and_modification_time() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let input = tmp.path().join("DSC1.ARW");
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&input, &data).unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options().write(true).open(&input).unwrap().set_modified(old).unwrap();
+
+        let output = tmp.path().join("2023/11/DSC1.ARW");
+        copy_original(&input, &output).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), data);
+        assert_eq!(std::fs::metadata(&output).unwrap().modified().unwrap(), old);
+        assert_eq!(std::fs::read(&input).unwrap(), data, "source changed");
+        assert!(!temp_path_for(&output).exists());
+    }
+
+    #[test]
+    fn copy_original_copies_sidecars_in_both_naming_styles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let input = tmp.path().join("DSC1.ARW");
+        std::fs::write(&input, b"raw").unwrap();
+        std::fs::write(tmp.path().join("DSC1.xmp"), b"lightroom").unwrap();
+        std::fs::write(tmp.path().join("DSC1.ARW.xmp"), b"darktable").unwrap();
+
+        let out_dir = tmp.path().join("archive");
+        let output = out_dir.join("2024-01-01_DSC1.ARW");
+        // A sidecar that already exists at the destination is kept.
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("2024-01-01_DSC1.ARW.xmp"), b"newer edits").unwrap();
+
+        copy_original(&input, &output).unwrap();
+        assert_eq!(std::fs::read(out_dir.join("2024-01-01_DSC1.xmp")).unwrap(), b"lightroom");
+        assert_eq!(
+            std::fs::read(out_dir.join("2024-01-01_DSC1.ARW.xmp")).unwrap(),
+            b"newer edits"
+        );
+    }
+
+    #[test]
+    fn same_contents_detects_a_difference() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (a, b, c) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("c"));
+        std::fs::write(&a, vec![7u8; 2_500_000]).unwrap();
+        std::fs::write(&b, vec![7u8; 2_500_000]).unwrap();
+        let mut changed = vec![7u8; 2_500_000];
+        changed[2_400_000] = 8;
+        std::fs::write(&c, changed).unwrap();
+        assert!(same_contents(&a, &b).unwrap());
+        assert!(!same_contents(&a, &c).unwrap());
+        std::fs::write(&c, vec![7u8; 10]).unwrap();
+        assert!(!same_contents(&a, &c).unwrap());
     }
 
     // -----------------------------------------------------------------------
