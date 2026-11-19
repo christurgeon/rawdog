@@ -473,8 +473,53 @@ fn copy_original(input: &Path, output: &Path) -> Result<()> {
 
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return result;
     }
-    result
+    copy_sidecars(input, output)
+}
+
+/// Copy the XMP sidecars of `input` next to `output`, in the same naming
+/// style: `NAME.xmp` (Lightroom, Capture One) or `NAME.EXT.xmp` (darktable).
+/// They hold ratings and edits, which an archive must keep. An existing
+/// sidecar at the destination is kept, because it may hold newer edits.
+fn copy_sidecars(input: &Path, output: &Path) -> Result<()> {
+    let mut pairs = Vec::new();
+    for ext in ["xmp", "XMP"] {
+        pairs.push((input.with_extension(ext), output.with_extension(ext)));
+    }
+    let with_suffix = |p: &Path| {
+        let mut name = p.as_os_str().to_owned();
+        name.push(".xmp");
+        PathBuf::from(name)
+    };
+    pairs.push((with_suffix(input), with_suffix(output)));
+
+    for (source, destination) in pairs {
+        if !source.is_file() || destination.exists() {
+            continue;
+        }
+        let tmp = temp_path_for(&destination);
+        let _guard = TempFileGuard::register(&tmp);
+        let copied = std::fs::copy(&source, &tmp)
+            .map_err(anyhow::Error::from)
+            .and_then(|_| same_contents(&source, &tmp))
+            .and_then(|same| {
+                if same {
+                    std::fs::rename(&tmp, &destination).map_err(Into::into)
+                } else {
+                    Err(anyhow!("the copy differs from the original"))
+                }
+            });
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(anyhow!(
+                "Copied {} but not its sidecar {}: {e:#}",
+                input.display(),
+                source.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// True if the two files have the same bytes.
@@ -529,9 +574,13 @@ impl Drop for TempFileGuard {
 pub fn remove_active_temp_files() {
     // A conversion thread can hold the lock; do not wait for it.
     if let Ok(active) = ACTIVE_TEMP_FILES.try_lock() {
-        for path in active.iter() {
-            let _ = std::fs::remove_file(path);
-        }
+        remove_files(&active);
+    }
+}
+
+fn remove_files(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -1045,19 +1094,22 @@ mod tests {
     }
 
     #[test]
-    fn remove_active_temp_files_removes_only_files_in_use() {
+    fn temp_file_guard_registers_only_files_in_use() {
+        // Other tests run in parallel and register their own files, so this
+        // test checks its own paths only and never removes the whole list.
         let tmp = tempfile::TempDir::new().unwrap();
         let in_use = tmp.path().join(".a.jpg.rawdog-tmp");
         let finished = tmp.path().join(".b.jpg.rawdog-tmp");
-        std::fs::write(&in_use, b"x").unwrap();
-        std::fs::write(&finished, b"x").unwrap();
+        let active = || ACTIVE_TEMP_FILES.lock().unwrap().clone();
 
-        let _active = TempFileGuard::register(&in_use);
+        let _guard = TempFileGuard::register(&in_use);
         drop(TempFileGuard::register(&finished));
-        remove_active_temp_files();
+        assert!(active().contains(&in_use));
+        assert!(!active().contains(&finished));
 
+        std::fs::write(&in_use, b"x").unwrap();
+        remove_files(std::slice::from_ref(&in_use));
         assert!(!in_use.exists());
-        assert!(finished.exists());
     }
 
     #[test]
@@ -1075,6 +1127,28 @@ mod tests {
         assert_eq!(std::fs::metadata(&output).unwrap().modified().unwrap(), old);
         assert_eq!(std::fs::read(&input).unwrap(), data, "source changed");
         assert!(!temp_path_for(&output).exists());
+    }
+
+    #[test]
+    fn copy_original_copies_sidecars_in_both_naming_styles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let input = tmp.path().join("DSC1.ARW");
+        std::fs::write(&input, b"raw").unwrap();
+        std::fs::write(tmp.path().join("DSC1.xmp"), b"lightroom").unwrap();
+        std::fs::write(tmp.path().join("DSC1.ARW.xmp"), b"darktable").unwrap();
+
+        let out_dir = tmp.path().join("archive");
+        let output = out_dir.join("2024-01-01_DSC1.ARW");
+        // A sidecar that already exists at the destination is kept.
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("2024-01-01_DSC1.ARW.xmp"), b"newer edits").unwrap();
+
+        copy_original(&input, &output).unwrap();
+        assert_eq!(std::fs::read(out_dir.join("2024-01-01_DSC1.xmp")).unwrap(), b"lightroom");
+        assert_eq!(
+            std::fs::read(out_dir.join("2024-01-01_DSC1.ARW.xmp")).unwrap(),
+            b"newer edits"
+        );
     }
 
     #[test]
