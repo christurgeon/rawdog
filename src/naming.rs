@@ -218,12 +218,14 @@ fn xmp_rating(xmp: &[u8]) -> Option<i8> {
 fn xmp_text(xmp: &[u8]) -> String {
     let utf16 = |bytes: &[u8], big_endian: bool| {
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|b| {
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| {
                 if big_endian {
-                    u16::from_be_bytes([b[0], b[1]])
+                    u16::from_be_bytes(pair)
                 } else {
-                    u16::from_le_bytes([b[0], b[1]])
+                    u16::from_le_bytes(pair)
                 }
             })
             .collect();
