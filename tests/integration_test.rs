@@ -786,3 +786,51 @@ fn cli_report_lists_every_file_with_its_result() {
     let text = fs::read_to_string(&json).unwrap();
     assert!(text.contains(r#""status": "skipped""#), "{text}");
 }
+
+#[test]
+fn cli_original_copies_files_into_the_name_layout() {
+    let tmp = TempDir::new().unwrap();
+    let card = tmp.path().join("card");
+    fs::create_dir(&card).unwrap();
+    fs::write(card.join("DSC1.ARW"), b"raw bytes one").unwrap();
+    fs::write(card.join("DSC2.arw"), b"raw bytes two").unwrap();
+    let archive = tmp.path().join("archive");
+
+    let output = run(&[
+        card.as_ref(),
+        "-f".as_ref(),
+        "original".as_ref(),
+        "-o".as_ref(),
+        archive.as_ref(),
+        "--name".as_ref(),
+        "{date}/{stem}".as_ref(),
+    ]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fs::read(archive.join("unknown/DSC1.ARW")).unwrap(), b"raw bytes one");
+    assert_eq!(fs::read(archive.join("unknown/DSC2.arw")).unwrap(), b"raw bytes two");
+    // The card is unchanged.
+    assert_eq!(fs::read(card.join("DSC1.ARW")).unwrap(), b"raw bytes one");
+
+    // Running again skips the existing copies.
+    let output = run(&[card.as_ref(), "-f".as_ref(), "original".as_ref(), "-o".as_ref(), archive.as_ref(), "--name".as_ref(), "{date}/{stem}".as_ref()]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("0 succeeded, 0 failed, 2 skipped"));
+}
+
+#[test]
+fn cli_original_rejects_image_options() {
+    let output = run(&["-f".as_ref(), "original".as_ref(), "-r".as_ref(), "100".as_ref(), "/tmp/fake.arw".as_ref()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--resize"), "{stderr}");
+    assert!(!output.status.success());
+}
+
+#[test]
+fn cli_original_without_output_dir_refuses_to_copy_onto_itself() {
+    let tmp = TempDir::new().unwrap();
+    let raw = tmp.path().join("DSC1.ARW");
+    fs::write(&raw, b"raw").unwrap();
+    let output = run(&[raw.as_ref(), "-f".as_ref(), "original".as_ref(), "--overwrite".as_ref()]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("same file"));
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&raw).unwrap(), b"raw");
+}

@@ -22,6 +22,9 @@ pub enum OutputFormat {
     #[value(alias = "tif")]
     Tiff,
     Png,
+    /// Copy the RAW file itself, unchanged. With --name, this files a card
+    /// into a dated folder layout
+    Original,
 }
 
 #[derive(Parser)]
@@ -261,6 +264,32 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if matches!(cli.format, OutputFormat::Original) {
+        let image_options = [
+            ("--resize", cli.resize.is_some()),
+            ("--fast", cli.fast),
+            ("--preview", cli.preview),
+            ("--exposure", cli.exposure.is_some()),
+            ("--wb", cli.wb.is_some()),
+            ("--sharpen", cli.sharpen.is_some()),
+            ("--strip-gps", cli.strip_gps),
+            ("--strip-metadata", cli.strip_metadata),
+            ("--artist", cli.artist.is_some()),
+            ("--copyright", cli.copyright.is_some()),
+        ];
+        let used: Vec<&str> = image_options
+            .iter()
+            .filter(|(_, set)| *set)
+            .map(|(name, _)| *name)
+            .collect();
+        if !used.is_empty() {
+            bail!(
+                "-f original copies files unchanged, so {} cannot be used with it.",
+                used.join(", ")
+            );
+        }
+    }
+
     if let Some(dir) = cli.output.as_deref().filter(|d| d.exists() && !d.is_dir()) {
         bail!("Output path {} exists and is not a directory.", dir.display());
     }
@@ -369,7 +398,13 @@ fn main() -> Result<()> {
                 .max()
                 .unwrap_or(0);
             let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-            default_workers(largest_input, cli.fast || cli.preview, total_memory(), cores)
+            if matches!(cli.format, OutputFormat::Original) {
+                // Copies need little memory; more of them only compete for
+                // the same disk.
+                cores.min(4)
+            } else {
+                default_workers(largest_input, cli.fast || cli.preview, total_memory(), cores)
+            }
         }
     };
 
@@ -762,7 +797,7 @@ fn plan_outputs(
             Some(named) => {
                 let mut name = named[i].clone().into_os_string();
                 name.push(".");
-                name.push(extension(format));
+                name.push(output_extension(&f.path, format));
                 match output_dir {
                     Some(dir) => dir.join(&name),
                     None => f.path.parent().unwrap_or(Path::new("")).join(&name),
@@ -796,11 +831,16 @@ fn plan_outputs(
     Ok(jobs)
 }
 
-fn extension(format: OutputFormat) -> &'static str {
+fn output_extension(input: &Path, format: OutputFormat) -> String {
     match format {
-        OutputFormat::Jpeg => "jpg",
-        OutputFormat::Tiff => "tiff",
-        OutputFormat::Png => "png",
+        OutputFormat::Jpeg => "jpg".to_string(),
+        OutputFormat::Tiff => "tiff".to_string(),
+        OutputFormat::Png => "png".to_string(),
+        OutputFormat::Original => input
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
     }
 }
 
@@ -820,7 +860,7 @@ fn is_raw(path: &Path) -> bool {
 /// Build the output path for a given input ARW file.
 fn make_output_path(input: &Path, output_dir: Option<&Path>, format: OutputFormat) -> PathBuf {
     let stem = input.file_stem().unwrap_or_default();
-    let ext = extension(format);
+    let ext = output_extension(input, format);
     let file_name = format!("{}.{}", stem.to_string_lossy(), ext);
 
     match output_dir {
@@ -1140,6 +1180,13 @@ mod tests {
         let input = Path::new("/photos/DSC00001.ARW");
         let result = make_output_path(input, None, OutputFormat::Tiff);
         assert_eq!(result, PathBuf::from("/photos/DSC00001.tiff"));
+    }
+
+    #[test]
+    fn make_output_path_original_keeps_the_input_extension() {
+        let input = Path::new("/card/DSC00001.ARW");
+        let result = make_output_path(input, Some(Path::new("/archive")), OutputFormat::Original);
+        assert_eq!(result, PathBuf::from("/archive/DSC00001.ARW"));
     }
 
     #[test]
