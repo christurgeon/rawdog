@@ -248,8 +248,28 @@ fn open_pipeline(input: &Path) -> Result<Pipeline> {
             input.display()
         ));
     }
-    Pipeline::new_from_source(ImageSource::Raw(raw))
-        .map_err(|e| anyhow!("Failed to create pipeline for {}: {}", input.display(), e))
+    let mut pipeline = Pipeline::new_from_source(ImageSource::Raw(raw))
+        .map_err(|e| anyhow!("Failed to create pipeline for {}: {}", input.display(), e))?;
+    let tolab = &mut pipeline.ops.tolab;
+    tolab.cam_to_xyz_normalized = cam_to_xyz_d65(tolab.xyz_to_cam);
+    Ok(pipeline)
+}
+
+/// Camera-to-XYZ matrix that maps camera white (1, 1, 1) to the D65 white
+/// point.
+///
+/// rawloader normalises the matrix so that camera white maps to XYZ
+/// (1, 1, 1). imagepipe then converts as if XYZ were relative to D65, where
+/// (1, 1, 1) is pink, so neutral greys came out with about 10% too much red.
+fn cam_to_xyz_d65(mut xyz_to_cam: [[f32; 3]; 4]) -> [[f32; 4]; 3] {
+    const D65_WHITE: [f32; 3] = [0.95047, 1.0, 1.08883];
+    for row in xyz_to_cam.iter_mut() {
+        let sum: f32 = row.iter().zip(D65_WHITE).map(|(v, w)| v * w).sum();
+        if sum != 0.0 {
+            row.iter_mut().for_each(|v| *v /= sum);
+        }
+    }
+    rawloader::RawImage::pseudoinverse(xyz_to_cam)
 }
 
 /// A reason to reject the decoded samples, if many of them are far above the
@@ -956,6 +976,22 @@ mod tests {
         assert!(implausible_samples(&raw_image(data.clone(), 4095)).is_none());
         data[..50].fill(65535);
         assert!(implausible_samples(&raw_image(data, 4095)).is_some());
+    }
+
+    #[test]
+    fn cam_to_xyz_d65_maps_camera_white_to_the_d65_white_point() {
+        // An sRGB-like camera: XYZ to linear sRGB, padded to four rows.
+        let m = [
+            [3.2406, -1.5372, -0.4986],
+            [-0.9689, 1.8758, 0.0415],
+            [0.0557, -0.2040, 1.0570],
+            [0.0, 0.0, 0.0],
+        ];
+        let cam_to_xyz = cam_to_xyz_d65(m);
+        for (i, expected) in [0.95047f32, 1.0, 1.08883].iter().enumerate() {
+            let xyz: f32 = cam_to_xyz[i][..3].iter().sum();
+            assert!((xyz - expected).abs() < 1e-3, "row {i}: {xyz}");
+        }
     }
 
     // -----------------------------------------------------------------------
