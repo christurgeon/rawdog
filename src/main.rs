@@ -41,9 +41,30 @@ struct Cli {
 
     /// Name template for output files, relative to the output directory
     /// and without extension. Fields: {stem} {date} {year} {month} {day}
-    /// {time} {model}. Example: "{date}/{model}_{stem}"
+    /// {time} {model} {rating}. Example: "{date}/{model}_{stem}"
     #[arg(long, value_name = "TEMPLATE")]
     name: Option<naming::NameTemplate>,
+
+    /// Convert only files rated at least this many stars (1 to 5). Ratings
+    /// come from sidecar XMP files (Lightroom, Capture One, darktable) or
+    /// from the camera
+    #[arg(long, value_name = "STARS", value_parser = clap::value_parser!(i8).range(1..=5))]
+    min_rating: Option<i8>,
+
+    /// Convert only files taken on or after this date (YYYY-MM-DD, camera
+    /// clock)
+    #[arg(long, value_name = "DATE", value_parser = parse_date)]
+    since: Option<(u16, u8, u8)>,
+
+    /// Convert only files taken on or before this date (YYYY-MM-DD, camera
+    /// clock)
+    #[arg(long, value_name = "DATE", value_parser = parse_date)]
+    until: Option<(u16, u8, u8)>,
+
+    /// Convert only files from cameras whose model contains this text
+    /// (not case-sensitive), for example "7M4" or "Z 6"
+    #[arg(long, value_name = "MODEL")]
+    camera: Option<String>,
 
     /// Output format
     #[arg(short, long, value_enum, default_value_t = OutputFormat::Jpeg)]
@@ -140,6 +161,76 @@ fn float_in_range<const MIN: i32, const MAX: i32>(s: &str) -> Result<f32, String
     }
 }
 
+fn parse_date(s: &str) -> Result<(u16, u8, u8), String> {
+    let err = || "must be a date as YYYY-MM-DD".to_string();
+    let mut parts = s.split('-');
+    let (Some(y), Some(m), Some(d), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(err());
+    };
+    let (y, m, d) = (
+        y.parse::<u16>().map_err(|_| err())?,
+        m.parse::<u8>().map_err(|_| err())?,
+        d.parse::<u8>().map_err(|_| err())?,
+    );
+    if y < 1900 || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return Err(err());
+    }
+    Ok((y, m, d))
+}
+
+/// The selection options of a run.
+struct Selection {
+    min_rating: Option<i8>,
+    since: Option<(u16, u8, u8)>,
+    until: Option<(u16, u8, u8)>,
+    camera: Option<String>,
+}
+
+impl Selection {
+    fn is_active(&self) -> bool {
+        self.min_rating.is_some()
+            || self.since.is_some()
+            || self.until.is_some()
+            || self.camera.is_some()
+    }
+
+    /// Why a file is excluded, if it is. A file without the metadata that a
+    /// filter needs is excluded.
+    fn exclusion(&self, info: &naming::NameInfo) -> Option<String> {
+        if let Some(min) = self.min_rating {
+            match info.rating {
+                Some(r) if r >= min => {}
+                Some(r) => return Some(format!("rating {r}")),
+                None => return Some("no rating".to_string()),
+            }
+        }
+        let date = info.taken.map(|(y, m, d, ..)| (y, m, d));
+        if self.since.is_some() || self.until.is_some() {
+            let Some(date) = date else {
+                return Some("no capture date".to_string());
+            };
+            let shown = format!("taken {:04}-{:02}-{:02}", date.0, date.1, date.2);
+            if self.since.is_some_and(|since| date < since)
+                || self.until.is_some_and(|until| date > until)
+            {
+                return Some(shown);
+            }
+        }
+        if let Some(wanted) = &self.camera {
+            let model = info.model.as_deref().unwrap_or_default();
+            if !model.to_lowercase().contains(&wanted.to_lowercase()) {
+                return Some(if model.is_empty() {
+                    "no camera model".to_string()
+                } else {
+                    format!("camera {model}")
+                });
+            }
+        }
+        None
+    }
+}
+
 fn tint_value(s: &str) -> Result<f32, String> {
     match s.parse::<f32>() {
         Ok(v) if (0.5..=2.0).contains(&v) => Ok(v),
@@ -173,6 +264,40 @@ fn main() -> Result<()> {
         }
         bail!("No RAW files found in the provided inputs.");
     }
+
+    let selection = Selection {
+        min_rating: cli.min_rating,
+        since: cli.since,
+        until: cli.until,
+        camera: cli.camera.clone(),
+    };
+    let files = if selection.is_active() {
+        let excluded: Vec<Option<String>> = files
+            .par_iter()
+            .map(|f| selection.exclusion(&naming::NameInfo::read(&f.path, true)))
+            .collect();
+        let (kept, dropped): (Vec<_>, Vec<_>) =
+            files.into_iter().zip(excluded).partition(|(_, reason)| reason.is_none());
+        if cli.dry_run {
+            for (f, reason) in &dropped {
+                println!("exclude {} ({})", f.path.display(), reason.as_deref().unwrap_or(""));
+            }
+        } else if !cli.quiet && !dropped.is_empty() {
+            println!("{} file(s) excluded by the selection options", dropped.len());
+        }
+        if kept.is_empty() {
+            if !cli.quiet {
+                println!("No RAW files match the selection options.");
+            }
+            if missing_inputs {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        kept.into_iter().map(|(f, _)| f).collect()
+    } else {
+        files
+    };
 
     let jobs = plan_outputs(
         &files,
@@ -836,6 +961,78 @@ mod tests {
         let explicit_first =
             collect_raw_files(&[sub.join("x.arw"), tmp.path().to_path_buf()], true).unwrap();
         assert_eq!(explicit_first[0].rel_dir, PathBuf::new());
+    }
+
+    // -----------------------------------------------------------------------
+    // Selection tests
+    // -----------------------------------------------------------------------
+
+    fn info(rating: Option<i8>, date: Option<(u16, u8, u8)>, model: Option<&str>) -> naming::NameInfo {
+        naming::NameInfo {
+            stem: "x".to_string(),
+            taken: date.map(|(y, m, d)| (y, m, d, 12, 0, 0)),
+            model: model.map(str::to_string),
+            rating,
+        }
+    }
+
+    fn selection() -> Selection {
+        Selection {
+            min_rating: None,
+            since: None,
+            until: None,
+            camera: None,
+        }
+    }
+
+    #[test]
+    fn selection_by_rating() {
+        let sel = Selection {
+            min_rating: Some(3),
+            ..selection()
+        };
+        assert!(sel.exclusion(&info(Some(3), None, None)).is_none());
+        assert!(sel.exclusion(&info(Some(5), None, None)).is_none());
+        assert_eq!(sel.exclusion(&info(Some(2), None, None)).unwrap(), "rating 2");
+        assert_eq!(sel.exclusion(&info(Some(-1), None, None)).unwrap(), "rating -1");
+        assert_eq!(sel.exclusion(&info(None, None, None)).unwrap(), "no rating");
+    }
+
+    #[test]
+    fn selection_by_date_is_inclusive() {
+        let sel = Selection {
+            since: Some((2026, 11, 14)),
+            until: Some((2026, 11, 15)),
+            ..selection()
+        };
+        assert!(sel.exclusion(&info(None, Some((2026, 11, 14)), None)).is_none());
+        assert!(sel.exclusion(&info(None, Some((2026, 11, 15)), None)).is_none());
+        assert!(sel.exclusion(&info(None, Some((2026, 11, 13)), None)).is_some());
+        assert!(sel.exclusion(&info(None, Some((2026, 12, 1)), None)).is_some());
+        assert_eq!(sel.exclusion(&info(None, None, None)).unwrap(), "no capture date");
+    }
+
+    #[test]
+    fn selection_by_camera_ignores_case() {
+        let sel = Selection {
+            camera: Some("7m4".to_string()),
+            ..selection()
+        };
+        assert!(sel.exclusion(&info(None, None, Some("ILCE-7M4"))).is_none());
+        assert_eq!(
+            sel.exclusion(&info(None, None, Some("ILCE-7M3"))).unwrap(),
+            "camera ILCE-7M3"
+        );
+        assert!(!selection().is_active());
+        assert!(sel.is_active());
+    }
+
+    #[test]
+    fn parse_date_accepts_only_valid_dates() {
+        assert_eq!(parse_date("2026-11-05"), Ok((2026, 11, 5)));
+        for bad in ["2026-13-01", "2026-11", "11/05/2026", "2026-11-05-1", "1800-01-01"] {
+            assert!(parse_date(bad).is_err(), "{bad}");
+        }
     }
 
     // -----------------------------------------------------------------------
