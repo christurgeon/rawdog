@@ -155,6 +155,12 @@ Set how many files are converted at the same time. By default rawdog chooses thi
 rawdog ./photos/ -j 2
 ```
 
+Keep a record of a large run. The report lists each file with its output, its status (converted, skipped, failed, or excluded), the error message, and the time taken; it is JSON if the name ends in `.json`, otherwise CSV:
+
+```sh
+rawdog -R /Volumes/CARD -o ./jpegs --report run.csv
+```
+
 Print errors only, for use in scripts:
 
 ```sh
