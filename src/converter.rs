@@ -211,20 +211,22 @@ fn load_preview(input: &Path) -> Result<RgbImage> {
 /// Decode `input` and build the processing pipeline for it.
 ///
 /// Decoders are tried in this order:
-/// 1. rawloader, which imagepipe is built on. Its camera list ends in 2018.
-/// 2. rawler, which knows newer cameras and Canon CR3.
+/// 1. rawler. It knows cameras up to now, Canon CR3, and the sensor crop of
+///    many older cameras that rawloader outputs with masked border pixels.
+/// 2. rawloader, which imagepipe is built on. Its camera list ends in 2018,
+///    but it reads a few files that rawler does not.
 /// 3. imagepipe's raster loader, for JPEG, PNG, and TIFF input.
 ///
 /// The RAW decoders come first because most RAW files are TIFF containers,
 /// and a raster loader could open one and return only its preview.
 fn open_pipeline(input: &Path) -> Result<Pipeline> {
-    let raw = match rawloader::decode_file(input) {
+    let raw = match decode_with_rawler(input) {
         Ok(raw) => raw,
-        Err(old_decoder) => match decode_with_rawler(input) {
+        Err(new_decoder) => match rawloader::decode_file(input) {
             Ok(raw) => raw,
             // imagepipe opens raster files itself, with its own version of
             // the `image` crate.
-            Err(new_decoder) => {
+            Err(old_decoder) => {
                 return Pipeline::new_from_file(input).map_err(|_| {
                     // Both decoders give long messages; one line is enough.
                     let detail = |e: &str| e.lines().next().unwrap_or_default().to_string();
@@ -232,15 +234,44 @@ fn open_pipeline(input: &Path) -> Result<Pipeline> {
                         "Cannot decode {}: the file is corrupt or its format is not supported \
                          ({}; {})",
                         input.display(),
-                        detail(&old_decoder.to_string()),
-                        detail(&new_decoder)
+                        detail(&new_decoder),
+                        detail(&old_decoder.to_string())
                     )
                 })
             }
         },
     };
+    if let Some(problem) = implausible_samples(&raw) {
+        return Err(anyhow!(
+            "Cannot decode {}: the decoder returned invalid data ({problem}); \
+             this format variant is not supported",
+            input.display()
+        ));
+    }
     Pipeline::new_from_source(ImageSource::Raw(raw))
         .map_err(|e| anyhow!("Failed to create pipeline for {}: {}", input.display(), e))
+}
+
+/// A reason to reject the decoded samples, if many of them are far above the
+/// white level. That happens when a decoder misreads a compression variant,
+/// and the result is an image of noise.
+fn implausible_samples(raw: &rawloader::RawImage) -> Option<String> {
+    let rawloader::RawImageData::Integer(data) = &raw.data else {
+        return None;
+    };
+    let white = *raw.whitelevels.iter().max()? as u32;
+    if data.is_empty() || white == 0 {
+        return None;
+    }
+    let limit = white.saturating_mul(2);
+    let over = data.iter().filter(|&&v| v as u32 > limit).count();
+    // A few hot pixels are normal; one sample in a hundred is not.
+    (over * 100 > data.len()).then(|| {
+        format!(
+            "{:.0}% of the samples are above twice the white level {white}",
+            over as f64 * 100.0 / data.len() as f64
+        )
+    })
 }
 
 /// Decode with rawler and convert the result to the type that imagepipe
@@ -248,10 +279,23 @@ fn open_pipeline(input: &Path) -> Result<Pipeline> {
 fn decode_with_rawler(input: &Path) -> Result<rawloader::RawImage, String> {
     use rawler::rawimage::{RawImageData, RawPhotometricInterpretation};
 
-    // rawler can panic on files that are not RAW files.
-    let img = std::panic::catch_unwind(|| rawler::decode_file(input))
-        .map_err(|_| "decoder panicked".to_string())?
-        .map_err(|e| e.to_string())?;
+    // rawler can panic on files that are not RAW files. It sets
+    // `RawImage::orientation` only for DNG; for the other formats the
+    // orientation comes from the metadata.
+    let (img, exif_orientation) = std::panic::catch_unwind(|| {
+        let source = rawler::rawsource::RawSource::new(input).map_err(|e| e.to_string())?;
+        let decoder = rawler::get_decoder(&source).map_err(|e| e.to_string())?;
+        let params = rawler::decoders::RawDecodeParams::default();
+        let img = decoder
+            .raw_image(&source, &params, false)
+            .map_err(|e| e.to_string())?;
+        let orientation = decoder
+            .raw_metadata(&source, &params)
+            .ok()
+            .and_then(|m| m.exif.orientation);
+        Ok::<_, String>((img, orientation))
+    })
+    .map_err(|_| "decoder panicked".to_string())??;
 
     let cfa = match &img.photometric {
         RawPhotometricInterpretation::Cfa(config) => rawloader::CFA::new(&config.cfa.name),
@@ -284,19 +328,38 @@ fn decode_with_rawler(input: &Path) -> Result<rawloader::RawImage, String> {
     // rawler leaves `xyz_to_cam` empty and gives matrices per illuminant.
     let mut xyz_to_cam = img.xyz_to_cam;
     if xyz_to_cam.iter().flatten().all(|v| *v == 0.0) {
-        let matrix = img
-            .color_matrix
-            .get(&rawler::imgop::xyz::Illuminant::D65)
-            .or_else(|| img.color_matrix.values().next())
-            .ok_or("no colour matrix for this camera")?;
-        for (i, v) in matrix.iter().take(12).enumerate() {
-            xyz_to_cam[i / 3][i % 3] = *v;
+        use rawler::imgop::xyz::Illuminant;
+        // Daylight illuminants first, D65 best. The matrices are in a hash
+        // map, so the fallback must not depend on its iteration order.
+        let matrix = [Illuminant::D65, Illuminant::D75, Illuminant::D55, Illuminant::D50]
+            .iter()
+            .find_map(|i| img.color_matrix.get(i))
+            .or_else(|| {
+                img.color_matrix
+                    .iter()
+                    .min_by_key(|(illuminant, _)| **illuminant)
+                    .map(|(_, m)| m)
+            });
+        let monochrome = img.cpp == 1 && !cfa.is_valid();
+        match matrix {
+            Some(matrix) => {
+                for (i, v) in matrix.iter().take(12).enumerate() {
+                    xyz_to_cam[i / 3][i % 3] = *v;
+                }
+            }
+            // imagepipe does not use the matrix of a monochrome image.
+            None if monochrome => {}
+            None => return Err("no colour matrix for this camera".to_string()),
         }
     }
 
     use rawler::Orientation as New;
     use rawloader::Orientation as Old;
-    let orientation = match img.orientation {
+    let source_orientation = match (img.orientation, exif_orientation) {
+        (New::Normal | New::Unknown, Some(tag)) => New::from_u16(tag),
+        (orientation, _) => orientation,
+    };
+    let orientation = match source_orientation {
         New::Normal => Old::Normal,
         New::HorizontalFlip => Old::HorizontalFlip,
         New::Rotate180 => Old::Rotate180,
@@ -857,6 +920,42 @@ mod tests {
         assert_eq!(trim_fast_edge(make_16bit_image(102, 52), None, true).dimensions(), (102, 52));
         // Below the smallest size that uses decoder scaling.
         assert_eq!(trim_fast_edge(make_8bit_image(10, 6), Some(8), true).dimensions(), (10, 6));
+    }
+
+    // -----------------------------------------------------------------------
+    // decoder result checks
+    // -----------------------------------------------------------------------
+
+    fn raw_image(data: Vec<u16>, white: u16) -> rawloader::RawImage {
+        rawloader::RawImage {
+            make: String::new(),
+            model: String::new(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: data.len(),
+            height: 1,
+            cpp: 1,
+            wb_coeffs: [2.0, 1.0, 1.5, f32::NAN],
+            whitelevels: [white; 4],
+            blacklevels: [0; 4],
+            xyz_to_cam: [[0.0; 3]; 4],
+            cfa: rawloader::CFA::new("RGGB"),
+            crops: [1, 1, 1, 1],
+            blackareas: Vec::new(),
+            orientation: rawloader::Orientation::Normal,
+            data: rawloader::RawImageData::Integer(data),
+        }
+    }
+
+    #[test]
+    fn implausible_samples_rejects_data_far_above_the_white_level() {
+        let mut data = vec![1000u16; 1000];
+        assert!(implausible_samples(&raw_image(data.clone(), 4095)).is_none());
+        // Hot pixels: 0.5% above the limit is accepted.
+        data[..5].fill(65535);
+        assert!(implausible_samples(&raw_image(data.clone(), 4095)).is_none());
+        data[..50].fill(65535);
+        assert!(implausible_samples(&raw_image(data, 4095)).is_some());
     }
 
     // -----------------------------------------------------------------------

@@ -253,6 +253,29 @@ fn describes_source_layout(tag: exif::Tag) -> bool {
     }
 }
 
+/// Largest field that is copied. Some cameras store megabytes of private data
+/// in one tag (Panasonic S9: 5.7 MB), which would not fit in a JPEG.
+const MAX_FIELD_BYTES: usize = 16 * 1024;
+
+/// Approximate size in bytes of a field value.
+fn value_size(value: &exif::Value) -> usize {
+    use exif::Value;
+    match value {
+        Value::Byte(v) | Value::Undefined(v, _) => v.len(),
+        Value::SByte(v) => v.len(),
+        Value::Ascii(v) => v.iter().map(|s| s.len() + 1).sum(),
+        Value::Short(v) => v.len() * 2,
+        Value::SShort(v) => v.len() * 2,
+        Value::Long(v) => v.len() * 4,
+        Value::SLong(v) => v.len() * 4,
+        Value::Float(v) => v.len() * 4,
+        Value::Rational(v) => v.len() * 8,
+        Value::SRational(v) => v.len() * 8,
+        Value::Double(v) => v.len() * 8,
+        Value::Unknown(_, count, _) => *count as usize,
+    }
+}
+
 /// Prepare source EXIF fields for the converted image.
 ///
 /// - Only the primary image's fields are kept. The source thumbnail is not
@@ -287,6 +310,7 @@ fn fields_for_output<'a>(
     fields
         .filter(|_| !meta.strip_all)
         .filter(|f| f.ifd_num == exif::In::PRIMARY && !describes_source_layout(f.tag))
+        .filter(|f| value_size(&f.value) <= MAX_FIELD_BYTES)
         .filter(|f| !(meta.strip_gps && f.tag.context() == Context::Gps))
         .filter(|f| !replaced(f.tag))
         .map(|field| {
@@ -758,6 +782,22 @@ mod tests {
             tags(&out),
             vec![Tag::ImageDescription, Tag::Model, Tag::ISOSpeed]
         );
+    }
+
+    #[test]
+    fn fields_for_output_drops_only_oversized_fields() {
+        use exif::{Context, In, Tag, Value};
+        let source = [
+            description_field(),
+            field(
+                Tag(Context::Tiff, 0x127),
+                In::PRIMARY,
+                Value::Undefined(vec![0; MAX_FIELD_BYTES + 1], 0),
+            ),
+            field(Tag::Model, In::PRIMARY, Value::Ascii(vec![b"Cam".to_vec()])),
+        ];
+        let out = fields_for_output(source.iter(), (300, 200), &MetadataOptions::default());
+        assert_eq!(tags(&out), vec![Tag::ImageDescription, Tag::Model]);
     }
 
     #[test]
