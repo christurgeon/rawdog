@@ -40,6 +40,10 @@ pub struct ConvertOptions {
 
 /// Convert a single ARW file to the specified output format.
 pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<()> {
+    if matches!(opts.format, OutputFormat::Original) {
+        return copy_original(input, output);
+    }
+
     let ConvertOptions {
         format,
         resize,
@@ -104,6 +108,7 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
                     let img = source.rgb16(input, opts)?;
                     write_tiff(&img, input, &mut out, opts).with_context(unwritable)?;
                 }
+                OutputFormat::Original => unreachable!("handled by copy_original"),
                 OutputFormat::Png => {
                     let img = source.rgb16(input, opts)?;
                     write_png(&img, input, &mut out, opts).with_context(unwritable)?;
@@ -431,6 +436,68 @@ fn exposure_curve(ev: f32, base: &SplineFunc) -> Vec<(f32, f32)> {
             (l, base.interpolate(y_to_l(y)).clamp(0.0, 1.0))
         })
         .collect()
+}
+
+/// Copy `input` to `output` unchanged, with its modification time.
+///
+/// The copy goes to a temporary file, is compared byte for byte with the
+/// source, and only then gets its final name. The source is never changed.
+fn copy_original(input: &Path, output: &Path) -> Result<()> {
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create output directory {}", parent.display()))?;
+    }
+    let tmp = temp_path_for(output);
+    let _guard = TempFileGuard::register(&tmp);
+    let unwritable = || format!("Failed to write output file {}", output.display());
+
+    let result = (|| -> Result<()> {
+        std::fs::copy(input, &tmp).with_context(unwritable)?;
+        let copy = std::fs::File::options()
+            .write(true)
+            .open(&tmp)
+            .with_context(unwritable)?;
+        copy.sync_all().with_context(unwritable)?;
+        if let Ok(modified) = std::fs::metadata(input).and_then(|m| m.modified()) {
+            copy.set_modified(modified).with_context(unwritable)?;
+        }
+        drop(copy);
+        if !same_contents(input, &tmp)? {
+            return Err(anyhow!(
+                "The copy of {} differs from the original; the disk may be failing",
+                input.display()
+            ));
+        }
+        std::fs::rename(&tmp, output).with_context(unwritable)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// True if the two files have the same bytes.
+fn same_contents(a: &Path, b: &Path) -> Result<bool> {
+    use std::io::Read;
+    let open = |p: &Path| {
+        std::fs::File::open(p).with_context(|| format!("Failed to read {}", p.display()))
+    };
+    let (mut fa, mut fb) = (open(a)?, open(b)?);
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
 }
 
 /// Temporary files that are being written, so that an interrupt can remove
@@ -991,6 +1058,38 @@ mod tests {
 
         assert!(!in_use.exists());
         assert!(finished.exists());
+    }
+
+    #[test]
+    fn copy_original_copies_bytes_and_modification_time() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let input = tmp.path().join("DSC1.ARW");
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&input, &data).unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options().write(true).open(&input).unwrap().set_modified(old).unwrap();
+
+        let output = tmp.path().join("2023/11/DSC1.ARW");
+        copy_original(&input, &output).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), data);
+        assert_eq!(std::fs::metadata(&output).unwrap().modified().unwrap(), old);
+        assert_eq!(std::fs::read(&input).unwrap(), data, "source changed");
+        assert!(!temp_path_for(&output).exists());
+    }
+
+    #[test]
+    fn same_contents_detects_a_difference() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (a, b, c) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("c"));
+        std::fs::write(&a, vec![7u8; 2_500_000]).unwrap();
+        std::fs::write(&b, vec![7u8; 2_500_000]).unwrap();
+        let mut changed = vec![7u8; 2_500_000];
+        changed[2_400_000] = 8;
+        std::fs::write(&c, changed).unwrap();
+        assert!(same_contents(&a, &b).unwrap());
+        assert!(!same_contents(&a, &c).unwrap());
+        std::fs::write(&c, vec![7u8; 10]).unwrap();
+        assert!(!same_contents(&a, &c).unwrap());
     }
 
     // -----------------------------------------------------------------------

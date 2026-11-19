@@ -91,6 +91,12 @@ Template fields: `{stem}` (input file name without extension), `{date}` (2024-03
 
 The template path is below the `-o` directory. Without `-o` it is below the directory of each input file. With a template, `-R` does not mirror the input tree, so include `{date}` or another field that keeps equal file names apart.
 
+Import a card: copy the RAW files themselves into dated folders. Each copy is compared byte for byte with the original and keeps its modification time; the card is never changed. Image options such as `-r` cannot be used with `-f original`:
+
+```sh
+rawdog -R /Volumes/CARD -f original -o ~/Archive --name "{year}/{date}/{stem}"
+```
+
 Convert only your picks. Ratings come from sidecar XMP files written by Lightroom, Capture One, or darktable, or from the rating set in the camera:
 
 ```sh
