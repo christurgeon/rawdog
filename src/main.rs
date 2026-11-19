@@ -264,6 +264,13 @@ fn main() -> Result<()> {
     // print a backtrace message for each one.
     std::panic::set_hook(Box::new(|_| {}));
 
+    // On Ctrl-C, remove the partial outputs before exiting. 130 is the
+    // usual exit status after SIGINT.
+    let _ = ctrlc::set_handler(|| {
+        converter::remove_active_temp_files();
+        std::process::exit(130);
+    });
+
     let convert_one = |(input_path, output_path): &(PathBuf, PathBuf)| {
         if let Some(reason) = refusal(input_path, output_path, &dir_names) {
             pb.suspend(|| {
