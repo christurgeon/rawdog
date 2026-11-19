@@ -16,88 +16,76 @@ cargo install --path .
 
 ## Usage
 
-Convert a single file:
+Run `rawdog --help` for every option.
+
+### Basics
+
+Convert a file, or every RAW file in a directory, to JPEG next to the originals:
 
 ```sh
 rawdog photo.ARW
-```
-
-Convert all RAW files in a directory:
-
-```sh
 rawdog ./photos/
 ```
 
-Specify an output directory:
+Write to another directory. With `-R`, subdirectories are converted too, and their layout is mirrored under the output directory:
 
 ```sh
 rawdog ./photos/ -o ./jpegs/
-```
-
-Convert a directory tree recursively. With `-o`, the subdirectory layout under
-the input directory is mirrored under the output directory:
-
-```sh
 rawdog -R ./photos/ -o ./jpegs/   # photos/2024/a.ARW -> jpegs/2024/a.jpg
 ```
 
-Files given directly on the command line go straight into `-o`. If two inputs
-would write the same output file, rawdog reports the conflict and converts
-nothing.
+Files given directly on the command line go straight into `-o`. If two inputs would write the same output file, rawdog reports the conflict and converts nothing.
 
-Resize the long edge to 2048px:
+### Size, format, and quality
 
 ```sh
-rawdog photo.ARW -r 2048
+rawdog photo.ARW -r 2048          # long edge 2048 pixels
+rawdog photo.ARW -q 85            # JPEG quality 85 (default 92)
+rawdog photo.ARW -f tiff          # 16-bit TIFF
+rawdog ./photos/ -f png -r 2048   # 16-bit PNG, resized
 ```
 
-Set JPEG quality to 85:
+Resized images look soft; `--sharpen` adds output sharpening, with an optional amount from 0 to 3 (default 0.5):
 
 ```sh
-rawdog photo.ARW -q 85
+rawdog ./trip -r 2048 --sharpen
 ```
 
-Output as 16-bit TIFF:
+Every output carries an sRGB colour profile, so colours are the same in every viewer.
+
+### Developing
+
+RAW files are developed with a tone curve that gives brightness and contrast close to the camera's own JPEG. Use `--look flat` for the darker, flatter result of earlier versions, which leaves more room for editing afterwards.
+
+Brighten a dark batch by two thirds of a stop and set the white balance to 3400 K:
 
 ```sh
-rawdog photo.ARW -f tiff
+rawdog ./reception --exposure 0.67 --wb 3400
 ```
 
-Output as 16-bit PNG with resize:
+`--exposure` rolls off highlights instead of clipping them. `--wb` replaces the as-shot white balance of every file; add `--tint` to correct a green or magenta cast (above 1 is more magenta).
+
+### Culling and proofs
+
+`--preview` writes the JPEG preview that the camera embedded in each RAW file, with the camera's own colours. It is the fastest way to look through a card. The size depends on the camera: 1616x1080 for Sony bodies, full resolution for many Canon and Nikon bodies.
 
 ```sh
-rawdog ./photos/ -f png -r 2048
+rawdog -R /Volumes/CARD --preview -o ./proofs
 ```
 
-Combine options:
-
-```sh
-rawdog ./photos/ -o ./jpegs/ -q 95 -r 3000 --overwrite
-```
-
-Make small proofs quickly. `--fast` scales during RAW decoding, which is several times faster and slightly softer:
+`--fast` develops the RAW data but scales during decoding: several times faster than the default, and slightly softer. It needs `-r`:
 
 ```sh
 rawdog ./card -r 2048 --fast -o ./proofs
 ```
 
-Import a card into folders by capture date, with the camera model in each file name:
+`--gallery` writes `gallery.html` into the output directory: a page of the output images with file name, capture time, camera, and rating. It works offline and on a phone:
 
 ```sh
-rawdog -R /Volumes/CARD -o ~/Pictures --name "{date}/{model}_{stem}"
+rawdog ./wedding -r 1600 --fast -o ./proofs --gallery
 ```
 
-Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), `{model}`, and `{rating}`. A file without that metadata gets `unknown`.
-
-The template path is below the `-o` directory. Without `-o` it is below the directory of each input file. With a template, `-R` does not mirror the input tree, so include `{date}` or another field that keeps equal file names apart.
-
-RAW files are developed with a tone curve that gives brightness and contrast close to the camera's own JPEG. Use `--look flat` for the darker, flatter result of earlier versions, which leaves more room for editing afterwards.
-
-Import a card: copy the RAW files themselves into dated folders. Each copy is compared byte for byte with the original and keeps its modification time; the card is never changed. XMP sidecars (`NAME.xmp` from Lightroom or Capture One, `NAME.ARW.xmp` from darktable) are copied with their RAW file, and a sidecar that already exists in the archive is kept. Image options such as `-r` cannot be used with `-f original`:
-
-```sh
-rawdog -R /Volumes/CARD -f original -o ~/Archive --name "{year}/{date}/{stem}"
-```
+### Selecting files
 
 Convert only your picks. Ratings come from sidecar XMP files written by Lightroom, Capture One, or darktable, or from the rating set in the camera:
 
@@ -111,75 +99,51 @@ Convert one day of a multi-day card, from one of two bodies:
 rawdog -R /Volumes/CARD --since 2026-11-14 --until 2026-11-14 --camera 7M4 -o ./day2
 ```
 
-Dates are the camera clock's local date. A file without the metadata that a filter needs is excluded; `--dry-run` lists each excluded file with the reason. `{rating}` in a `--name` template gives the star rating (0 for unrated).
+Dates are the camera clock's local date. A file without the metadata that a filter needs is excluded; `--dry-run` lists each excluded file with the reason.
 
-Brighten a dark batch by two thirds of a stop and set the white balance to 3400 K:
+### Naming and importing
 
-```sh
-rawdog ./reception --exposure 0.67 --wb 3400
-```
-
-`--exposure` rolls off highlights instead of clipping them. `--wb` replaces the as-shot white balance of every file; add `--tint` to correct a green or magenta cast.
-
-Resized images look soft. Add output sharpening:
+`--name` sets the output path from a template. Import a card into folders by capture date, with the camera model in each file name:
 
 ```sh
-rawdog ./trip -r 2048 --sharpen
+rawdog -R /Volumes/CARD -o ~/Pictures --name "{date}/{model}_{stem}"
 ```
 
-`--sharpen` takes an optional amount from 0 to 3; the default is 0.5.
+Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), `{model}`, and `{rating}` (0 for unrated). A file without that metadata gets `unknown`.
 
-Export for the web without location data, with your name and copyright:
+The template path is below the `-o` directory. Without `-o` it is below the directory of each input file. With a template, `-R` does not mirror the input tree, so include `{date}` or another field that keeps equal file names apart.
+
+`-f original` copies the RAW files themselves instead of converting them, for example into an archive by date:
+
+```sh
+rawdog -R /Volumes/CARD -f original -o ~/Archive --name "{year}/{date}/{stem}"
+```
+
+Each copy is compared byte for byte with the original and keeps its modification time; the card is never changed. XMP sidecars (`NAME.xmp` from Lightroom or Capture One, `NAME.ARW.xmp` from darktable) are copied with their RAW file, and a sidecar that already exists in the archive is kept. Image options such as `-r` cannot be used with `-f original`.
+
+### Metadata
+
+Camera, lens, exposure, and date metadata are copied to JPEG, PNG, and TIFF output. For the web, remove the location and add your name:
 
 ```sh
 rawdog ./trip -r 2048 --strip-gps --artist "J. Doe" --copyright "(c) 2026 J. Doe"
 ```
 
-Camera, lens, exposure, and date metadata are copied to JPEG, PNG, and TIFF output. Use `--strip-metadata` to copy none of it.
+`--strip-metadata` copies no metadata at all.
 
-Cull a card quickly. `--preview` writes the JPEG preview that the camera embedded in each RAW file, with the camera's own colours, and does not develop the RAW data:
-
-```sh
-rawdog -R /Volumes/CARD --preview -o ./proofs
-```
-
-The preview size depends on the camera: 1616x1080 for Sony bodies, full resolution for many Canon and Nikon bodies.
-
-Preview what a run will do, without writing files:
+### Large runs and scripts
 
 ```sh
-rawdog -R ./card -o ./jpegs --dry-run
-```
-
-Convert again only the files whose RAW is newer than the existing output:
-
-```sh
-rawdog ./photos/ --update
-```
-
-Set how many files are converted at the same time. By default rawdog chooses this from the installed RAM and the size of the largest input, because too many large files at once make the system swap:
-
-```sh
-rawdog ./photos/ -j 2
-```
-
-Make proofs for a client: `--gallery` writes `gallery.html` into the output directory, a page of the output images with file name, capture time, camera, and rating. It works offline and on a phone:
-
-```sh
-rawdog ./wedding -r 1600 --fast -o ./proofs --gallery
-```
-
-Keep a record of a large run. The report lists each file with its output, its status (converted, skipped, failed, or excluded), the error message, and the time taken; it is JSON if the name ends in `.json`, otherwise CSV:
-
-```sh
+rawdog -R ./card -o ./jpegs --dry-run        # show what would happen; write nothing
+rawdog ./photos/ --update                    # convert again only RAW files newer than their output
+rawdog ./photos/ -j 2                        # convert two files at a time
 rawdog -R /Volumes/CARD -o ./jpegs --report run.csv
+rawdog ./photos/ --quiet                     # print errors only
 ```
 
-Print errors only, for use in scripts:
+By default rawdog chooses how many files to convert at the same time from the installed RAM and the size of the largest input, because too many large files at once make the system swap.
 
-```sh
-rawdog ./photos/ --quiet
-```
+`--report` lists each file with its output, its status (converted, skipped, failed, or excluded), the error message, and the time taken. It is JSON if the name ends in `.json`, otherwise CSV.
 
 ## Existing Files
 
