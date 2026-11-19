@@ -240,6 +240,7 @@ fn main() -> Result<()> {
             strip_gps: cli.strip_gps,
             artist: cli.artist.clone(),
             copyright: cli.copyright.clone(),
+            srgb: !cli.preview,
         },
     };
 

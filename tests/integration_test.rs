@@ -694,3 +694,22 @@ fn cli_preview_fails_cleanly_for_a_file_without_a_preview() {
     assert!(!output.status.success());
     assert!(!tmp.path().join("in.jpg").exists());
 }
+
+#[test]
+fn cli_output_carries_an_srgb_icc_profile_in_every_format() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [1, 2, 3]);
+    let out = tmp.path().join("out");
+    for format in ["jpeg", "png", "tiff"] {
+        let output = run(&[input.as_ref(), "-o".as_ref(), out.as_ref(), "-f".as_ref(), format.as_ref()]);
+        assert!(output.status.success(), "{format}");
+    }
+    for name in ["in.jpg", "in.png", "in.tiff"] {
+        let bytes = fs::read(out.join(name)).unwrap();
+        // Every ICC profile carries the signature "acsp" in its header. PNG
+        // stores the profile compressed, in an iCCP chunk.
+        let marker: &[u8] = if name.ends_with(".png") { b"iCCP" } else { b"acsp" };
+        assert!(bytes.windows(4).any(|w| w == marker), "{name}: no ICC profile");
+    }
+}

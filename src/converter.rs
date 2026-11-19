@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use image::codecs::jpeg::JpegEncoder;
+use image::ImageEncoder;
 use image::codecs::png::PngEncoder;
 use image::codecs::tiff::TiffEncoder;
 use image::{ImageBuffer, Rgb, RgbImage};
@@ -511,7 +512,10 @@ fn write_jpeg(
     // Encode JPEG to an in-memory buffer so we can inject EXIF metadata
     // before writing to disk.
     let mut jpeg_buf = Vec::new();
-    let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, opts.quality);
+    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, opts.quality);
+    if opts.metadata.srgb {
+        encoder.set_icc_profile(exif_utils::srgb_icc_profile().to_vec())?;
+    }
     img.write_with_encoder(encoder)
         .context("Failed to encode JPEG")?;
 
@@ -549,9 +553,20 @@ fn write_tiff(
         .ok()
         .flatten();
     match fields {
-        Some((fields, _)) => {
-            exif_utils::write_tiff_16bit_with_exif(out, img.dimensions(), img.as_raw(), &fields)
-        }
+        Some((fields, _)) => exif_utils::write_tiff_16bit_with_exif(
+            out,
+            img.dimensions(),
+            img.as_raw(),
+            &fields,
+            opts.metadata.srgb,
+        ),
+        None if opts.metadata.srgb => exif_utils::write_tiff_16bit_with_exif(
+            out,
+            img.dimensions(),
+            img.as_raw(),
+            &[],
+            true,
+        ),
         None => img
             .write_with_encoder(TiffEncoder::new(out))
             .map_err(Into::into),
@@ -567,7 +582,11 @@ fn write_png(
 ) -> Result<()> {
     // Encode PNG to an in-memory buffer so we can inject EXIF metadata.
     let mut buf = Vec::new();
-    img.write_with_encoder(PngEncoder::new(&mut buf))
+    let mut encoder = PngEncoder::new(&mut buf);
+    if opts.metadata.srgb {
+        encoder.set_icc_profile(exif_utils::srgb_icc_profile().to_vec())?;
+    }
+    img.write_with_encoder(encoder)
         .context("Failed to encode PNG")?;
 
     // Inject EXIF metadata into the PNG if available.
