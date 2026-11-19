@@ -868,3 +868,19 @@ fn cli_gallery_needs_an_output_directory_and_a_web_format() {
     let output = run(&["--gallery".as_ref(), "-o".as_ref(), "/tmp/x".as_ref(), "-f".as_ref(), "tiff".as_ref(), "/tmp/fake.arw".as_ref()]);
     assert!(String::from_utf8_lossy(&output.stderr).contains("JPEG or PNG"));
 }
+
+#[test]
+fn cli_selection_rejects_contradictory_or_empty_options() {
+    let output = run(&[
+        "--since".as_ref(),
+        "2026-01-02".as_ref(),
+        "--until".as_ref(),
+        "2026-01-01".as_ref(),
+        "/tmp/fake.arw".as_ref(),
+    ]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--since"));
+    assert!(!output.status.success());
+
+    let output = run(&["--camera".as_ref(), "".as_ref(), "/tmp/fake.arw".as_ref()]);
+    assert_eq!(output.status.code(), Some(2));
+}
