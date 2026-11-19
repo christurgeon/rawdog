@@ -884,3 +884,58 @@ fn cli_selection_rejects_contradictory_or_empty_options() {
     let output = run(&["--camera".as_ref(), "".as_ref(), "/tmp/fake.arw".as_ref()]);
     assert_eq!(output.status.code(), Some(2));
 }
+
+#[test]
+fn cli_defaults_file_applies_and_can_be_overridden_or_skipped() {
+    let tmp = TempDir::new().unwrap();
+    let defaults = tmp.path().join("defaults");
+    fs::write(&defaults, "# test\n--artist Default Name\n--format png\n").unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [1, 2, 3]);
+    let out = tmp.path().join("out");
+    let rawdog = |extra: &[&str]| {
+        Command::new(rawdog_bin())
+            .env("RAWDOG_DEFAULTS", &defaults)
+            .arg(&input)
+            .arg("-o")
+            .arg(&out)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+
+    // The default format applies: PNG output.
+    assert!(rawdog(&[]).status.success());
+    assert!(out.join("in.png").is_file());
+
+    // The command line wins over the defaults file.
+    assert!(rawdog(&["--format", "jpeg"]).status.success());
+    let file = fs::File::open(out.join("in.jpg")).unwrap();
+    let exif = exif::Reader::new()
+        .read_from_container(&mut std::io::BufReader::new(file))
+        .unwrap();
+    let artist = exif.get_field(exif::Tag::Artist, exif::In::PRIMARY).unwrap();
+    assert_eq!(artist.display_value().to_string(), "\"Default Name\"");
+
+    // --no-defaults ignores the file: JPEG, no artist.
+    fs::remove_file(out.join("in.jpg")).unwrap();
+    assert!(rawdog(&["--no-defaults"]).status.success());
+    let file = fs::File::open(out.join("in.jpg")).unwrap();
+    let exif = exif::Reader::new().read_from_container(&mut std::io::BufReader::new(file));
+    assert!(exif.map_or(true, |e| e.get_field(exif::Tag::Artist, exif::In::PRIMARY).is_none()));
+}
+
+#[test]
+fn cli_reports_a_bad_line_in_the_defaults_file() {
+    let tmp = TempDir::new().unwrap();
+    let defaults = tmp.path().join("defaults");
+    fs::write(&defaults, "--quality 90\nphoto.ARW\n").unwrap();
+    let output = Command::new(rawdog_bin())
+        .env("RAWDOG_DEFAULTS", &defaults)
+        .arg("/tmp/fake.arw")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("line 2"), "{stderr}");
+    assert!(!output.status.success());
+}
