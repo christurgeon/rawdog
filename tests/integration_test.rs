@@ -834,3 +834,37 @@ fn cli_original_without_output_dir_refuses_to_copy_onto_itself() {
     assert!(!output.status.success());
     assert_eq!(fs::read(&raw).unwrap(), b"raw");
 }
+
+#[test]
+fn cli_gallery_lists_the_output_images() {
+    let tmp = TempDir::new().unwrap();
+    let card = tmp.path().join("card");
+    write_png(&card.join("one.png"), [1, 2, 3]);
+    write_png(&card.join("sub/two.png"), [4, 5, 6]);
+    let out = tmp.path().join("proofs");
+
+    // A directory scan picks up RAW files only, so the PNGs are given as
+    // files; the template puts them in subdirectories.
+    let output = run(&[
+        card.join("one.png").as_ref(),
+        card.join("sub/two.png").as_ref(),
+        "-o".as_ref(),
+        out.as_ref(),
+        "--name".as_ref(),
+        "day 1/{stem}".as_ref(),
+        "--gallery".as_ref(),
+    ]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let page = fs::read_to_string(out.join("gallery.html")).unwrap();
+    assert!(page.contains(r#"src="day%201/one.jpg""#), "{page}");
+    assert!(page.contains(r#"src="day%201/two.jpg""#), "{page}");
+    assert!(page.contains("2 images"));
+}
+
+#[test]
+fn cli_gallery_needs_an_output_directory_and_a_web_format() {
+    let output = run(&["--gallery".as_ref(), "/tmp/fake.arw".as_ref()]);
+    assert_eq!(output.status.code(), Some(2));
+    let output = run(&["--gallery".as_ref(), "-o".as_ref(), "/tmp/x".as_ref(), "-f".as_ref(), "tiff".as_ref(), "/tmp/fake.arw".as_ref()]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("JPEG or PNG"));
+}

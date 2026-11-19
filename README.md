@@ -161,6 +161,12 @@ Set how many files are converted at the same time. By default rawdog chooses thi
 rawdog ./photos/ -j 2
 ```
 
+Make proofs for a client: `--gallery` writes `gallery.html` into the output directory, a page of the output images with file name, capture time, camera, and rating. It works offline and on a phone:
+
+```sh
+rawdog ./wedding -r 1600 --fast -o ./proofs --gallery
+```
+
 Keep a record of a large run. The report lists each file with its output, its status (converted, skipped, failed, or excluded), the error message, and the time taken; it is JSON if the name ends in `.json`, otherwise CSV:
 
 ```sh
