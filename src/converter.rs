@@ -88,6 +88,7 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     // run never leaves a partial file that a later run would skip. The file
     // is created before decoding, so an unwritable directory fails quickly.
     let tmp = temp_path_for(output);
+    let _guard = TempFileGuard::register(&tmp);
     let unwritable = || format!("Failed to write output file {}", output.display());
     let result = std::fs::File::create(&tmp)
         .with_context(unwritable)
@@ -429,6 +430,41 @@ fn exposure_curve(ev: f32, base: &SplineFunc) -> Vec<(f32, f32)> {
             (l, base.interpolate(y_to_l(y)).clamp(0.0, 1.0))
         })
         .collect()
+}
+
+/// Temporary files that are being written, so that an interrupt can remove
+/// them. Without this, Ctrl-C leaves hidden `.NAME.rawdog-tmp` files.
+static ACTIVE_TEMP_FILES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Keeps a temporary file in `ACTIVE_TEMP_FILES` while it is in use.
+struct TempFileGuard(PathBuf);
+
+impl TempFileGuard {
+    fn register(path: &Path) -> TempFileGuard {
+        if let Ok(mut active) = ACTIVE_TEMP_FILES.lock() {
+            active.push(path.to_path_buf());
+        }
+        TempFileGuard(path.to_path_buf())
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = ACTIVE_TEMP_FILES.lock() {
+            active.retain(|p| p != &self.0);
+        }
+    }
+}
+
+/// Remove every temporary file that is being written. For use when the
+/// process is interrupted.
+pub fn remove_active_temp_files() {
+    // A conversion thread can hold the lock; do not wait for it.
+    if let Ok(active) = ACTIVE_TEMP_FILES.try_lock() {
+        for path in active.iter() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 fn temp_path_for(output: &Path) -> PathBuf {
@@ -920,6 +956,22 @@ mod tests {
         assert_eq!(trim_fast_edge(make_16bit_image(102, 52), None, true).dimensions(), (102, 52));
         // Below the smallest size that uses decoder scaling.
         assert_eq!(trim_fast_edge(make_8bit_image(10, 6), Some(8), true).dimensions(), (10, 6));
+    }
+
+    #[test]
+    fn remove_active_temp_files_removes_only_files_in_use() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let in_use = tmp.path().join(".a.jpg.rawdog-tmp");
+        let finished = tmp.path().join(".b.jpg.rawdog-tmp");
+        std::fs::write(&in_use, b"x").unwrap();
+        std::fs::write(&finished, b"x").unwrap();
+
+        let _active = TempFileGuard::register(&in_use);
+        drop(TempFileGuard::register(&finished));
+        remove_active_temp_files();
+
+        assert!(!in_use.exists());
+        assert!(finished.exists());
     }
 
     // -----------------------------------------------------------------------
