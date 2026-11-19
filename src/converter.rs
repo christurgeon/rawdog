@@ -76,9 +76,18 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
             // other way: above 1 is more magenta.
             pipeline.ops.tolab.set_temp(kelvin, 1.0 / tint);
         }
-        if let Some(ev) = exposure {
-            let curve = &mut pipeline.ops.basecurve;
-            curve.points = exposure_curve(ev, &curve.get_spline());
+        match (exposure, &mut pipeline.globals.image) {
+            // Darkening is exact as a gain on the RAW samples: colour and
+            // lightness scale together. The curve changes lightness only,
+            // which left dark areas too saturated at large negative values.
+            (Some(ev), ImageSource::Raw(raw)) if ev < 0.0 => scale_raw_samples(raw, ev.exp2()),
+            // Brightening uses the curve, which rolls off highlights where a
+            // gain would clip them.
+            (Some(ev), _) => {
+                let curve = &mut pipeline.ops.basecurve;
+                curve.points = exposure_curve(ev, &curve.get_spline());
+            }
+            (None, _) => {}
         }
         Source::Developed(Box::new(pipeline))
     };
@@ -399,6 +408,26 @@ fn decode_with_rawler(input: &Path) -> Result<rawloader::RawImage, String> {
             RawImageData::Float(data) => rawloader::RawImageData::Float(data),
         },
     })
+}
+
+/// Multiply the light in RAW samples by `gain`: the part above the black
+/// level is scaled, and the black level stays.
+fn scale_raw_samples(raw: &mut rawloader::RawImage, gain: f32) {
+    // imagepipe subtracts one black level for every sample (the first).
+    let black = raw.blacklevels[0] as f32;
+    match &mut raw.data {
+        rawloader::RawImageData::Integer(data) => {
+            for v in data.iter_mut() {
+                let light = (*v as f32 - black).max(0.0);
+                *v = (black + light * gain).round() as u16;
+            }
+        }
+        rawloader::RawImageData::Float(data) => {
+            for v in data.iter_mut() {
+                *v = black + (*v - black).max(0.0) * gain;
+            }
+        }
+    }
 }
 
 /// Tone curve points that apply an exposure change of `ev` stops, followed
@@ -1189,6 +1218,18 @@ mod tests {
             orientation: rawloader::Orientation::Normal,
             data: rawloader::RawImageData::Integer(data),
         }
+    }
+
+    #[test]
+    fn scale_raw_samples_scales_the_light_above_the_black_level() {
+        let mut raw = raw_image(vec![512, 1512, 4512, 100], 15360);
+        raw.blacklevels = [512; 4];
+        scale_raw_samples(&mut raw, 0.25);
+        let rawloader::RawImageData::Integer(data) = raw.data else {
+            unreachable!()
+        };
+        // Black stays black; light is quartered; below black stays at black.
+        assert_eq!(data, vec![512, 762, 1512, 512]);
     }
 
     #[test]
