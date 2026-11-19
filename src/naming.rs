@@ -12,6 +12,7 @@ enum Token {
     Day,
     Time,
     Model,
+    Rating,
 }
 
 const TOKENS: &[(&str, Token)] = &[
@@ -22,6 +23,7 @@ const TOKENS: &[(&str, Token)] = &[
     ("day", Token::Day),
     ("time", Token::Time),
     ("model", Token::Model),
+    ("rating", Token::Rating),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -92,6 +94,8 @@ pub struct NameInfo {
     pub stem: String,
     pub taken: Option<Taken>,
     pub model: Option<String>,
+    /// Star rating: 1 to 5, 0 for unrated, -1 for rejected (Lightroom).
+    pub rating: Option<i8>,
 }
 
 impl NameInfo {
@@ -109,6 +113,7 @@ impl NameInfo {
             return info;
         }
         let Ok(Some((fields, _))) = crate::exif::read_source_fields(path) else {
+            info.rating = read_rating(path, &[]);
             return info;
         };
 
@@ -128,8 +133,71 @@ impl NameInfo {
         info.model = ascii(exif::Tag::Model)
             .map(|raw| String::from_utf8_lossy(&raw).trim().to_string())
             .filter(|m| !m.is_empty());
+        info.rating = read_rating(path, &fields);
         info
     }
+}
+
+/// The rating of a RAW file. Sources, in order:
+/// 1. A sidecar XMP file, written by Lightroom, Capture One, or darktable.
+///    It wins because it holds the photographer's later decision.
+/// 2. The XMP packet in the file's main EXIF directory (Sony, Nikon, Leica,
+///    Canon CR2) or the EXIF Rating tag.
+/// 3. The XMP packet that the decoder reads (Canon CR3, Fujifilm RAF).
+fn read_rating(path: &Path, fields: &[exif::Field]) -> Option<i8> {
+    const XMP_TAG: exif::Tag = exif::Tag(exif::Context::Tiff, 0x02bc);
+    const RATING_TAG: exif::Tag = exif::Tag(exif::Context::Tiff, 0x4746);
+
+    let mut sidecars = vec![path.with_extension("xmp"), path.with_extension("XMP")];
+    let mut darktable = path.as_os_str().to_owned();
+    darktable.push(".xmp");
+    sidecars.push(PathBuf::from(darktable));
+    if let Some(rating) = sidecars
+        .iter()
+        .filter_map(|p| std::fs::read(p).ok())
+        .find_map(|xmp| xmp_rating(&xmp))
+    {
+        return Some(rating);
+    }
+
+    for field in fields {
+        let rating = match (&field.value, field.tag) {
+            (exif::Value::Byte(xmp) | exif::Value::Undefined(xmp, _), tag) if tag == XMP_TAG => {
+                xmp_rating(xmp)
+            }
+            (value, tag) if tag == RATING_TAG => value.get_uint(0).map(|v| v.min(5) as i8),
+            _ => None,
+        };
+        if rating.is_some() {
+            return rating;
+        }
+    }
+
+    let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    if ext != "cr3" && ext != "raf" {
+        return None;
+    }
+    // rawler can panic on files that are not RAW files.
+    let xmp = std::panic::catch_unwind(|| {
+        let source = rawler::rawsource::RawSource::new(path).ok()?;
+        let decoder = rawler::get_decoder(&source).ok()?;
+        decoder
+            .xpacket(&source, &rawler::decoders::RawDecodeParams::default())
+            .ok()?
+    })
+    .ok()??;
+    xmp_rating(&xmp)
+}
+
+/// The `xmp:Rating` value of an XMP packet, in element or attribute form.
+fn xmp_rating(xmp: &[u8]) -> Option<i8> {
+    let text = String::from_utf8_lossy(xmp);
+    let start = text.find("xmp:Rating")? + "xmp:Rating".len();
+    let rest = text[start..].trim_start_matches(|c: char| c == '>' || c == '=' || c == '"' || c == '\'' || c.is_whitespace());
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '-'))
+        .unwrap_or(rest.len());
+    rest[..end].parse::<i8>().ok().map(|r| r.clamp(-1, 5))
 }
 
 impl NameTemplate {
@@ -158,6 +226,7 @@ impl NameTemplate {
                         Token::Day => taken(|(_, _, d, ..)| format!("{d:02}")),
                         Token::Time => taken(|(_, _, _, h, m, s)| format!("{h:02}{m:02}{s:02}")),
                         Token::Model => info.model.clone().unwrap_or_else(unknown),
+                        Token::Rating => info.rating.unwrap_or(0).to_string(),
                     };
                     // A value must not add path components, and must not
                     // be the name of the current or the parent directory.
@@ -183,6 +252,7 @@ mod tests {
             stem: "DSC0001".to_string(),
             taken: Some((2024, 3, 9, 7, 5, 42)),
             model: Some("ILCE-7M3".to_string()),
+            rating: Some(4),
         }
     }
 
@@ -196,6 +266,45 @@ mod tests {
             expand("{year}/{month}/{day}/{date}_{time}_{model}_{stem}", &info()),
             PathBuf::from("2024/03/09/2024-03-09_070542_ILCE-7M3_DSC0001")
         );
+    }
+
+    #[test]
+    fn expands_rating_with_zero_for_unrated() {
+        assert_eq!(expand("{rating}/{stem}", &info()), PathBuf::from("4/DSC0001"));
+        let unrated = NameInfo {
+            stem: "a".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(expand("{rating}/{stem}", &unrated), PathBuf::from("0/a"));
+    }
+
+    #[test]
+    fn xmp_rating_reads_element_and_attribute_forms() {
+        assert_eq!(xmp_rating(b"<xmp:Rating>3</xmp:Rating>"), Some(3));
+        assert_eq!(xmp_rating(b"<x xmp:Rating=\"5\" />"), Some(5));
+        assert_eq!(xmp_rating(b"xmp:Rating='-1'"), Some(-1));
+        assert_eq!(xmp_rating(b"<xmp:Rating>0</xmp:Rating>"), Some(0));
+        assert_eq!(xmp_rating(b"<xmp:CreatorTool>x</xmp:CreatorTool>"), None);
+        assert_eq!(xmp_rating(b"xmp:Rating=\"9\""), Some(5));
+    }
+
+    #[test]
+    fn sidecar_rating_wins_over_the_rating_in_the_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let raw = tmp.path().join("DSC1.ARW");
+        std::fs::write(&raw, b"not a raw file").unwrap();
+        let in_file = [exif::Field {
+            tag: exif::Tag(exif::Context::Tiff, 0x02bc),
+            ifd_num: exif::In::PRIMARY,
+            value: exif::Value::Byte(b"<xmp:Rating>2</xmp:Rating>".to_vec()),
+        }];
+        assert_eq!(read_rating(&raw, &in_file), Some(2));
+
+        // Lightroom and Capture One: DSC1.xmp. darktable: DSC1.ARW.xmp.
+        std::fs::write(tmp.path().join("DSC1.ARW.xmp"), b"xmp:Rating=\"4\"").unwrap();
+        assert_eq!(read_rating(&raw, &in_file), Some(4));
+        std::fs::write(tmp.path().join("DSC1.xmp"), b"xmp:Rating=\"5\"").unwrap();
+        assert_eq!(read_rating(&raw, &in_file), Some(5));
     }
 
     #[test]
@@ -222,6 +331,7 @@ mod tests {
             stem: "a".to_string(),
             taken: None,
             model: Some("../Evil/Cam".to_string()),
+            rating: None,
         };
         assert_eq!(expand("{model}_{stem}", &info), PathBuf::from(".._Evil_Cam_a"));
     }
@@ -232,6 +342,7 @@ mod tests {
             stem: "a".to_string(),
             taken: None,
             model: Some("..".to_string()),
+            rating: None,
         };
         assert_eq!(expand("{model}/{stem}", &info), PathBuf::from("__/a"));
     }
