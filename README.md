@@ -145,6 +145,20 @@ By default rawdog chooses how many files to convert at the same time from the in
 
 `--report` lists each file with its output, its status (converted, skipped, failed, or excluded), the error message, and the time taken. It is JSON if the name ends in `.json`, otherwise CSV.
 
+### Default options
+
+Options you use every time can go in `~/.config/rawdog/defaults`, one per line. The value follows the option after a space and needs no quotes:
+
+```
+# ~/.config/rawdog/defaults
+--copyright (c) 2026 J. Doe
+--artist J. Doe
+--strip-gps
+--sharpen 0.5
+```
+
+`--sharpen` needs its amount in the file. An option on the command line overrides the same option in the file. `--no-defaults` ignores the file for one run, and `RAWDOG_DEFAULTS` names a different file.
+
 ## Existing Files
 
 - An existing output file is skipped. `--overwrite` replaces it, and `--update` replaces it only when the RAW file is newer.
@@ -190,6 +204,29 @@ if [ -z "$OUTPUT_DIR" ]; then
 fi
 
 rawdog "$@" -o "$OUTPUT_DIR"
+```
+
+More recipes, each saved as its own Quick Action in the same way. They select folders as well as files, show a notification with the result, and use your [defaults file](#default-options).
+
+Make proofs of the selected files or folders into a `proofs` folder next to them, and open the gallery page:
+
+```bash
+export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
+
+OUT="$(dirname "$1")/proofs"
+if RESULT=$(rawdog -R "$@" -r 2048 --fast --sharpen 0.5 -o "$OUT" --gallery 2>&1); then
+    open "$OUT/gallery.html"
+fi
+osascript -e "display notification \"$(echo "$RESULT" | grep -E 'succeeded|No RAW' | tail -1)\" with title \"RawDog proofs\""
+```
+
+Import a card into an archive by date, with sidecars, verified byte for byte:
+
+```bash
+export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
+
+RESULT=$(rawdog -R "$@" -f original -o "$HOME/Pictures/Archive" --name "{year}/{date}/{stem}" 2>&1)
+osascript -e "display notification \"$(echo "$RESULT" | grep -E 'succeeded|No RAW' | tail -1)\" with title \"RawDog import\""
 ```
 
 If the action doesn't appear, check **System Settings → Privacy & Security → Extensions → Finder**.
