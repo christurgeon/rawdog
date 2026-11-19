@@ -1,6 +1,7 @@
 mod converter;
 mod exif;
 mod naming;
+mod report;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -65,6 +66,12 @@ struct Cli {
     /// (not case-sensitive), for example "7M4" or "Z 6"
     #[arg(long, value_name = "MODEL")]
     camera: Option<String>,
+
+    /// Write what happened to each file to this file: JSON if the name ends
+    /// in .json, otherwise CSV. Columns: input, output, status (converted,
+    /// skipped, failed, excluded), message, seconds
+    #[arg(long, value_name = "FILE")]
+    report: Option<PathBuf>,
 
     /// Output format
     #[arg(short, long, value_enum, default_value_t = OutputFormat::Jpeg)]
@@ -159,6 +166,11 @@ fn float_in_range<const MIN: i32, const MAX: i32>(s: &str) -> Result<f32, String
         Ok(v) if v >= MIN as f32 && v <= MAX as f32 => Ok(v),
         _ => Err(format!("must be a number from {MIN} to {MAX}")),
     }
+}
+
+fn write_report(path: &Path, records: &mut [report::Record]) -> Result<()> {
+    report::write(path, records)
+        .map_err(|e| anyhow!("Failed to write report {}: {e}", path.display()))
 }
 
 fn parse_date(s: &str) -> Result<(u16, u8, u8), String> {
@@ -271,6 +283,7 @@ fn main() -> Result<()> {
         until: cli.until,
         camera: cli.camera.clone(),
     };
+    let mut excluded_records = Vec::new();
     let files = if selection.is_active() {
         let excluded: Vec<Option<String>> = files
             .par_iter()
@@ -278,6 +291,16 @@ fn main() -> Result<()> {
             .collect();
         let (kept, dropped): (Vec<_>, Vec<_>) =
             files.into_iter().zip(excluded).partition(|(_, reason)| reason.is_none());
+        excluded_records = dropped
+            .iter()
+            .map(|(f, reason)| report::Record {
+                input: f.path.clone(),
+                output: None,
+                status: report::Status::Excluded,
+                message: reason.clone().unwrap_or_default(),
+                seconds: 0.0,
+            })
+            .collect();
         if cli.dry_run {
             for (f, reason) in &dropped {
                 println!("exclude {} ({})", f.path.display(), reason.as_deref().unwrap_or(""));
@@ -288,6 +311,9 @@ fn main() -> Result<()> {
         if kept.is_empty() {
             if !cli.quiet {
                 println!("No RAW files match the selection options.");
+            }
+            if let Some(path) = &cli.report {
+                write_report(path, &mut excluded_records)?;
             }
             if missing_inputs {
                 std::process::exit(1);
@@ -370,6 +396,18 @@ fn main() -> Result<()> {
     };
 
     let failures: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    let records: Mutex<Vec<report::Record>> = Mutex::new(excluded_records);
+    let record = |input: &Path, output: &Path, status, message: String, seconds: f64| {
+        if cli.report.is_some() {
+            records.lock().unwrap().push(report::Record {
+                input: input.to_path_buf(),
+                output: Some(output.to_path_buf()),
+                status,
+                message,
+                seconds,
+            });
+        }
+    };
     let succeeded = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
@@ -402,6 +440,7 @@ fn main() -> Result<()> {
             pb.suspend(|| {
                 eprintln!("Error converting {}: {reason}", input_path.display());
             });
+            record(input_path, output_path, report::Status::Failed, reason, 0.0);
             failures.lock().unwrap().push(input_path.clone());
             failed.fetch_add(1, Ordering::Relaxed);
             pb.inc(1);
@@ -409,6 +448,13 @@ fn main() -> Result<()> {
         }
 
         if should_skip(input_path, output_path, cli.overwrite, cli.update) {
+            record(
+                input_path,
+                output_path,
+                report::Status::Skipped,
+                "output exists".to_string(),
+                0.0,
+            );
             skipped.fetch_add(1, Ordering::Relaxed);
             pb.inc(1);
             return;
@@ -416,6 +462,7 @@ fn main() -> Result<()> {
 
         // The RAW decoder can panic on corrupt files. Report that as a
         // failure of this file instead of aborting the batch.
+        let started = std::time::Instant::now();
         let result = std::panic::catch_unwind(|| {
             converter::convert_raw(input_path, output_path, &opts)
         })
@@ -423,12 +470,16 @@ fn main() -> Result<()> {
 
         match result {
             Ok(()) => {
+                let seconds = started.elapsed().as_secs_f64();
+                record(input_path, output_path, report::Status::Converted, String::new(), seconds);
                 succeeded.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
                 pb.suspend(|| {
                     eprintln!("Error converting {}: {:#}", input_path.display(), e);
                 });
+                let seconds = started.elapsed().as_secs_f64();
+                record(input_path, output_path, report::Status::Failed, format!("{e:#}"), seconds);
                 failures.lock().unwrap().push(input_path.clone());
                 failed.fetch_add(1, Ordering::Relaxed);
             }
@@ -459,6 +510,10 @@ fn main() -> Result<()> {
 
     if !cli.quiet {
         println!("{s} succeeded, {f} failed, {sk} skipped");
+    }
+
+    if let Some(path) = &cli.report {
+        write_report(path, &mut records.into_inner().unwrap())?;
     }
 
     // Errors scroll away in a long run, so repeat which files failed.

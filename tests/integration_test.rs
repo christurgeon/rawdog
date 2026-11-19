@@ -763,3 +763,26 @@ fn cli_since_rejects_a_bad_date() {
     let output = run(&["--since".as_ref(), "14/11/2026".as_ref(), "/tmp/fake.arw".as_ref()]);
     assert_eq!(output.status.code(), Some(2));
 }
+
+#[test]
+fn cli_report_lists_every_file_with_its_result() {
+    let tmp = TempDir::new().unwrap();
+    let good = tmp.path().join("good.png");
+    write_png(&good, [1, 2, 3]);
+    let bad = tmp.path().join("bad.arw");
+    fs::write(&bad, b"not a raw file").unwrap();
+    let csv = tmp.path().join("run.csv");
+    let json = tmp.path().join("run.json");
+
+    run(&[good.as_ref(), bad.as_ref(), "--report".as_ref(), csv.as_ref()]);
+    let text = fs::read_to_string(&csv).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "input,output,status,message,seconds");
+    assert!(lines.iter().any(|l| l.contains("bad.arw") && l.contains(",failed,")), "{text}");
+    assert!(lines.iter().any(|l| l.contains("good.png") && l.contains(",converted,")), "{text}");
+
+    // Second run: the good file is skipped because its output exists.
+    run(&[good.as_ref(), "--report".as_ref(), json.as_ref()]);
+    let text = fs::read_to_string(&json).unwrap();
+    assert!(text.contains(r#""status": "skipped""#), "{text}");
+}
