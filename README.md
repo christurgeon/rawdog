@@ -143,6 +143,20 @@ By default rawdog chooses how many files to convert at the same time from the in
 
 `--report` lists each file with its output, its status (converted, skipped, failed, or excluded), the error message, and the time taken. It is JSON if the name ends in `.json`, otherwise CSV.
 
+### Default options
+
+Options you use every time can go in `~/.config/rawdog/defaults`, one per line. The value follows the option after a space and needs no quotes:
+
+```
+# ~/.config/rawdog/defaults
+--copyright (c) 2026 J. Doe
+--artist J. Doe
+--strip-gps
+--sharpen 0.5
+```
+
+`--sharpen` needs its amount in the file. An option on the command line overrides the same option in the file. `--no-defaults` ignores the file for one run, and `RAWDOG_DEFAULTS` names a different file.
+
 ## Existing Files
 
 - An existing output file is skipped. `--overwrite` replaces it, and `--update` replaces it only when the RAW file is newer.

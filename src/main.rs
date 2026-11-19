@@ -29,7 +29,15 @@ pub enum OutputFormat {
 }
 
 #[derive(Parser)]
-#[command(name = "rawdog", version, about = "Raw files in, images out. No Lightroom, no fuss.")]
+#[command(
+    name = "rawdog",
+    version,
+    about = "Raw files in, images out. No Lightroom, no fuss.",
+    // Options from the defaults file come first; a later value wins.
+    args_override_self = true,
+    after_help = "Default options can be set in ~/.config/rawdog/defaults (or the file named by \
+                  RAWDOG_DEFAULTS): one option per line, for example `--copyright (c) 2026 J. Doe`."
+)]
 struct Cli {
     /// One or more RAW files, or directories that contain RAW files.
     /// Sony ARW and most other camera RAW formats are accepted
@@ -224,6 +232,62 @@ fn write_gallery(dir: &Path, records: &[report::Record], quiet: bool) -> Result<
     Ok(())
 }
 
+/// The defaults file: `$RAWDOG_DEFAULTS`, else `$XDG_CONFIG_HOME/rawdog/defaults`,
+/// else `~/.config/rawdog/defaults`.
+fn defaults_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("RAWDOG_DEFAULTS") {
+        return Some(PathBuf::from(path));
+    }
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(config.join("rawdog").join("defaults"))
+}
+
+/// Arguments from a defaults file. Each line holds one option, and optionally
+/// its value after the first space; the value needs no quotes. Empty lines
+/// and lines that start with `#` are ignored.
+fn parse_defaults(text: &str) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !line.starts_with("--") {
+            return Err(format!(
+                "line {}: expected an option such as --copyright, found {line:?}",
+                number + 1
+            ));
+        }
+        match line.split_once(char::is_whitespace) {
+            Some((option, value)) => {
+                args.push(option.to_string());
+                args.push(value.trim().to_string());
+            }
+            None if value_is_optional(line) => {
+                return Err(format!(
+                    "line {}: give {line} a value, for example `{line} 0.5`",
+                    number + 1
+                ))
+            }
+            None => args.push(line.to_string()),
+        }
+    }
+    Ok(args)
+}
+
+/// True if `option` takes a value that may be left out, like `--sharpen`.
+/// In a defaults file such an option would take the next argument, the
+/// first input path, as its value, so it must be given a value there.
+fn value_is_optional(option: &str) -> bool {
+    Cli::command()
+        .get_arguments()
+        .find(|a| a.get_long() == option.strip_prefix("--"))
+        .and_then(|a| a.get_num_args())
+        .is_some_and(|n| n.min_values() == 0 && n.max_values() > 0)
+}
+
 fn write_report(path: &Path, records: &mut [report::Record]) -> Result<()> {
     report::write(path, records)
         .map_err(|e| anyhow!("Failed to write report {}: {e}", path.display()))
@@ -315,7 +379,19 @@ fn tint_value(s: &str) -> Result<f32, String> {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let skip_defaults = args.iter().any(|a| a == "--no-defaults");
+    args.retain(|a| a != "--no-defaults");
+    if !skip_defaults {
+        if let Some(path) = defaults_path().filter(|p| p.is_file()) {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read defaults file {}", path.display()))?;
+            let defaults = parse_defaults(&text)
+                .map_err(|e| anyhow!("In defaults file {}: {e}", path.display()))?;
+            args.splice(1..1, defaults.into_iter().map(Into::into));
+        }
+    }
+    let cli = Cli::parse_from(args);
 
     // Handle shell completion generation
     if let Some(shell) = cli.completions {
@@ -1131,6 +1207,31 @@ mod tests {
         let explicit_first =
             collect_raw_files(&[sub.join("x.arw"), tmp.path().to_path_buf()], true).unwrap();
         assert_eq!(explicit_first[0].rel_dir, PathBuf::new());
+    }
+
+    // -----------------------------------------------------------------------
+    // defaults file tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_defaults_reads_one_option_per_line() {
+        let text = "# my defaults\n\n--copyright (c) 2026 J. Doe\n  --strip-gps  \n--quality 90\n";
+        assert_eq!(
+            parse_defaults(text).unwrap(),
+            vec!["--copyright", "(c) 2026 J. Doe", "--strip-gps", "--quality", "90"]
+        );
+        // An option with an optional value needs one in the file, or it
+        // would take the first input path as its value.
+        assert!(parse_defaults("--sharpen\n").unwrap_err().contains("give --sharpen a value"));
+        assert_eq!(parse_defaults("--sharpen 1\n").unwrap(), vec!["--sharpen", "1"]);
+        let err = parse_defaults("photo.ARW\n").unwrap_err();
+        assert!(err.contains("line 1"), "{err}");
+    }
+
+    #[test]
+    fn command_line_overrides_a_default() {
+        let cli = Cli::try_parse_from(["rawdog", "--quality", "80", "--quality", "95", "x.arw"]).unwrap();
+        assert_eq!(cli.quality, 95);
     }
 
     // -----------------------------------------------------------------------
