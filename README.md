@@ -204,6 +204,29 @@ fi
 rawdog "$@" -o "$OUTPUT_DIR"
 ```
 
+More recipes, each saved as its own Quick Action in the same way. They select folders as well as files, show a notification with the result, and use your [defaults file](#default-options).
+
+Make proofs of the selected files or folders into a `proofs` folder next to them, and open the gallery page:
+
+```bash
+export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
+
+OUT="$(dirname "$1")/proofs"
+if RESULT=$(rawdog -R "$@" -r 2048 --fast --sharpen 0.5 -o "$OUT" --gallery 2>&1); then
+    open "$OUT/gallery.html"
+fi
+osascript -e "display notification \"$(echo "$RESULT" | grep -E 'succeeded|No RAW' | tail -1)\" with title \"RawDog proofs\""
+```
+
+Import a card into an archive by date, with sidecars, verified byte for byte:
+
+```bash
+export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
+
+RESULT=$(rawdog -R "$@" -f original -o "$HOME/Pictures/Archive" --name "{year}/{date}/{stem}" 2>&1)
+osascript -e "display notification \"$(echo "$RESULT" | grep -E 'succeeded|No RAW' | tail -1)\" with title \"RawDog import\""
+```
+
 If the action doesn't appear, check **System Settings → Privacy & Security → Extensions → Finder**.
 
 ## License
