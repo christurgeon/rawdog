@@ -14,7 +14,19 @@ pub struct MetadataOptions {
     pub artist: Option<String>,
     /// Value for the Copyright tag. Replaces the source value.
     pub copyright: Option<String>,
+    /// The output pixels are sRGB, whatever colour space the camera was set
+    /// to. False for `--preview`, which keeps the camera's own encoding.
+    pub srgb: bool,
 }
+
+/// An sRGB ICC profile, generated once.
+pub fn srgb_icc_profile() -> &'static [u8] {
+    static PROFILE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    PROFILE.get_or_init(|| moxcms::ColorProfile::new_srgb().encode().unwrap_or_default())
+}
+
+/// TIFF tag that holds an ICC profile.
+const ICC_PROFILE_TAG: exif::Tag = exif::Tag(exif::Context::Tiff, 0x8773);
 
 /// Read the EXIF data of a source file.
 ///
@@ -313,12 +325,16 @@ fn fields_for_output<'a>(
         .filter(|f| value_size(&f.value) <= MAX_FIELD_BYTES)
         .filter(|f| !(meta.strip_gps && f.tag.context() == Context::Gps))
         .filter(|f| !replaced(f.tag))
+        // A camera set to Adobe RGB marks its files with ColorSpace 0xFFFF
+        // and interoperability index "R03". The developed output is sRGB.
+        .filter(|f| !(meta.srgb && f.tag.context() == exif::Context::Interop))
         .map(|field| {
             let mut field = field.clone();
             match field.tag {
                 exif::Tag::Orientation => field.value = exif::Value::Short(vec![1]),
                 exif::Tag::PixelXDimension => field.value = exif::Value::Long(vec![width]),
                 exif::Tag::PixelYDimension => field.value = exif::Value::Long(vec![height]),
+                exif::Tag::ColorSpace if meta.srgb => field.value = exif::Value::Short(vec![1]),
                 _ => {}
             }
             field
@@ -336,6 +352,7 @@ pub fn write_tiff_16bit_with_exif<W: Write + Seek>(
     (width, height): (u32, u32),
     samples: &[u16],
     fields: &[exif::Field],
+    icc_profile: bool,
 ) -> Result<()> {
     use exif::{Field, In, Tag, Value};
 
@@ -361,7 +378,13 @@ pub fn write_tiff_16bit_with_exif<W: Write + Seek>(
     let strips = [bytes.as_slice()];
 
     let mut writer = exif::experimental::Writer::new();
-    for field in layout.iter().chain(fields) {
+    let icc = Field {
+        tag: ICC_PROFILE_TAG,
+        ifd_num: In::PRIMARY,
+        value: Value::Undefined(srgb_icc_profile().to_vec(), 0),
+    };
+    let profile = icc_profile.then_some(&icc);
+    for field in layout.iter().chain(fields).chain(profile) {
         writer.push_field(field);
     }
     writer.set_strips(&strips, In::PRIMARY);
@@ -663,7 +686,8 @@ mod tests {
     fn write_tiff_16bit_with_exif_roundtrips_pixels_and_fields() {
         let samples: Vec<u16> = (0..4 * 3 * 3).map(|i| i * 1000).collect();
         let mut buf = Cursor::new(Vec::new());
-        write_tiff_16bit_with_exif(&mut buf, (4, 3), &samples, &[description_field()]).unwrap();
+        write_tiff_16bit_with_exif(&mut buf, (4, 3), &samples, &[description_field()], true)
+            .unwrap();
         let bytes = buf.into_inner();
 
         let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Tiff)
@@ -782,6 +806,40 @@ mod tests {
             tags(&out),
             vec![Tag::ImageDescription, Tag::Model, Tag::ISOSpeed]
         );
+    }
+
+    #[test]
+    fn fields_for_output_marks_developed_output_as_srgb() {
+        use exif::{In, Tag, Value};
+        let source = [
+            field(Tag::ColorSpace, In::PRIMARY, Value::Short(vec![0xffff])),
+            field(
+                Tag::InteroperabilityIndex,
+                In::PRIMARY,
+                Value::Ascii(vec![b"R03".to_vec()]),
+            ),
+        ];
+        let srgb = MetadataOptions {
+            srgb: true,
+            ..Default::default()
+        };
+        let out = fields_for_output(source.iter(), (300, 200), &srgb);
+        assert_eq!(tags(&out), vec![Tag::ColorSpace]);
+        assert_eq!(out[0].value.get_uint(0), Some(1));
+
+        // --preview keeps the camera's own colour space.
+        let out = fields_for_output(source.iter(), (300, 200), &MetadataOptions::default());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].value.get_uint(0), Some(0xffff));
+    }
+
+    #[test]
+    fn srgb_icc_profile_is_a_valid_rgb_display_profile() {
+        let icc = srgb_icc_profile();
+        assert!(icc.len() > 128);
+        assert_eq!(&icc[12..16], b"mntr");
+        assert_eq!(&icc[16..20], b"RGB ");
+        assert_eq!(&icc[36..40], b"acsp");
     }
 
     #[test]

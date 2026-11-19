@@ -713,3 +713,72 @@ fn cli_look_does_not_change_raster_input() {
         assert!((camera[c] - flat[c]).abs() < 0.5, "{camera:?} vs {flat:?}");
     }
 }
+
+#[test]
+fn cli_output_carries_an_srgb_icc_profile_in_every_format() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [1, 2, 3]);
+    let out = tmp.path().join("out");
+    for format in ["jpeg", "png", "tiff"] {
+        let output = run(&[input.as_ref(), "-o".as_ref(), out.as_ref(), "-f".as_ref(), format.as_ref()]);
+        assert!(output.status.success(), "{format}");
+    }
+    for name in ["in.jpg", "in.png", "in.tiff"] {
+        let bytes = fs::read(out.join(name)).unwrap();
+        // Every ICC profile carries the signature "acsp" in its header. PNG
+        // stores the profile compressed, in an iCCP chunk.
+        let marker: &[u8] = if name.ends_with(".png") { b"iCCP" } else { b"acsp" };
+        assert!(bytes.windows(4).any(|w| w == marker), "{name}: no ICC profile");
+    }
+}
+
+#[test]
+fn cli_min_rating_uses_sidecar_files_and_lists_exclusions_in_dry_run() {
+    let tmp = TempDir::new().unwrap();
+    for (name, rating) in [("keep", Some(4)), ("drop", Some(1)), ("none", None)] {
+        write_png(&tmp.path().join(format!("{name}.png")), [1, 2, 3]);
+        if let Some(r) = rating {
+            let xmp = format!("<x:xmpmeta><rdf:Description xmp:Rating=\"{r}\"/></x:xmpmeta>");
+            fs::write(tmp.path().join(format!("{name}.xmp")), xmp).unwrap();
+        }
+    }
+    let inputs: Vec<std::path::PathBuf> = ["keep", "drop", "none"]
+        .iter()
+        .map(|n| tmp.path().join(format!("{n}.png")))
+        .collect();
+    let out = tmp.path().join("out");
+    let mut args: Vec<&std::ffi::OsStr> = inputs.iter().map(|p| p.as_os_str()).collect();
+    args.extend(["--min-rating", "3", "-o"].iter().map(|a| a.as_ref() as &std::ffi::OsStr));
+    args.push(out.as_os_str());
+
+    let mut dry = args.clone();
+    dry.push("-n".as_ref());
+    let stdout = String::from_utf8_lossy(&run(&dry).stdout).to_string();
+    assert!(stdout.contains("exclude") && stdout.contains("drop.png (rating 1)"), "{stdout}");
+    assert!(stdout.contains("none.png (no rating)"), "{stdout}");
+
+    let output = run(&args);
+    assert!(output.status.success());
+    assert!(out.join("keep.jpg").is_file());
+    assert!(!out.join("drop.jpg").exists());
+    assert!(!out.join("none.jpg").exists());
+}
+
+#[test]
+fn cli_selection_that_matches_nothing_is_not_an_error() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [1, 2, 3]);
+    let output = run(&[input.as_ref(), "--camera".as_ref(), "Z 9".as_ref()]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No RAW files match"), "{stdout}");
+    assert!(!tmp.path().join("in.jpg").exists());
+}
+
+#[test]
+fn cli_since_rejects_a_bad_date() {
+    let output = run(&["--since".as_ref(), "14/11/2026".as_ref(), "/tmp/fake.arw".as_ref()]);
+    assert_eq!(output.status.code(), Some(2));
+}

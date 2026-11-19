@@ -1426,6 +1426,7 @@ dependencies = [
  "img-parts",
  "indicatif",
  "kamadak-exif",
+ "moxcms",
  "rawler",
  "rawloader",
  "rayon",

@@ -87,11 +87,25 @@ Import a card into folders by capture date, with the camera model in each file n
 rawdog -R /Volumes/CARD -o ~/Pictures --name "{date}/{model}_{stem}"
 ```
 
-Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), and `{model}`. A file without that metadata gets `unknown`.
+Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), `{model}`, and `{rating}`. A file without that metadata gets `unknown`.
 
 The template path is below the `-o` directory. Without `-o` it is below the directory of each input file. With a template, `-R` does not mirror the input tree, so include `{date}` or another field that keeps equal file names apart.
 
 RAW files are developed with a tone curve that gives brightness and contrast close to the camera's own JPEG. Use `--look flat` for the darker, flatter result of earlier versions, which leaves more room for editing afterwards.
+
+Convert only your picks. Ratings come from sidecar XMP files written by Lightroom, Capture One, or darktable, or from the rating set in the camera:
+
+```sh
+rawdog -R /Volumes/CARD --min-rating 3 -o ./picks
+```
+
+Convert one day of a multi-day card, from one of two bodies:
+
+```sh
+rawdog -R /Volumes/CARD --since 2026-11-14 --until 2026-11-14 --camera 7M4 -o ./day2
+```
+
+Dates are the camera clock's local date. A file without the metadata that a filter needs is excluded; `--dry-run` lists each excluded file with the reason. `{rating}` in a `--name` template gives the star rating (0 for unrated).
 
 Brighten a dark batch by two thirds of a stop and set the white balance to 3400 K:
 
