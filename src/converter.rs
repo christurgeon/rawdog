@@ -34,7 +34,19 @@ pub struct ConvertOptions {
     /// Use the JPEG preview that the camera embedded in the RAW file
     /// instead of developing the RAW data.
     pub preview: bool,
+    /// Tone curve for RAW development.
+    pub look: Look,
     pub metadata: exif_utils::MetadataOptions,
+}
+
+/// Tone curve for RAW development.
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
+pub enum Look {
+    /// Brightness and contrast close to the camera's own JPEG.
+    Camera,
+    /// imagepipe's base curve alone: darker and flatter, with more room for
+    /// editing afterwards.
+    Flat,
 }
 
 /// Convert a single ARW file to the specified output format.
@@ -70,6 +82,12 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
             // higher value gives a greener image. `--tint` is defined the
             // other way: above 1 is more magenta.
             pipeline.ops.tolab.set_temp(kelvin, 1.0 / tint);
+        }
+        // Raster input (JPEG, PNG, TIFF) is already rendered.
+        let raw_input = matches!(pipeline.globals.image, ImageSource::Raw(_));
+        if raw_input && opts.look == Look::Camera {
+            let curve = &mut pipeline.ops.basecurve;
+            curve.points = camera_look_curve(&curve.get_spline());
         }
         if let Some(ev) = exposure {
             let curve = &mut pipeline.ops.basecurve;
@@ -393,6 +411,38 @@ fn decode_with_rawler(input: &Path) -> Result<rawloader::RawImage, String> {
             RawImageData::Float(data) => rawloader::RawImageData::Float(data),
         },
     })
+}
+
+/// How the camera's own JPEG maps the lightness of imagepipe's output, as
+/// pairs of normalised CIE L* (imagepipe output, camera JPEG).
+///
+/// Measured on 38 cameras from 11 makers: the median over cameras of the
+/// median camera-JPEG lightness for each output lightness, in areas without
+/// texture. Values above 0.85 are extended smoothly to (1, 1).
+const CAMERA_LOOK: [(f32, f32); 10] = [
+    (0.05, 0.036),
+    (0.10, 0.08),
+    (0.20, 0.20),
+    (0.30, 0.33),
+    (0.40, 0.46),
+    (0.50, 0.59),
+    (0.60, 0.715),
+    (0.70, 0.815),
+    (0.80, 0.90),
+    (0.90, 0.955),
+];
+
+/// Tone curve points for the camera look: the pipeline's own base curve,
+/// followed by `CAMERA_LOOK`.
+fn camera_look_curve(base: &SplineFunc) -> Vec<(f32, f32)> {
+    const STEPS: usize = 32;
+    let look = SplineFunc::new(&CAMERA_LOOK);
+    (1..STEPS)
+        .map(|i| {
+            let x = i as f32 / STEPS as f32;
+            (x, look.interpolate(base.interpolate(x)).clamp(0.0, 1.0))
+        })
+        .collect()
 }
 
 /// Tone curve points that apply an exposure change of `ev` stops, followed
@@ -1024,6 +1074,7 @@ mod tests {
             white_balance: None,
             sharpen: None,
             preview: true,
+            look: Look::Flat,
             metadata: Default::default(),
         }
     }
@@ -1097,6 +1148,22 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn camera_look_curve_brightens_midtones_and_keeps_the_ends() {
+        let base = SplineFunc::new(&[(0.5, 0.6)]);
+        let points = camera_look_curve(&base);
+        for pair in points.windows(2) {
+            assert!(pair[1].1 > pair[0].1, "not increasing at {}", pair[1].0);
+        }
+        let curve = SplineFunc::new(&points);
+        assert!(curve.interpolate(0.0).abs() < 1e-6);
+        assert!((curve.interpolate(1.0) - 1.0).abs() < 1e-6);
+        // Midtones: brighter than the base curve, as in camera JPEGs.
+        assert!(curve.interpolate(0.5) > base.interpolate(0.5) + 0.05);
+        // Deep shadows: not lifted.
+        assert!(curve.interpolate(0.04) <= base.interpolate(0.04) + 0.01);
+    }
+
+    #[test]
     fn exposure_curve_zero_ev_equals_base_curve() {
         let base = SplineFunc::new(&[(0.5, 0.6)]);
         for (x, y) in exposure_curve(0.0, &base) {
@@ -1150,6 +1217,7 @@ mod tests {
                 white_balance: None,
                 sharpen: None,
                 preview: false,
+                look: Look::Flat,
                 metadata: Default::default(),
             },
         );
@@ -1174,6 +1242,7 @@ mod tests {
                 white_balance: None,
                 sharpen: None,
                 preview: false,
+                look: Look::Flat,
                 metadata: Default::default(),
             },
         );

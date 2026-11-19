@@ -91,6 +91,8 @@ Template fields: `{stem}` (input file name without extension), `{date}` (2024-03
 
 The template path is below the `-o` directory. Without `-o` it is below the directory of each input file. With a template, `-R` does not mirror the input tree, so include `{date}` or another field that keeps equal file names apart.
 
+RAW files are developed with a tone curve that gives brightness and contrast close to the camera's own JPEG. Use `--look flat` for the darker, flatter result of earlier versions, which leaves more room for editing afterwards.
+
 Brighten a dark batch by two thirds of a stop and set the white balance to 3400 K:
 
 ```sh

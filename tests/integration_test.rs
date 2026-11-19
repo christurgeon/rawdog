@@ -694,3 +694,22 @@ fn cli_preview_fails_cleanly_for_a_file_without_a_preview() {
     assert!(!output.status.success());
     assert!(!tmp.path().join("in.jpg").exists());
 }
+
+#[test]
+fn cli_look_values_are_validated() {
+    let output = run(&["--look".as_ref(), "vivid".as_ref(), "/tmp/fake.arw".as_ref()]);
+    assert_eq!(output.status.code(), Some(2));
+    let output = run(&["--help".as_ref()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--look"), "got: {stdout}");
+}
+
+#[test]
+fn cli_look_does_not_change_raster_input() {
+    // A PNG is already rendered; the look applies to RAW files only.
+    let camera = convert_grey_with(&["--look", "camera"]);
+    let flat = convert_grey_with(&["--look", "flat"]);
+    for c in 0..3 {
+        assert!((camera[c] - flat[c]).abs() < 0.5, "{camera:?} vs {flat:?}");
+    }
+}

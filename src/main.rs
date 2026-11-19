@@ -100,6 +100,12 @@ struct Cli {
     #[arg(long, value_name = "TEXT")]
     copyright: Option<String>,
 
+    /// Tone curve for RAW files. `camera` gives brightness and contrast
+    /// close to the camera's own JPEG; `flat` is darker and flatter, with
+    /// more room for editing afterwards
+    #[arg(long, value_enum, default_value_t = converter::Look::Camera)]
+    look: converter::Look,
+
     /// Use the JPEG preview that the camera embedded in each RAW file,
     /// without developing the RAW data. Very fast, with the camera's own
     /// colours; the size depends on the camera (1616x1080 for Sony)
@@ -235,6 +241,7 @@ fn main() -> Result<()> {
         white_balance: cli.wb.map(|kelvin| (kelvin, cli.tint)),
         sharpen: cli.sharpen,
         preview: cli.preview,
+        look: cli.look,
         metadata: exif::MetadataOptions {
             strip_all: cli.strip_metadata,
             strip_gps: cli.strip_gps,
