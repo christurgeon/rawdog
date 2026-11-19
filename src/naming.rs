@@ -191,13 +191,52 @@ fn read_rating(path: &Path, fields: &[exif::Field]) -> Option<i8> {
 
 /// The `xmp:Rating` value of an XMP packet, in element or attribute form.
 fn xmp_rating(xmp: &[u8]) -> Option<i8> {
-    let text = String::from_utf8_lossy(xmp);
-    let start = text.find("xmp:Rating")? + "xmp:Rating".len();
-    let rest = text[start..].trim_start_matches(|c: char| c == '>' || c == '=' || c == '"' || c == '\'' || c.is_whitespace());
-    let end = rest
-        .find(|c: char| !(c.is_ascii_digit() || c == '-'))
-        .unwrap_or(rest.len());
-    rest[..end].parse::<i8>().ok().map(|r| r.clamp(-1, 5))
+    let text = xmp_text(xmp);
+    const NAME: &str = "xmp:Rating";
+    let mut from = 0;
+    while let Some(found) = text[from..].find(NAME) {
+        let rest = &text[from + found + NAME.len()..];
+        from += found + NAME.len();
+        // The name must end here: not `xmp:RatingPercent`.
+        if !rest.starts_with(['=', '>', ' ', '\t', '\n', '\r']) {
+            continue;
+        }
+        let value = rest.trim_start_matches(|c: char| {
+            c == '>' || c == '=' || c == '"' || c == '\'' || c.is_whitespace()
+        });
+        let end = value
+            .find(|c: char| !(c.is_ascii_digit() || c == '-'))
+            .unwrap_or(value.len());
+        if let Ok(rating) = value[..end].parse::<i8>() {
+            return Some(rating.clamp(-1, 5));
+        }
+    }
+    None
+}
+
+/// XMP is UTF-8 in practice, but the standard also allows UTF-16.
+fn xmp_text(xmp: &[u8]) -> String {
+    let utf16 = |bytes: &[u8], big_endian: bool| {
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| {
+                if big_endian {
+                    u16::from_be_bytes(pair)
+                } else {
+                    u16::from_le_bytes(pair)
+                }
+            })
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    match xmp {
+        [0xff, 0xfe, rest @ ..] => utf16(rest, false),
+        [0xfe, 0xff, rest @ ..] => utf16(rest, true),
+        [0xef, 0xbb, 0xbf, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        _ => String::from_utf8_lossy(xmp).into_owned(),
+    }
 }
 
 impl NameTemplate {
@@ -286,6 +325,20 @@ mod tests {
         assert_eq!(xmp_rating(b"<xmp:Rating>0</xmp:Rating>"), Some(0));
         assert_eq!(xmp_rating(b"<xmp:CreatorTool>x</xmp:CreatorTool>"), None);
         assert_eq!(xmp_rating(b"xmp:Rating=\"9\""), Some(5));
+        // A longer name that starts with the same text is not the rating.
+        assert_eq!(
+            xmp_rating(b"<d xmp:RatingPercent=\"20\" xmp:Rating=\"5\"/>"),
+            Some(5)
+        );
+        assert_eq!(xmp_rating(b"<d xmp:RatingPercent=\"20\"/>"), None);
+        assert_eq!(xmp_rating(b"<d MicrosoftPhoto:Rating=\"99\"/>"), None);
+        // UTF-16 with a byte order mark, and UTF-8 with one.
+        let utf16: Vec<u8> = [0xff, 0xfe]
+            .into_iter()
+            .chain("<x xmp:Rating=\"4\"/>".encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        assert_eq!(xmp_rating(&utf16), Some(4));
+        assert_eq!(xmp_rating(b"\xef\xbb\xbfxmp:Rating=\"2\""), Some(2));
     }
 
     #[test]

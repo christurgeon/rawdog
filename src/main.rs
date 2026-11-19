@@ -68,7 +68,7 @@ struct Cli {
 
     /// Convert only files from cameras whose model contains this text
     /// (not case-sensitive), for example "7M4" or "Z 6"
-    #[arg(long, value_name = "MODEL")]
+    #[arg(long, value_name = "MODEL", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     camera: Option<String>,
 
     /// Write what happened to each file to this file: JSON if the name ends
@@ -241,7 +241,15 @@ fn parse_date(s: &str) -> Result<(u16, u8, u8), String> {
         m.parse::<u8>().map_err(|_| err())?,
         d.parse::<u8>().map_err(|_| err())?,
     );
-    if y < 1900 || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days_in_month = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return Err(err()),
+    };
+    if y < 1900 || !(1..=days_in_month).contains(&d) {
         return Err(err());
     }
     Ok((y, m, d))
@@ -315,6 +323,12 @@ fn main() -> Result<()> {
         let name = cmd.get_name().to_string();
         generate(shell, &mut cmd, name, &mut std::io::stdout());
         return Ok(());
+    }
+
+    if let (Some(since), Some(until)) = (cli.since, cli.until) {
+        if since > until {
+            bail!("--since must not be later than --until.");
+        }
     }
 
     if cli.gallery && matches!(cli.format, OutputFormat::Tiff | OutputFormat::Original) {
@@ -1186,7 +1200,18 @@ mod tests {
     #[test]
     fn parse_date_accepts_only_valid_dates() {
         assert_eq!(parse_date("2026-11-05"), Ok((2026, 11, 5)));
-        for bad in ["2026-13-01", "2026-11", "11/05/2026", "2026-11-05-1", "1800-01-01"] {
+        assert_eq!(parse_date("2024-02-29"), Ok((2024, 2, 29)));
+        for bad in [
+            "2026-13-01",
+            "2026-11",
+            "11/05/2026",
+            "2026-11-05-1",
+            "1800-01-01",
+            "2026-02-30",
+            "2025-02-29",
+            "2026-04-31",
+            "2026-00-10",
+        ] {
             assert!(parse_date(bad).is_err(), "{bad}");
         }
     }
