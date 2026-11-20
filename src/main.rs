@@ -145,9 +145,12 @@ struct Cli {
     #[arg(long, value_name = "SIZE", value_parser = byte_size)]
     max_size: Option<u64>,
 
-    /// Resize long edge to this many pixels, preserving aspect ratio
-    #[arg(short, long, value_parser = clap::value_parser!(u32).range(1..))]
-    resize: Option<u32>,
+    /// Resize long edge to this many pixels, preserving aspect ratio.
+    /// Several sizes, such as 3000,2048,1080, write each size into its own
+    /// folder below -o
+    #[arg(short, long, value_name = "PIXELS", value_delimiter = ',',
+          action = clap::ArgAction::Set, value_parser = clap::value_parser!(u32).range(1..))]
+    resize: Vec<u32>,
 
     /// Crop the centre to this aspect ratio, such as 4:5, 16:9, or 1:1. The
     /// ratio follows each image's orientation (4:5 makes a landscape 5:4).
@@ -619,6 +622,10 @@ fn main() -> Result<()> {
         }
     }
 
+    if cli.resize.len() > 1 && cli.output.is_none() {
+        bail!("Several --resize sizes need -o: each size is written into its own folder there.");
+    }
+
     if cli.gallery && matches!(cli.format, OutputFormat::Tiff | OutputFormat::Original) {
         bail!("--gallery needs JPEG or PNG output; browsers do not show TIFF or RAW files.");
     }
@@ -637,7 +644,7 @@ fn main() -> Result<()> {
     if matches!(cli.format, OutputFormat::Original) {
         let image_options = [
             ("--max-size", cli.max_size.is_some()),
-            ("--resize", cli.resize.is_some()),
+            ("--resize", !cli.resize.is_empty()),
             ("--aspect", cli.aspect.is_some()),
             ("--fast", cli.fast),
             ("--preview", cli.preview),
@@ -822,13 +829,31 @@ fn main() -> Result<()> {
         files
     };
 
-    let jobs = plan_outputs(
-        &files,
-        cli.output.as_deref(),
-        cli.format,
-        template.as_ref(),
-        (!infos.is_empty()).then_some(infos.as_slice()),
-    )?;
+    // With several sizes, each size gets its own folder below -o, and each
+    // job knows its size.
+    let mut sizes = cli.resize.clone();
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    sizes.dedup();
+    let size_dirs: Vec<(Option<u32>, Option<PathBuf>)> = if sizes.len() > 1 {
+        let out = cli.output.as_deref().expect("checked: several sizes need -o");
+        sizes.iter().map(|&s| (Some(s), Some(out.join(s.to_string())))).collect()
+    } else {
+        vec![(sizes.first().copied(), cli.output.clone())]
+    };
+    let mut jobs = Vec::new();
+    let mut job_sizes: HashMap<PathBuf, Option<u32>> = HashMap::new();
+    for (size, dir) in &size_dirs {
+        for job in plan_outputs(
+            &files,
+            dir.as_deref(),
+            cli.format,
+            template.as_ref(),
+            (!infos.is_empty()).then_some(infos.as_slice()),
+        )? {
+            job_sizes.insert(job.1.clone(), *size);
+            jobs.push(job);
+        }
+    }
     let infos: HashMap<PathBuf, naming::NameInfo> =
         files.iter().map(|f| f.path.clone()).zip(infos).collect();
 
@@ -896,7 +921,7 @@ fn main() -> Result<()> {
         format: cli.format,
         quality: cli.quality,
         max_bytes: cli.max_size,
-        resize: cli.resize,
+        resize: cli.resize.first().copied(),
         aspect: cli.aspect,
         fast: cli.fast,
         exposure: cli.exposure,
@@ -1014,7 +1039,13 @@ fn main() -> Result<()> {
             input_path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
         );
         let result = std::panic::catch_unwind(|| {
-            converter::convert_raw(input_path, output_path, &opts)
+            match job_sizes.get(output_path) {
+                Some(&size) if size != opts.resize => {
+                    let sized = converter::ConvertOptions { resize: size, ..opts.clone() };
+                    converter::convert_raw(input_path, output_path, &sized)
+                }
+                _ => converter::convert_raw(input_path, output_path, &opts),
+            }
         })
         .unwrap_or_else(|_| Err(anyhow!("decoder panicked; the file is probably corrupt")));
 
@@ -1079,7 +1110,9 @@ fn main() -> Result<()> {
     if let Some(path) = &cli.report {
         write_report(path, &mut records)?;
     }
-    if let (true, Some(dir)) = (cli.gallery, cli.output.as_deref()) {
+    // With several sizes, the gallery shows the smallest, in its folder.
+    let gallery_dir = size_dirs.last().and_then(|(_, dir)| dir.clone());
+    if let (true, Some(dir)) = (cli.gallery, gallery_dir.as_deref()) {
         write_gallery(dir, &records, &infos, cli.quiet)?;
     }
 
