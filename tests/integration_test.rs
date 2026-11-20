@@ -684,18 +684,6 @@ fn cli_preview_conflicts_with_development_options() {
 }
 
 #[test]
-fn cli_preview_fails_cleanly_for_a_file_without_a_preview() {
-    let tmp = TempDir::new().unwrap();
-    let input = tmp.path().join("in.png");
-    write_png(&input, [1, 2, 3]);
-    let output = run(&[input.as_ref(), "--preview".as_ref()]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("preview"), "got: {stderr}");
-    assert!(!output.status.success());
-    assert!(!tmp.path().join("in.jpg").exists());
-}
-
-#[test]
 fn cli_look_values_are_validated() {
     let output = run(&["--look".as_ref(), "vivid".as_ref(), "/tmp/fake.arw".as_ref()]);
     assert_eq!(output.status.code(), Some(2));
@@ -1142,4 +1130,16 @@ fn cli_files_from_standard_input_forms_one_run() {
         .collect();
     names.sort();
     assert_eq!(names, ["0001.jpg", "0002.jpg"]);
+}
+
+#[test]
+fn cli_preview_develops_a_file_without_a_preview() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("grey.png");
+    image::RgbImage::from_pixel(64, 64, image::Rgb([100, 100, 100])).save(&input).unwrap();
+    let out_dir = tmp.path().join("out");
+    let output = run(&[input.as_ref(), "--preview".as_ref(), "-o".as_ref(), out_dir.as_ref()]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(out_dir.join("grey.jpg").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("developing the RAW data instead"));
 }

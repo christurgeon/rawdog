@@ -26,6 +26,9 @@ pub struct ConvertOptions {
     pub max_bytes: Option<u64>,
     /// Maximum length of the long edge in pixels.
     pub resize: Option<u32>,
+    /// Crop to this aspect ratio (long side, short side), centred, in the
+    /// orientation of each image. Applied before `resize`.
+    pub aspect: Option<(u32, u32)>,
     /// Scale during RAW decoding instead of after it. Needs `resize`.
     pub fast: bool,
     /// Exposure change in stops (EV).
@@ -74,7 +77,23 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     } = *opts;
 
     let mut source = if opts.preview {
-        Source::Preview(load_preview(input)?)
+        // A file whose preview cannot be read is developed too; if the
+        // file is broken, developing reports why.
+        let Some(preview) = load_preview(input).ok().flatten() else {
+            // Phones, Olympus, and some DNG files store no preview. Develop
+            // those instead of failing, at --fast speed when resizing.
+            eprintln!(
+                "Note: {} has no embedded preview that rawdog can read; developing the RAW data instead",
+                input.display()
+            );
+            let mut developed = opts.clone();
+            developed.preview = false;
+            developed.fast = resize.is_some();
+            developed.metadata.srgb = true;
+            return convert_raw(input, output, &developed);
+        };
+        warn_if_preview_is_small(&preview, resize);
+        Source::Preview(preview)
     } else {
         let mut pipeline = open_pipeline(input)?;
 
@@ -83,7 +102,7 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         // full demosaic followed by a Lanczos resize, and slightly softer.
         // Two extra pixels are requested because `trim_fast_edge` removes
         // one pixel from every side. Very small sizes use the normal path.
-        if let (true, Some(max_edge)) = (fast, resize) {
+        if let (true, Some(max_edge)) = (fast, fast_decode_edge(resize, opts.aspect)) {
             if max_edge >= FAST_MIN_EDGE {
                 pipeline.globals.settings.maxwidth = max_edge as usize + 2;
                 pipeline.globals.settings.maxheight = max_edge as usize + 2;
@@ -184,7 +203,8 @@ impl Source {
         match self {
             Source::Developed(pipeline) => render_8bit(pipeline, input, opts),
             Source::Preview(img) => {
-                let mut img = maybe_resize_8bit(std::mem::take(img), opts.resize);
+                let img = crop_to_aspect(std::mem::take(img), opts.aspect);
+                let mut img = maybe_resize_8bit(img, opts.resize);
                 if let Some(amount) = opts.sharpen {
                     sharpen(&mut img, amount);
                 }
@@ -203,7 +223,7 @@ impl Source {
             Source::Developed(pipeline) => render_16bit_sharpened(pipeline, input, opts),
             Source::Preview(img) => {
                 let wide = image::DynamicImage::ImageRgb8(std::mem::take(img)).into_rgb16();
-                let mut img = maybe_resize_16bit(wide, opts.resize);
+                let mut img = maybe_resize_16bit(crop_to_aspect(wide, opts.aspect), opts.resize);
                 if let Some(amount) = opts.sharpen {
                     sharpen(&mut img, amount);
                 }
@@ -216,7 +236,7 @@ impl Source {
 /// Load the JPEG preview that the camera stored in a RAW file, rotated
 /// upright. Its size depends on the camera: about 1616x1080 for Sony, full
 /// resolution for many Canon and Nikon bodies.
-fn load_preview(input: &Path) -> Result<RgbImage> {
+fn load_preview(input: &Path) -> Result<Option<RgbImage>> {
     use rawler::decoders::RawDecodeParams;
     use rawler::rawsource::RawSource;
 
@@ -243,18 +263,26 @@ fn load_preview(input: &Path) -> Result<RgbImage> {
 
     // rawler can panic on files that are not RAW files.
     let first_line = |e: String| e.lines().next().unwrap_or_default().to_string();
+    // The caller names the file in its message.
     match std::panic::catch_unwind(load) {
-        Ok(Ok(Some(preview))) => Ok(preview),
-        Ok(Ok(None)) => Err(anyhow!(
-            "{} has no embedded preview; convert it without --preview",
-            input.display()
-        )),
-        Ok(Err(e)) => Err(anyhow!(
-            "Cannot read a preview from {}: {}",
-            input.display(),
-            first_line(e)
-        )),
-        Err(_) => Err(anyhow!("Cannot read a preview from {}", input.display())),
+        Ok(Ok(preview)) => Ok(preview),
+        Ok(Err(e)) => Err(anyhow!("cannot read the embedded preview: {}", first_line(e))),
+        Err(_) => Err(anyhow!("cannot read the embedded preview")),
+    }
+}
+
+/// Warn once per run when `--resize` asks for more pixels than a preview
+/// has, because a preview is never enlarged.
+fn warn_if_preview_is_small(preview: &RgbImage, resize: Option<u32>) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let long_edge = preview.width().max(preview.height());
+    if resize.is_some_and(|r| r > long_edge)
+        && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        eprintln!(
+            "Note: embedded previews are smaller than --resize (for example {long_edge} pixels \
+             on the long edge) and are not enlarged; convert without --preview for larger images"
+        );
     }
 }
 
@@ -575,16 +603,19 @@ fn copy_original(input: &Path, output: &Path, with_jpeg: bool) -> Result<()> {
     }
     copy_sidecars(input, output)?;
     if with_jpeg {
-        copy_companions(input, output)?;
+        // The RAW file was just copied, so a camera JPEG already at the
+        // destination may belong to another image ({seq} renumbers).
+        copy_companions(input, output, true)?;
     }
     Ok(())
 }
 
 /// Copy the JPEG or HEIF files that a camera set to RAW+JPEG wrote next to
 /// `input` with the same name, such as `DSC1.JPG` for `DSC1.ARW`. Each copy
-/// keeps its modification time and is compared with the original; an
-/// existing file at the destination is kept.
-fn copy_companions(input: &Path, output: &Path) -> Result<()> {
+/// keeps its modification time and is compared with the original. With
+/// `replace`, an existing file at the destination is replaced; otherwise
+/// it is kept.
+pub fn copy_companions(input: &Path, output: &Path, replace: bool) -> Result<()> {
     const EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "hif", "heic"];
     let (Some(dir), Some(stem)) = (input.parent(), input.file_stem()) else {
         return Ok(());
@@ -605,7 +636,7 @@ fn copy_companions(input: &Path, output: &Path) -> Result<()> {
             continue;
         }
         let destination = output.with_extension(ext);
-        if destination.exists() {
+        if destination.exists() && (!replace || same_contents(&source, &destination)?) {
             continue;
         }
         copy_verified(&source, &destination, true).map_err(|e| {
@@ -749,7 +780,9 @@ fn render_8bit(pipeline: &mut Pipeline, input: &Path, opts: &ConvertOptions) -> 
     let img: RgbImage = ImageBuffer::from_raw(width, height, decoded.data)
         .context("Failed to construct image buffer from decoded data")?;
 
-    let mut img = maybe_resize_8bit(trim_fast_edge(img, opts.resize, opts.fast), opts.resize);
+    let decode_edge = fast_decode_edge(opts.resize, opts.aspect);
+    let img = crop_to_aspect(trim_fast_edge(img, decode_edge, opts.fast), opts.aspect);
+    let mut img = maybe_resize_8bit(img, opts.resize);
     if let Some(amount) = opts.sharpen {
         sharpen(&mut img, amount);
     }
@@ -761,7 +794,7 @@ fn render_16bit_sharpened(
     input: &Path,
     opts: &ConvertOptions,
 ) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
-    let mut img = render_16bit(pipeline, input, opts.resize, opts.fast)?;
+    let mut img = render_16bit(pipeline, input, opts.resize, opts.fast, opts.aspect)?;
     if let Some(amount) = opts.sharpen {
         sharpen(&mut img, amount);
     }
@@ -916,6 +949,7 @@ fn render_16bit(
     input: &Path,
     resize: Option<u32>,
     fast: bool,
+    aspect: Option<(u32, u32)>,
 ) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
     // imagepipe's full pipeline (always used for RAW files) returns linear
     // 16-bit data, while its raster fast path returns the source file's
@@ -936,7 +970,8 @@ fn render_16bit(
             .context("Failed to construct 16-bit image buffer from decoded data")?;
 
     // Resize in linear light, then encode.
-    let mut img = maybe_resize_16bit(trim_fast_edge(img, resize, fast), resize);
+    let trimmed = trim_fast_edge(img, fast_decode_edge(resize, aspect), fast);
+    let mut img = maybe_resize_16bit(crop_to_aspect(trimmed, aspect), resize);
     if is_linear {
         let lut = srgb_encode_lut();
         for v in img.iter_mut() {
@@ -1081,6 +1116,47 @@ where
     }
 }
 
+/// The long edge that `fast` asks the decoder for. A crop to another aspect
+/// ratio removes up to half of the long edge of a 2:1 image, so the decoder
+/// gives twice the size and the crop still fills `resize`.
+fn fast_decode_edge(resize: Option<u32>, aspect: Option<(u32, u32)>) -> Option<u32> {
+    resize.map(|edge| if aspect.is_some() { edge.saturating_mul(2) } else { edge })
+}
+
+/// Crop the centre of `img` to `aspect` (long side, short side), in the
+/// image's own orientation: 4:5 makes a portrait 4:5 and a landscape 5:4.
+fn crop_to_aspect<P>(
+    img: ImageBuffer<P, Vec<P::Subpixel>>,
+    aspect: Option<(u32, u32)>,
+) -> ImageBuffer<P, Vec<P::Subpixel>>
+where
+    P: image::Pixel + 'static,
+{
+    let Some((long_ratio, short_ratio)) = aspect else {
+        return img;
+    };
+    let (width, height) = img.dimensions();
+    let (long, short) = (width.max(height) as u64, width.min(height) as u64);
+    let (long_ratio, short_ratio) = (long_ratio as u64, short_ratio as u64);
+    // Keep the short side and shorten the long side, or the other way round.
+    let (new_long, new_short) = if long * short_ratio > short * long_ratio {
+        ((short * long_ratio + short_ratio / 2) / short_ratio, short)
+    } else {
+        (long, (long * short_ratio + long_ratio / 2) / long_ratio)
+    };
+    let (new_long, new_short) = (new_long.max(1) as u32, new_short.max(1) as u32);
+    let (new_w, new_h) = if width >= height {
+        (new_long, new_short)
+    } else {
+        (new_short, new_long)
+    };
+    if (new_w, new_h) == (width, height) {
+        return img;
+    }
+    let (x, y) = ((width - new_w) / 2, (height - new_h) / 2);
+    image::imageops::crop_imm(&img, x, y, new_w, new_h).to_image()
+}
+
 fn maybe_resize_8bit(
     img: ImageBuffer<Rgb<u8>, Vec<u8>>,
     resize: Option<u32>,
@@ -1155,6 +1231,26 @@ mod tests {
         apply_watermark(&mut img, &mark);
         let v = img.get_pixel(500 - 15 - 50, 500 - 15 - 50)[0];
         assert!((32_000..=33_500).contains(&v), "{v}");
+    }
+
+    #[test]
+    fn crop_to_aspect_follows_the_orientation() {
+        let landscape = RgbImage::new(6000, 4000);
+        assert_eq!(crop_to_aspect(landscape.clone(), Some((5, 4))).dimensions(), (5000, 4000));
+        assert_eq!(crop_to_aspect(landscape.clone(), Some((16, 9))).dimensions(), (6000, 3375));
+        assert_eq!(crop_to_aspect(landscape.clone(), Some((1, 1))).dimensions(), (4000, 4000));
+        assert_eq!(crop_to_aspect(landscape.clone(), Some((3, 2))).dimensions(), (6000, 4000));
+        assert_eq!(crop_to_aspect(landscape, None).dimensions(), (6000, 4000));
+        let portrait = RgbImage::new(4000, 6000);
+        assert_eq!(crop_to_aspect(portrait, Some((5, 4))).dimensions(), (4000, 5000));
+    }
+
+    #[test]
+    fn crop_to_aspect_keeps_the_centre() {
+        let img = RgbImage::from_fn(30, 10, |x, _| image::Rgb([x as u8, 0, 0]));
+        let out = crop_to_aspect(img, Some((1, 1)));
+        assert_eq!(out.dimensions(), (10, 10));
+        assert_eq!(out.get_pixel(0, 0)[0], 10);
     }
 
     // -----------------------------------------------------------------------
@@ -1358,7 +1454,7 @@ mod tests {
 
         let mut p16 = Pipeline::new_from_file(&png).unwrap();
         p16.globals.settings.use_fastpath = false;
-        let out16 = render_16bit(&mut p16, &png, None, false).unwrap();
+        let out16 = render_16bit(&mut p16, &png, None, false, None).unwrap();
 
         let (m8, m16) = (mean_u8(&out8.data), mean_u16_as_u8(out16.as_raw()));
         assert!(
@@ -1375,7 +1471,7 @@ mod tests {
         let png = write_gradient_png(tmp.path());
 
         let mut p16 = Pipeline::new_from_file(&png).unwrap();
-        let out16 = render_16bit(&mut p16, &png, None, false).unwrap();
+        let out16 = render_16bit(&mut p16, &png, None, false, None).unwrap();
         let expected = image::open(&png).unwrap().to_rgb16();
         assert_eq!(out16.as_raw(), expected.as_raw());
     }
@@ -1492,6 +1588,9 @@ mod tests {
         assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
 
         let out = tmp.path().join("archive");
+        // A JPEG of another image at the destination is replaced.
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("2024_DSC1.JPG"), b"another image").unwrap();
         copy_original(&input, &out.join("2024_DSC1.ARW"), true).unwrap();
         let mut names: Vec<String> = std::fs::read_dir(&out)
             .unwrap()
@@ -1502,6 +1601,14 @@ mod tests {
         let copied = out.join("2024_DSC1.JPG");
         assert_eq!(std::fs::read(&copied).unwrap(), b"jpeg");
         assert_eq!(std::fs::metadata(&copied).unwrap().modified().unwrap(), old);
+
+        // Without `replace`, a missing companion is added and an existing
+        // one is kept.
+        std::fs::remove_file(out.join("2024_DSC1.HIF")).unwrap();
+        std::fs::write(&copied, b"kept").unwrap();
+        copy_companions(&input, &out.join("2024_DSC1.ARW"), false).unwrap();
+        assert_eq!(std::fs::read(out.join("2024_DSC1.HIF")).unwrap(), b"heif");
+        assert_eq!(std::fs::read(&copied).unwrap(), b"kept");
     }
 
     #[test]
@@ -1577,6 +1684,7 @@ mod tests {
             quality: 92,
             max_bytes: None,
             resize,
+            aspect: None,
             fast: false,
             exposure: None,
             white_balance: None,
@@ -1723,6 +1831,7 @@ mod tests {
                 quality: 92,
                 max_bytes: None,
                 resize: None,
+                aspect: None,
                 fast: false,
                 exposure: None,
                 white_balance: None,
@@ -1751,6 +1860,7 @@ mod tests {
                 quality: 92,
                 max_bytes: None,
                 resize: None,
+                aspect: None,
                 fast: false,
                 exposure: None,
                 white_balance: None,

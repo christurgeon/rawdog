@@ -47,6 +47,7 @@ struct Cli {
 
     /// Read more inputs from this file, one path per line; "-" reads
     /// standard input, as in `find ... | rawdog --files-from - -o out`.
+    /// Relative paths are relative to the current directory.
     /// All inputs form one run, so --name {seq}, --report, and --gallery
     /// cover them all
     #[arg(long, value_name = "FILE")]
@@ -142,6 +143,12 @@ struct Cli {
     /// Resize long edge to this many pixels, preserving aspect ratio
     #[arg(short, long, value_parser = clap::value_parser!(u32).range(1..))]
     resize: Option<u32>,
+
+    /// Crop the centre to this aspect ratio, such as 4:5, 16:9, or 1:1. The
+    /// ratio follows each image's orientation (4:5 makes a landscape 5:4).
+    /// --resize applies to the cropped image
+    #[arg(long, value_name = "W:H", value_parser = aspect_ratio)]
+    aspect: Option<(u32, u32)>,
 
     /// Scale during RAW decoding when --resize is set. Several times
     /// faster and slightly softer; intended for proofs and culling
@@ -544,6 +551,15 @@ fn byte_size(s: &str) -> Result<u64, String> {
     }
 }
 
+/// An aspect ratio such as "4:5" or "16x9", as (long side, short side).
+fn aspect_ratio(s: &str) -> Result<(u32, u32), String> {
+    let error = || "must be a ratio such as 4:5, 16:9, or 1:1".to_string();
+    let (a, b) = s.split_once([':', 'x', 'X']).ok_or_else(error)?;
+    let parse = |v: &str| v.trim().parse::<u32>().ok().filter(|v| (1..=100).contains(v));
+    let (a, b) = (parse(a).ok_or_else(error)?, parse(b).ok_or_else(error)?);
+    Ok((a.max(b), a.min(b)))
+}
+
 fn tint_value(s: &str) -> Result<f32, String> {
     match s.parse::<f32>() {
         Ok(v) if (0.5..=2.0).contains(&v) => Ok(v),
@@ -596,6 +612,7 @@ fn main() -> Result<()> {
         let image_options = [
             ("--max-size", cli.max_size.is_some()),
             ("--resize", cli.resize.is_some()),
+            ("--aspect", cli.aspect.is_some()),
             ("--fast", cli.fast),
             ("--preview", cli.preview),
             ("--exposure", cli.exposure.is_some()),
@@ -676,6 +693,11 @@ fn main() -> Result<()> {
         bail!("No RAW files found in the provided inputs.");
     }
 
+    // Before selection and naming, which read the metadata of every file
+    // and take a while on a memory card.
+    if !cli.quiet && !cli.dry_run {
+        println!("Found {} RAW file(s)", files.len());
+    }
     let stems: Vec<String> = files
         .iter()
         .map(|f| f.path.file_stem().unwrap_or_default().to_string_lossy().into_owned())
@@ -817,15 +839,12 @@ fn main() -> Result<()> {
         }
     };
 
-    if !cli.quiet {
-        println!("Found {} RAW file(s)", files.len());
-    }
-
     let opts = converter::ConvertOptions {
         format: cli.format,
         quality: cli.quality,
         max_bytes: cli.max_size,
         resize: cli.resize,
+        aspect: cli.aspect,
         fast: cli.fast,
         exposure: cli.exposure,
         white_balance: cli.wb.map(|kelvin| (kelvin, cli.tint)),
@@ -897,6 +916,18 @@ fn main() -> Result<()> {
         }
 
         if should_skip(input_path, output_path, cli.overwrite, cli.update) {
+            // A RAW file archived earlier may lack its camera JPEG, because
+            // --with-jpeg was not given then or the copy failed.
+            if opts.with_jpeg {
+                if let Err(e) = converter::copy_companions(input_path, output_path, false) {
+                    eprintln!("Error converting {}: {:#}", input_path.display(), e);
+                    record(input_path, output_path, report::Status::Failed, format!("{e:#}"), 0.0);
+                    failures.lock().unwrap().push(input_path.clone());
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    pb.inc(1);
+                    return;
+                }
+            }
             record(
                 input_path,
                 output_path,
@@ -912,6 +943,9 @@ fn main() -> Result<()> {
         // The RAW decoder can panic on corrupt files. Report that as a
         // failure of this file instead of aborting the batch.
         let started = std::time::Instant::now();
+        pb.set_message(
+            input_path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        );
         let result = std::panic::catch_unwind(|| {
             converter::convert_raw(input_path, output_path, &opts)
         })
@@ -959,6 +993,12 @@ fn main() -> Result<()> {
 
     if !cli.quiet {
         println!("{s} succeeded, {f} failed, {sk} skipped");
+        if sk > 0 && !cli.update {
+            println!(
+                "Skipped files already have an output; --overwrite replaces it, and --update \
+                 replaces it when the RAW file is newer."
+            );
+        }
     }
 
     let mut records = records.into_inner().unwrap();
@@ -1191,7 +1231,8 @@ fn canonical(path: &Path) -> PathBuf {
 /// The paths of a `--files-from` list: one per line. Spaces are kept, as
 /// they can be part of a name; empty lines and Windows line ends are not.
 fn input_list(text: &str) -> Vec<PathBuf> {
-    text.lines()
+    text.trim_start_matches('\u{feff}')
+        .lines()
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
         .filter(|line| !line.trim().is_empty())
         .map(PathBuf::from)
@@ -1509,6 +1550,16 @@ mod tests {
     }
 
     #[test]
+    fn aspect_ratio_parses_both_orders() {
+        assert_eq!(aspect_ratio("4:5"), Ok((5, 4)));
+        assert_eq!(aspect_ratio("16x9"), Ok((16, 9)));
+        assert_eq!(aspect_ratio("1:1"), Ok((1, 1)));
+        for bad in ["", "4", "4:", "0:1", "4:5:6", "a:b", "101:1"] {
+            assert!(aspect_ratio(bad).is_err(), "{bad} was accepted");
+        }
+    }
+
+    #[test]
     fn byte_size_accepts_decimal_units() {
         assert_eq!(byte_size("800000"), Ok(800_000));
         assert_eq!(byte_size("2MB"), Ok(2_000_000));
@@ -1638,7 +1689,7 @@ mod tests {
     #[test]
     fn input_list_keeps_spaces_and_skips_empty_lines() {
         assert_eq!(
-            input_list("a/IMG 1.CR3\r\n\n  \nb.ARW\n"),
+            input_list("\u{feff}a/IMG 1.CR3\r\n\n  \nb.ARW\n"),
             [PathBuf::from("a/IMG 1.CR3"), PathBuf::from("b.ARW")]
         );
     }

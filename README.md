@@ -45,6 +45,12 @@ rawdog photo.ARW -f tiff          # 16-bit TIFF
 rawdog ./photos/ -f png -r 2048   # 16-bit PNG, resized
 ```
 
+`--aspect` crops the centre of each image to a ratio before the resize. The ratio follows each image's orientation, so `4:5` makes portraits 1080x1350 and landscapes 1350x1080 here:
+
+```sh
+rawdog ./trip --aspect 4:5 -r 1350
+```
+
 Resized images look soft; `--sharpen` adds output sharpening, with an optional amount from 0 to 3 (default 0.5):
 
 ```sh
@@ -73,7 +79,7 @@ rawdog ./reception --exposure 0.67 --wb 3400
 
 ### Culling and proofs
 
-`--preview` writes the JPEG preview that the camera embedded in each RAW file, with the camera's own colours. It is the fastest way to look through a card. The size depends on the camera: 1616x1080 for Sony bodies, full resolution for many Canon and Nikon bodies.
+`--preview` writes the JPEG preview that the camera embedded in each RAW file, with the camera's own colours. It is the fastest way to look through a card. A file without a preview that rawdog can read (phones, Olympus, some DNG files) is developed instead, with a note. A preview is never enlarged, so `-r` larger than the preview has no effect. The size depends on the camera: 1616x1080 for Sony bodies, full resolution for many Canon and Nikon bodies.
 
 ```sh
 rawdog -R /Volumes/CARD --preview -o ./proofs
@@ -137,9 +143,9 @@ Dates are the camera clock's local date. A file without the metadata that a filt
 rawdog -R /Volumes/CARD -o ~/Pictures --name "{date}/{model}_{stem}"
 ```
 
-Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), `{model}`, `{lens}`, `{serial}` (the body's serial number, to keep two bodies of one model apart), `{rating}` (0 for unrated), and `{seq}`. A file without that metadata gets `unknown`; some cameras, such as Sony bodies, do not record the serial number in standard metadata. Characters that are not allowed in file names on exFAT drives or Windows (`/ \ : | * ? " < >`) become `_`.
+Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), `{model}`, `{lens}`, `{serial}` (the body's serial number, to keep two bodies of one model apart), `{rating}` (0 for unrated, `rejected` for a file rejected in Lightroom), and `{seq}`. A file without that metadata gets `unknown`; some cameras, such as Sony bodies, do not record the serial number in standard metadata. Characters that are not allowed in file names on exFAT drives or Windows (`/ \ : | * ? " < >`) become `_`.
 
-`{seq}` numbers the files of the run in capture order (0001, 0002, ...). Two bodies at a wedding both write `DSC00001`, and a burst puts several frames in one second; with `{seq}` the files of both cameras get one sequence and never share a name:
+`{seq}` numbers the files of the run in capture order (0001, 0002, ...). Numbers have four digits, or more when they pass 9999; a name with five digits does not sort after one with four, so keep a numbering below 10,000 files. Two bodies at a wedding both write `DSC00001`, and a burst puts several frames in one second; with `{seq}` the files of both cameras get one sequence and never share a name:
 
 ```sh
 rawdog -R /Volumes/CARD_A /Volumes/CARD_B -o ./wedding --name "{date}/{seq}_{stem}"
@@ -167,7 +173,7 @@ The template path is below the `-o` directory. Without `-o` it is below the dire
 rawdog -R /Volumes/CARD -f original -o ~/Archive --name "{year}/{date}/{stem}"
 ```
 
-Each copy is compared byte for byte with the original and keeps its modification time; the card is never changed. XMP sidecars (`NAME.xmp` from Lightroom or Capture One, `NAME.ARW.xmp` from darktable) are copied with their RAW file, and a sidecar that already exists in the archive is kept. With `--with-jpeg`, the JPEG or HEIF that a camera set to RAW+JPEG wrote next to each RAW file (`DSC1.JPG` or `DSC1.HIF` for `DSC1.ARW`) is copied and checked in the same way. Image options such as `-r` cannot be used with `-f original`.
+Each copy is compared byte for byte with the original and keeps its modification time; the card is never changed. XMP sidecars (`NAME.xmp` from Lightroom or Capture One, `NAME.ARW.xmp` from darktable) are copied with their RAW file, and a sidecar that already exists in the archive is kept. With `--with-jpeg`, the JPEG or HEIF that a camera set to RAW+JPEG wrote next to each RAW file (`DSC1.JPG` or `DSC1.HIF` for `DSC1.ARW`) is copied and checked in the same way. It replaces a file of the same name at the destination, so it always matches its RAW file; for a RAW file already in the archive, a missing JPEG is added. Image options such as `-r` cannot be used with `-f original`.
 
 ### Metadata
 
