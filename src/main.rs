@@ -258,6 +258,13 @@ struct Cli {
     #[arg(short, long, value_parser = clap::value_parser!(u32).range(1..))]
     jobs: Option<u32>,
 
+    /// Keep running and convert new files as they arrive, checking every
+    /// SECONDS (default 5), for tethered or event shooting. Stop with Ctrl-C
+    #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "5",
+          conflicts_with_all = ["dry_run", "files_from"],
+          value_parser = clap::value_parser!(u64).range(1..=3600))]
+    watch: Option<u64>,
+
     /// Print errors only
     #[arg(long)]
     quiet: bool,
@@ -328,6 +335,41 @@ fn write_gallery(
         println!("Gallery: {}", page.display());
     }
     Ok(())
+}
+
+/// Set for the runs that `--watch` starts.
+const WATCH_ROUND: &str = "RAWDOG_WATCH_ROUND";
+
+/// How long a file must be unchanged before a watch round converts it.
+const WATCH_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// `--watch`: run rawdog with the same arguments every `interval` seconds
+/// until interrupted. Each run converts only new files, because existing
+/// outputs are skipped. A run that finds nothing new prints nothing.
+fn watch(args: &[std::ffi::OsString], interval: u64, quiet: bool) -> Result<()> {
+    let exe = std::env::current_exe().context("Cannot find the rawdog program")?;
+    if !quiet {
+        println!("Watching for new RAW files every {interval} s; press Ctrl-C to stop.");
+    }
+    loop {
+        // The arguments already contain the defaults file.
+        let round = std::process::Command::new(&exe)
+            .args(&args[1..])
+            .arg("--no-defaults")
+            .env(WATCH_ROUND, "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .context("Failed to start a watch round")?;
+        let stdout = String::from_utf8_lossy(&round.stdout);
+        let stderr = String::from_utf8_lossy(&round.stderr);
+        let idle = stdout.lines().any(|l| l.starts_with("0 succeeded, 0 failed"))
+            || stderr.contains("No RAW files found");
+        if !idle {
+            print!("{stdout}");
+            eprint!("{stderr}");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(interval));
+    }
 }
 
 /// The defaults file: `$RAWDOG_DEFAULTS`, else `$XDG_CONFIG_HOME/rawdog/defaults`,
@@ -606,7 +648,11 @@ fn main() -> Result<()> {
             args.splice(1..1, defaults.into_iter().map(Into::into));
         }
     }
-    let cli = Cli::parse_from(args);
+    let cli = Cli::parse_from(&args);
+
+    if let Some(interval) = cli.watch.filter(|_| std::env::var_os(WATCH_ROUND).is_none()) {
+        return watch(&args, interval, cli.quiet);
+    }
 
     // Handle shell completion generation
     if let Some(shell) = cli.completions {
@@ -722,7 +768,18 @@ fn main() -> Result<()> {
         }
         inputs.extend(listed);
     }
-    let files = collect_raw_files(&inputs, cli.recursive)?;
+    let mut files = collect_raw_files(&inputs, cli.recursive)?;
+    if std::env::var_os(WATCH_ROUND).is_some() {
+        // A file that changed in the last seconds may still be copying.
+        let settled = |f: &InputFile| {
+            std::fs::metadata(&f.path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age >= WATCH_SETTLE)
+        };
+        files.retain(settled);
+    }
     // Same condition under which collect_raw_files warns "does not exist".
     let missing_inputs = inputs.iter().any(|p| !p.is_dir() && !p.is_file());
 
@@ -1098,7 +1155,7 @@ fn main() -> Result<()> {
 
     if !cli.quiet {
         println!("{s} succeeded, {f} failed, {sk} skipped");
-        if sk > 0 && !cli.update {
+        if sk > 0 && !cli.update && std::env::var_os(WATCH_ROUND).is_none() {
             println!(
                 "Skipped files already have an output; --overwrite replaces it, and --update \
                  replaces it when the RAW file is newer."
@@ -1780,6 +1837,15 @@ mod tests {
         let cli = Cli::try_parse_from(["rawdog", "--time-shift", "-1h", "x.arw"]).unwrap();
         assert_eq!(cli.time_shift.unwrap().seconds_for(None), -3_600);
         assert!(Cli::try_parse_from(["rawdog", "--time-shift", "soon", "x.arw"]).is_err());
+    }
+
+    #[test]
+    fn watch_option_defaults_to_five_seconds() {
+        let cli = Cli::try_parse_from(["rawdog", "in", "--watch"]).unwrap();
+        assert_eq!(cli.watch, Some(5));
+        let cli = Cli::try_parse_from(["rawdog", "in", "--watch", "30"]).unwrap();
+        assert_eq!(cli.watch, Some(30));
+        assert!(Cli::try_parse_from(["rawdog", "in", "--watch", "--dry-run"]).is_err());
     }
 
     #[test]
