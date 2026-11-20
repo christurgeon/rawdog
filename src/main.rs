@@ -687,6 +687,11 @@ fn main() -> Result<()> {
         bail!("No RAW files found in the provided inputs.");
     }
 
+    // Before selection and naming, which read the metadata of every file
+    // and take a while on a memory card.
+    if !cli.quiet && !cli.dry_run {
+        println!("Found {} RAW file(s)", files.len());
+    }
     let stems: Vec<String> = files
         .iter()
         .map(|f| f.path.file_stem().unwrap_or_default().to_string_lossy().into_owned())
@@ -828,10 +833,6 @@ fn main() -> Result<()> {
         }
     };
 
-    if !cli.quiet {
-        println!("Found {} RAW file(s)", files.len());
-    }
-
     let opts = converter::ConvertOptions {
         format: cli.format,
         quality: cli.quality,
@@ -935,6 +936,9 @@ fn main() -> Result<()> {
         // The RAW decoder can panic on corrupt files. Report that as a
         // failure of this file instead of aborting the batch.
         let started = std::time::Instant::now();
+        pb.set_message(
+            input_path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        );
         let result = std::panic::catch_unwind(|| {
             converter::convert_raw(input_path, output_path, &opts)
         })
@@ -982,6 +986,12 @@ fn main() -> Result<()> {
 
     if !cli.quiet {
         println!("{s} succeeded, {f} failed, {sk} skipped");
+        if sk > 0 && !cli.update {
+            println!(
+                "Skipped files already have an output; --overwrite replaces it, and --update \
+                 replaces it when the RAW file is newer."
+            );
+        }
     }
 
     let mut records = records.into_inner().unwrap();
