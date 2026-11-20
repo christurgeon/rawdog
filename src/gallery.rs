@@ -16,6 +16,8 @@ pub struct Caption {
     pub name: String,
     pub taken: Option<String>,
     pub model: Option<String>,
+    /// Exposure settings, such as "1/250 s · f/2.8 · ISO 800".
+    pub exposure: Option<String>,
     pub rating: Option<i8>,
 }
 
@@ -110,6 +112,9 @@ pub fn render(title: &str, page_dir: &Path, entries: &[Entry]) -> String {
         if let Some(model) = &c.model {
             details.push(escape(model));
         }
+        if let Some(exposure) = &c.exposure {
+            details.push(escape(exposure));
+        }
         if let Some(r) = c.rating.filter(|r| *r > 0) {
             details.push("★".repeat(r as usize));
         }
@@ -200,6 +205,7 @@ mod tests {
                 name: name.to_string(),
                 taken: Some("2026-11-14 18:02".to_string()),
                 model: Some("ILCE-7M4".to_string()),
+                exposure: None,
                 rating: Some(3),
             },
         }

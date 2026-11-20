@@ -99,7 +99,7 @@ rawdog -R /Volumes/CARD --preview -o ./proofs
 rawdog ./card -r 2048 --fast -o ./proofs
 ```
 
-`--gallery` writes `gallery.html` into the output directory: a page of the output images with file name, capture time, camera, and rating. It works offline and on a phone. Large images are shown as small copies in `gallery-thumbs/`, and each links to the full image, so the page stays fast with full-size output:
+`--gallery` writes `gallery.html` into the output directory: a page of the output images with file name, capture time, camera, exposure (1/250 s · f/2.8 · ISO 800 · 70 mm), and rating. It works offline and on a phone. Large images are shown as small copies in `gallery-thumbs/`, and each links to the full image, so the page stays fast with full-size output:
 
 ```sh
 rawdog ./wedding -r 1600 --fast -o ./proofs --gallery
@@ -159,6 +159,7 @@ rawdog -R /Volumes/CARD -o ~/Pictures --name "{date}/{model}_{stem}"
 | `{time}` | capture time: 070542 |
 | `{model}`, `{lens}` | camera model, lens model |
 | `{serial}` | the body's serial number, to keep two bodies of one model apart |
+| `{shutter}`, `{aperture}`, `{iso}`, `{focal}` | exposure: 1-250s, f2.8, 800, 70mm |
 | `{rating}` | 1 to 5, 0 for unrated, `rejected` for a file rejected in Lightroom |
 | `{label}` | colour label in lower case, `none` without one |
 | `{seq}` | number in capture order: 0001, 0002, ... |
