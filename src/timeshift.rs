@@ -145,6 +145,14 @@ pub fn add_seconds(taken: Taken, seconds: i64) -> Taken {
     )
 }
 
+/// The current year (UTC).
+pub fn current_year() -> u16 {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    add_seconds((1970, 1, 1, 0, 0, 0), seconds).0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +190,11 @@ mod tests {
         for bad in ["=+1h", "7M4=+1h,7m4=+2h", "+1h,-1h", "7M4=", "7M4"] {
             assert!(bad.parse::<TimeShift>().is_err(), "{bad} was accepted");
         }
+    }
+
+    #[test]
+    fn current_year_is_plausible() {
+        assert!((2026..2100).contains(&current_year()));
     }
 
     #[test]

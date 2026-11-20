@@ -376,9 +376,29 @@ fn fields_for_output<'a>(
         ifd_num: exif::In::PRIMARY,
         value: exif::Value::Ascii(vec![text.as_bytes().to_vec()]),
     };
+    // `{year}` in the copyright is the capture year, or the current year
+    // for a file without a capture date.
+    let copyright = meta.copyright.as_ref().map(|text| {
+        if !text.contains("{year}") {
+            return text.clone();
+        }
+        let year = [Tag::DateTimeOriginal, Tag::DateTime]
+            .iter()
+            .find_map(|tag| {
+                let field = fields.clone().find(|f| f.tag == *tag && f.ifd_num == exif::In::PRIMARY)?;
+                let exif::Value::Ascii(texts) = &field.value else {
+                    return None;
+                };
+                let d = exif::DateTime::from_ascii(texts.first()?).ok()?;
+                let taken = (d.year, d.month, d.day, d.hour, d.minute, d.second);
+                Some(crate::timeshift::add_seconds(taken, shift_seconds).0)
+            })
+            .unwrap_or_else(crate::timeshift::current_year);
+        text.replace("{year}", &year.to_string())
+    });
     let added = [
         meta.artist.as_ref().map(|t| text_field(Tag::Artist, t)),
-        meta.copyright.as_ref().map(|t| text_field(Tag::Copyright, t)),
+        copyright.as_ref().map(|t| text_field(Tag::Copyright, t)),
     ];
 
     fields
@@ -846,6 +866,32 @@ mod tests {
         let out = fields_for_output(source.iter(), (300, 200), &meta);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].display_value().to_string(), "\"New\"");
+    }
+
+    #[test]
+    fn copyright_year_is_the_shifted_capture_year() {
+        use exif::{In, Tag, Value};
+        let source = [field(
+            Tag::DateTimeOriginal,
+            In::PRIMARY,
+            Value::Ascii(vec![b"2025:12:31 23:30:00".to_vec()]),
+        )];
+        let meta = |shift: Option<&str>| MetadataOptions {
+            copyright: Some("(c) {year} J. Doe, {stem}".to_string()),
+            time_shift: shift.map(|s| s.parse().unwrap()),
+            ..Default::default()
+        };
+        let copyright = |out: Vec<exif::Field>| {
+            out.into_iter().find(|f| f.tag == Tag::Copyright).unwrap().display_value().to_string()
+        };
+        let out = fields_for_output(source.iter(), (300, 200), &meta(None));
+        assert_eq!(copyright(out), "\"(c) 2025 J. Doe, {stem}\"");
+        let out = fields_for_output(source.iter(), (300, 200), &meta(Some("+1h")));
+        assert_eq!(copyright(out), "\"(c) 2026 J. Doe, {stem}\"");
+        let none: [exif::Field; 0] = [];
+        let out = fields_for_output(none.iter(), (300, 200), &meta(None));
+        let year = crate::timeshift::current_year();
+        assert_eq!(copyright(out), format!("\"(c) {year} J. Doe, {{stem}}\""));
     }
 
     #[test]
