@@ -237,8 +237,10 @@ fn write_gallery(
         .par_iter()
         .map(|r| {
             let info = naming::NameInfo::read(&r.input, true).shifted(shift);
+            let image = r.output.clone().unwrap_or_default();
             gallery::Entry {
-                image: r.output.clone().unwrap_or_default(),
+                thumbnail: gallery::thumbnail(dir, &image),
+                image,
                 caption: gallery::Caption {
                     name: r
                         .input
