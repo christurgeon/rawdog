@@ -17,6 +17,8 @@ pub struct MetadataOptions {
     /// The output pixels are sRGB, whatever colour space the camera was set
     /// to. False for `--preview`, which keeps the camera's own encoding.
     pub srgb: bool,
+    /// Correction of the camera clock, applied to the capture dates.
+    pub time_shift: Option<crate::timeshift::TimeShift>,
 }
 
 /// An sRGB ICC profile, generated once.
@@ -346,11 +348,24 @@ fn value_size(value: &exif::Value) -> usize {
 /// - `meta` can remove GPS fields or all source fields, and can set the
 ///   Artist and Copyright tags.
 fn fields_for_output<'a>(
-    fields: impl Iterator<Item = &'a exif::Field>,
+    fields: impl Iterator<Item = &'a exif::Field> + Clone,
     (width, height): (u32, u32),
     meta: &MetadataOptions,
 ) -> Vec<exif::Field> {
     use exif::{Context, Tag};
+
+    let shift_seconds = meta.time_shift.as_ref().map_or(0, |shift| {
+        let model = fields
+            .clone()
+            .find(|f| f.tag == Tag::Model && f.ifd_num == exif::In::PRIMARY)
+            .map(|f| match &f.value {
+                exif::Value::Ascii(v) => {
+                    String::from_utf8_lossy(v.first().map_or(&[][..], |v| v)).trim().to_string()
+                }
+                _ => String::new(),
+            });
+        shift.seconds_for(model.as_deref())
+    });
 
     let replaced = |tag: Tag| {
         (tag == Tag::Artist && meta.artist.is_some())
@@ -382,12 +397,33 @@ fn fields_for_output<'a>(
                 exif::Tag::PixelXDimension => field.value = exif::Value::Long(vec![width]),
                 exif::Tag::PixelYDimension => field.value = exif::Value::Long(vec![height]),
                 exif::Tag::ColorSpace if meta.srgb => field.value = exif::Value::Short(vec![1]),
+                Tag::DateTimeOriginal | Tag::DateTimeDigitized | Tag::DateTime
+                    if shift_seconds != 0 =>
+                {
+                    if let Some(shifted) = shift_date_value(&field.value, shift_seconds) {
+                        field.value = shifted;
+                    }
+                }
                 _ => {}
             }
             field
         })
         .chain(added.into_iter().flatten())
         .collect()
+}
+
+/// An EXIF date value ("YYYY:MM:DD HH:MM:SS") moved by `seconds`.
+fn shift_date_value(value: &exif::Value, seconds: i64) -> Option<exif::Value> {
+    let exif::Value::Ascii(texts) = value else {
+        return None;
+    };
+    let d = exif::DateTime::from_ascii(texts.first()?).ok()?;
+    let (y, mo, day, h, mi, s) = crate::timeshift::add_seconds(
+        (d.year, d.month, d.day, d.hour, d.minute, d.second),
+        seconds,
+    );
+    let text = format!("{y:04}:{mo:02}:{day:02} {h:02}:{mi:02}:{s:02}");
+    Some(exif::Value::Ascii(vec![text.into_bytes()]))
 }
 
 /// Write a 16-bit RGB TIFF file that carries the given EXIF fields.
@@ -853,6 +889,33 @@ mod tests {
             tags(&out),
             vec![Tag::ImageDescription, Tag::Model, Tag::ISOSpeed]
         );
+    }
+
+    #[test]
+    fn fields_for_output_shifts_capture_dates_for_the_camera() {
+        use exif::{In, Tag, Value};
+        let date = |tag| field(tag, In::PRIMARY, Value::Ascii(vec![b"2026:11:14 23:30:00".to_vec()]));
+        let source = [
+            field(Tag::Model, In::PRIMARY, Value::Ascii(vec![b"ILCE-7M4".to_vec()])),
+            date(Tag::DateTimeOriginal),
+            date(Tag::DateTimeDigitized),
+            date(Tag::DateTime),
+            field(Tag::OffsetTimeOriginal, In::PRIMARY, Value::Ascii(vec![b"+01:00".to_vec()])),
+        ];
+        let meta = |shift: &str| MetadataOptions {
+            time_shift: Some(shift.parse().unwrap()),
+            ..Default::default()
+        };
+        let text = |out: &[exif::Field], tag| {
+            out.iter().find(|f| f.tag == tag).unwrap().display_value().to_string()
+        };
+        let out = fields_for_output(source.iter(), (300, 200), &meta("7M4=+1h,Z 6=-1h"));
+        for tag in [Tag::DateTimeOriginal, Tag::DateTimeDigitized, Tag::DateTime] {
+            assert_eq!(text(&out, tag), "2026-11-15 00:30:00");
+        }
+        assert_eq!(text(&out, Tag::OffsetTimeOriginal), "\"+01:00\"");
+        let out = fields_for_output(source.iter(), (300, 200), &meta("Z 6=-1h"));
+        assert_eq!(text(&out, Tag::DateTimeOriginal), "2026-11-14 23:30:00");
     }
 
     #[test]

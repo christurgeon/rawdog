@@ -87,8 +87,7 @@ impl FromStr for NameTemplate {
     }
 }
 
-/// Capture time as (year, month, day, hour, minute, second).
-type Taken = (u16, u8, u8, u8, u8, u8);
+use crate::timeshift::Taken;
 
 /// The values of one input file that a template can use.
 #[derive(Debug, Default, PartialEq)]
@@ -141,6 +140,16 @@ impl NameInfo {
         info.rating = read_rating(path, &fields);
         info.labels = read_labels(path, &fields);
         info
+    }
+}
+
+impl NameInfo {
+    /// The info with its capture time corrected by `shift`.
+    pub fn shifted(mut self, shift: Option<&crate::timeshift::TimeShift>) -> NameInfo {
+        if let (Some(shift), Some(taken)) = (shift, self.taken) {
+            self.taken = Some(shift.apply(taken, self.model.as_deref()));
+        }
+        self
     }
 }
 

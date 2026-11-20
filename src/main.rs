@@ -3,6 +3,7 @@ mod exif;
 mod gallery;
 mod naming;
 mod report;
+mod timeshift;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -86,6 +87,13 @@ struct Cli {
     /// (not case-sensitive), for example "7M4" or "Z 6"
     #[arg(long, value_name = "MODEL", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     camera: Option<String>,
+
+    /// Correct a camera clock that was set wrong: "+1h", "-30m", "+3m12s",
+    /// or per camera model "7M4=+3m12s,Z 6=-1h". Changes the capture time
+    /// used by --name, --since, --until, and --gallery, and the dates in the
+    /// output metadata
+    #[arg(long, value_name = "OFFSET", allow_hyphen_values = true)]
+    time_shift: Option<timeshift::TimeShift>,
 
     /// Convert only the files named in this file, such as a list a client
     /// sent back from the gallery. Names are separated by lines, commas,
@@ -213,7 +221,12 @@ fn float_in_range<const MIN: i32, const MAX: i32>(s: &str) -> Result<f32, String
 }
 
 /// Write `dir/gallery.html` for the outputs that exist after the run.
-fn write_gallery(dir: &Path, records: &[report::Record], quiet: bool) -> Result<()> {
+fn write_gallery(
+    dir: &Path,
+    records: &[report::Record],
+    shift: Option<&timeshift::TimeShift>,
+    quiet: bool,
+) -> Result<()> {
     let mut shown: Vec<&report::Record> = records
         .iter()
         .filter(|r| matches!(r.status, report::Status::Converted | report::Status::Skipped))
@@ -223,7 +236,7 @@ fn write_gallery(dir: &Path, records: &[report::Record], quiet: bool) -> Result<
     let entries: Vec<gallery::Entry> = shown
         .par_iter()
         .map(|r| {
-            let info = naming::NameInfo::read(&r.input, true);
+            let info = naming::NameInfo::read(&r.input, true).shifted(shift);
             gallery::Entry {
                 image: r.output.clone().unwrap_or_default(),
                 caption: gallery::Caption {
@@ -627,7 +640,10 @@ fn main() -> Result<()> {
         let needs_exif = selection.needs_exif();
         let excluded: Vec<Option<String>> = files
             .par_iter()
-            .map(|f| selection.exclusion(&naming::NameInfo::read(&f.path, needs_exif)))
+            .map(|f| {
+                let info = naming::NameInfo::read(&f.path, needs_exif);
+                selection.exclusion(&info.shifted(cli.time_shift.as_ref()))
+            })
             .collect();
         let (kept, dropped): (Vec<_>, Vec<_>) =
             files.into_iter().zip(excluded).partition(|(_, reason)| reason.is_none());
@@ -670,6 +686,7 @@ fn main() -> Result<()> {
         cli.output.as_deref(),
         cli.format,
         cli.name.as_ref(),
+        cli.time_shift.as_ref(),
     )?;
 
     let dir_names = DirNames::default();
@@ -740,6 +757,7 @@ fn main() -> Result<()> {
             artist: cli.artist.clone(),
             copyright: cli.copyright.clone(),
             srgb: !cli.preview,
+            time_shift: cli.time_shift.clone(),
         },
     };
 
@@ -865,7 +883,7 @@ fn main() -> Result<()> {
         write_report(path, &mut records)?;
     }
     if let (true, Some(dir)) = (cli.gallery, cli.output.as_deref()) {
-        write_gallery(dir, &records, cli.quiet)?;
+        write_gallery(dir, &records, cli.time_shift.as_ref(), cli.quiet)?;
     }
 
     // Errors scroll away in a long run, so repeat which files failed.
@@ -1109,13 +1127,14 @@ fn plan_outputs(
     output_dir: Option<&Path>,
     format: OutputFormat,
     template: Option<&naming::NameTemplate>,
+    shift: Option<&timeshift::TimeShift>,
 ) -> Result<Vec<(PathBuf, PathBuf)>> {
     // Reading EXIF for the template opens every file, so do it in parallel.
     let named: Option<Vec<PathBuf>> = template.map(|t| {
         let needs_exif = t.needs_exif();
         let infos: Vec<naming::NameInfo> = files
             .par_iter()
-            .map(|f| naming::NameInfo::read(&f.path, needs_exif))
+            .map(|f| naming::NameInfo::read(&f.path, needs_exif).shifted(shift))
             .collect();
         let seqs = if t.uses_seq() {
             sequence_numbers(files, &infos)
@@ -1359,7 +1378,7 @@ mod tests {
         )
         .unwrap();
         let out = tmp.path().join("out");
-        assert!(plan_outputs(&files, Some(&out), OutputFormat::Jpeg, None).is_err());
+        assert!(plan_outputs(&files, Some(&out), OutputFormat::Jpeg, None, None).is_err());
     }
 
     #[test]
@@ -1468,6 +1487,13 @@ mod tests {
         assert_eq!(cli.label, ["red", "Green"]);
         let cli = Cli::try_parse_from(["rawdog", "--label", "red", "--label", "blue", "x.arw"]).unwrap();
         assert_eq!(cli.label, ["blue"]);
+    }
+
+    #[test]
+    fn time_shift_option_accepts_negative_offsets() {
+        let cli = Cli::try_parse_from(["rawdog", "--time-shift", "-1h", "x.arw"]).unwrap();
+        assert_eq!(cli.time_shift.unwrap().seconds_for(None), -3_600);
+        assert!(Cli::try_parse_from(["rawdog", "--time-shift", "soon", "x.arw"]).is_err());
     }
 
     #[test]
@@ -1907,7 +1933,7 @@ mod tests {
 
         let files = collect_raw_files(&[input], true).unwrap();
         let out = Path::new("/out");
-        let jobs = plan_outputs(&files, Some(out), OutputFormat::Jpeg, None).unwrap();
+        let jobs = plan_outputs(&files, Some(out), OutputFormat::Jpeg, None, None).unwrap();
         let outputs: Vec<&Path> = jobs.iter().map(|(_, o)| o.as_path()).collect();
         assert_eq!(
             outputs,
@@ -1930,7 +1956,7 @@ mod tests {
         let template: naming::NameTemplate = "{date}/{stem}-web".parse().unwrap();
 
         let jobs =
-            plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Jpeg, Some(&template))
+            plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Jpeg, Some(&template), None)
                 .unwrap();
         let outputs: Vec<&Path> = jobs.iter().map(|(_, o)| o.as_path()).collect();
         assert_eq!(
@@ -1942,7 +1968,7 @@ mod tests {
         );
 
         // Without an output directory, the path is below each input's directory.
-        let jobs = plan_outputs(&files, None, OutputFormat::Png, Some(&template)).unwrap();
+        let jobs = plan_outputs(&files, None, OutputFormat::Png, Some(&template), None).unwrap();
         assert_eq!(jobs[0].1, input.join("a/unknown/x-web.png"));
     }
 
@@ -1953,7 +1979,7 @@ mod tests {
         fs::write(tmp.path().join("b.arw"), b"fake").unwrap();
         let files = collect_raw_files(&[tmp.path().to_path_buf()], false).unwrap();
         let template: naming::NameTemplate = "{date}".parse().unwrap();
-        assert!(plan_outputs(&files, None, OutputFormat::Jpeg, Some(&template)).is_err());
+        assert!(plan_outputs(&files, None, OutputFormat::Jpeg, Some(&template), None).is_err());
     }
 
     #[test]
@@ -1964,7 +1990,7 @@ mod tests {
         fs::write(nested.join("x.arw"), b"fake").unwrap();
 
         let files = collect_raw_files(&[nested.join("x.arw")], true).unwrap();
-        let jobs = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Png, None).unwrap();
+        let jobs = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Png, None, None).unwrap();
         assert_eq!(jobs[0].1, PathBuf::from("/out/x.png"));
     }
 
@@ -1975,7 +2001,7 @@ mod tests {
         fs::write(tmp.path().join("a/x.arw"), b"fake").unwrap();
 
         let files = collect_raw_files(&[tmp.path().to_path_buf()], true).unwrap();
-        let jobs = plan_outputs(&files, None, OutputFormat::Jpeg, None).unwrap();
+        let jobs = plan_outputs(&files, None, OutputFormat::Jpeg, None, None).unwrap();
         assert_eq!(jobs[0].1, tmp.path().join("a/x.jpg"));
     }
 
@@ -1990,7 +2016,7 @@ mod tests {
         let b = tmp.path().join("b/x.arw");
 
         let files = collect_raw_files(&[a.clone(), b.clone()], false).unwrap();
-        let err = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Jpeg, None)
+        let err = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Jpeg, None, None)
             .expect_err("expected a conflict error");
         let msg = err.to_string();
         assert!(msg.contains(&*a.to_string_lossy()), "{msg}");
@@ -2005,7 +2031,7 @@ mod tests {
 
         let inputs = vec![tmp.path().join("x.arw"), tmp.path().join(".").join("x.png")];
         let files = collect_raw_files(&inputs, false).unwrap();
-        assert!(plan_outputs(&files, None, OutputFormat::Jpeg, None).is_err());
+        assert!(plan_outputs(&files, None, OutputFormat::Jpeg, None, None).is_err());
     }
 
     #[test]
