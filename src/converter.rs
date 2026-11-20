@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use image::codecs::jpeg::JpegEncoder;
 use image::ImageEncoder;
 use image::codecs::png::PngEncoder;
@@ -36,6 +36,8 @@ pub struct ConvertOptions {
     /// White balance as (colour temperature in kelvin, tint). Replaces the
     /// as-shot white balance.
     pub white_balance: Option<(f32, f32)>,
+    /// White balance multipliers taken from a reference file.
+    pub wb_from: Option<std::sync::Arc<WhiteBalanceReference>>,
     /// Strength of output sharpening, applied after the resize.
     pub sharpen: Option<f32>,
     /// Use the JPEG preview that the camera embedded in the RAW file
@@ -47,6 +49,26 @@ pub struct ConvertOptions {
     /// A logo blended into the bottom-right corner of every image.
     pub watermark: Option<std::sync::Arc<image::RgbaImage>>,
     pub metadata: exif_utils::MetadataOptions,
+}
+
+/// The as-shot white balance of one RAW file, applied to other files of the
+/// same camera model so that a sequence does not flicker.
+pub struct WhiteBalanceReference {
+    coeffs: [f32; 4],
+    model: String,
+}
+
+/// Read the white balance of `path`. This decodes the file once.
+pub fn white_balance_reference(path: &Path) -> Result<WhiteBalanceReference> {
+    let pipeline = open_pipeline(path)
+        .with_context(|| format!("Failed to read --wb-from file {}", path.display()))?;
+    let ImageSource::Raw(raw) = &pipeline.globals.image else {
+        bail!("--wb-from file {} is not a RAW file", path.display());
+    };
+    Ok(WhiteBalanceReference {
+        coeffs: pipeline.ops.tolab.wb_coeffs,
+        model: raw.clean_model.clone(),
+    })
 }
 
 /// Convert a single ARW file to the specified output format.
@@ -102,6 +124,22 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
             // higher value gives a greener image. `--tint` is defined the
             // other way: above 1 is more magenta.
             pipeline.ops.tolab.set_temp(kelvin, 1.0 / tint);
+        }
+        if let Some(reference) = &opts.wb_from {
+            // Multipliers are specific to a sensor.
+            let model = match &pipeline.globals.image {
+                ImageSource::Raw(raw) => raw.clean_model.as_str(),
+                ImageSource::Other(_) => "",
+            };
+            if model != reference.model {
+                bail!(
+                    "taken with {}, but the --wb-from file with {}; white balance multipliers \
+                     differ between camera models",
+                    if model.is_empty() { "no known camera" } else { model },
+                    reference.model
+                );
+            }
+            pipeline.ops.tolab.wb_coeffs = reference.coeffs;
         }
         match (exposure, &mut pipeline.globals.image) {
             // Darkening is exact as a gain on the RAW samples: colour and
@@ -1621,6 +1659,7 @@ mod tests {
             fast: false,
             exposure: None,
             white_balance: None,
+            wb_from: None,
             sharpen: None,
             preview: true,
             watermark: None,
@@ -1751,6 +1790,7 @@ mod tests {
                 fast: false,
                 exposure: None,
                 white_balance: None,
+                wb_from: None,
                 sharpen: None,
                 preview: false,
                 watermark: None,
@@ -1779,6 +1819,7 @@ mod tests {
                 fast: false,
                 exposure: None,
                 white_balance: None,
+                wb_from: None,
                 sharpen: None,
                 preview: false,
                 watermark: None,

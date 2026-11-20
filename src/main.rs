@@ -166,6 +166,12 @@ struct Cli {
     #[arg(long, value_name = "KELVIN", value_parser = float_in_range::<1500, 15000>)]
     wb: Option<f32>,
 
+    /// Use the as-shot white balance of this RAW file for every file, so a
+    /// time-lapse or a set shot under one light does not change colour from
+    /// frame to frame. Files must come from the same camera model
+    #[arg(long, value_name = "RAW", conflicts_with_all = ["wb", "preview"])]
+    wb_from: Option<PathBuf>,
+
     /// White balance tint for --wb. Above 1 is more magenta, below 1 is
     /// more green
     #[arg(long, requires = "wb", default_value_t = 1.0, value_parser = tint_value)]
@@ -623,6 +629,7 @@ fn main() -> Result<()> {
             ("--preview", cli.preview),
             ("--exposure", cli.exposure.is_some()),
             ("--wb", cli.wb.is_some()),
+            ("--wb-from", cli.wb_from.is_some()),
             ("--sharpen", cli.sharpen.is_some()),
             ("--strip-gps", cli.strip_gps),
             ("--strip-metadata", cli.strip_metadata),
@@ -666,6 +673,11 @@ fn main() -> Result<()> {
                 .with_context(|| format!("Failed to read watermark {}", path.display()))?
                 .into_rgba8(),
         )),
+        None => None,
+    };
+
+    let wb_from = match &cli.wb_from {
+        Some(path) => Some(std::sync::Arc::new(converter::white_balance_reference(path)?)),
         None => None,
     };
 
@@ -874,6 +886,7 @@ fn main() -> Result<()> {
         fast: cli.fast,
         exposure: cli.exposure,
         white_balance: cli.wb.map(|kelvin| (kelvin, cli.tint)),
+        wb_from,
         sharpen: cli.sharpen,
         preview: cli.preview,
         with_jpeg: cli.with_jpeg,

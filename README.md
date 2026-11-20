@@ -75,6 +75,12 @@ rawdog ./reception --exposure 0.67 --wb 3400
 
 `--exposure` rolls off highlights instead of clipping them. `--wb` replaces the as-shot white balance of every file; add `--tint` to correct a green or magenta cast (above 1 is more magenta).
 
+For a time-lapse, or a set shot under one light, the camera's automatic white balance changes from frame to frame and the colours flicker. `--wb-from` uses the as-shot white balance of one file for all of them. The files must come from the same camera model, because the values differ between sensors:
+
+```sh
+rawdog ./timelapse --wb-from ./timelapse/DSC00412.ARW -r 3840 -o ./frames
+```
+
 ### Culling and proofs
 
 `--preview` writes the JPEG preview that the camera embedded in each RAW file, with the camera's own colours. It is the fastest way to look through a card. A file without a preview that rawdog can read (phones, Olympus, some DNG files) is developed instead, with a note. A preview is never enlarged, so `-r` larger than the preview has no effect. The size depends on the camera: 1616x1080 for Sony bodies, full resolution for many Canon and Nikon bodies.
