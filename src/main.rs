@@ -165,9 +165,9 @@ struct Cli {
 
     /// Resize long edge to this many pixels, preserving aspect ratio.
     /// Several sizes, such as 3000,2048,1080, write each size into its own
-    /// folder below -o
+    /// folder below -o; "full" is the full size, as in full,2048
     #[arg(short, long, value_name = "PIXELS", value_delimiter = ',',
-          action = clap::ArgAction::Set, value_parser = clap::value_parser!(u32).range(1..))]
+          action = clap::ArgAction::Set, value_parser = resize_value)]
     resize: Vec<u32>,
 
     /// Crop the centre to this aspect ratio, such as 4:5, 16:9, or 1:1. The
@@ -274,6 +274,12 @@ struct Cli {
     /// image's short edge
     #[arg(long, value_name = "PNG")]
     watermark: Option<PathBuf>,
+
+    /// Put the watermark only on these --resize sizes, such as 2048,1080,
+    /// so that full-size finals stay clean
+    #[arg(long, value_name = "PIXELS", value_delimiter = ',', requires = "watermark",
+          action = clap::ArgAction::Set, value_parser = clap::value_parser!(u32).range(1..))]
+    watermark_sizes: Vec<u32>,
 
     /// Overwrite existing output files (default: skip if exists)
     #[arg(long)]
@@ -772,6 +778,23 @@ fn aspect_ratio(s: &str) -> Result<(u32, u32), String> {
     Ok((a.max(b), a.min(b)))
 }
 
+/// A `--resize` size: pixels, or "full" (0) for the full size.
+fn resize_value(s: &str) -> Result<u32, String> {
+    match s.trim() {
+        "full" => Ok(0),
+        n => n
+            .parse::<u32>()
+            .ok()
+            .filter(|v| *v >= 1)
+            .ok_or_else(|| "must be a number of pixels, or full".to_string()),
+    }
+}
+
+/// The `--resize` sizes as `Option`s: `None` is the full size.
+fn sizes_of(resize: &[u32]) -> Vec<Option<u32>> {
+    resize.iter().map(|&r| (r > 0).then_some(r)).collect()
+}
+
 fn tint_value(s: &str) -> Result<f32, String> {
     match s.parse::<f32>() {
         Ok(v) if (0.5..=2.0).contains(&v) => Ok(v),
@@ -1130,14 +1153,16 @@ fn main() -> Result<()> {
 
     // With several sizes, each size gets its own folder below -o, and each
     // job knows its size.
-    let mut sizes = cli.resize.clone();
-    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    // Largest first; the full size (None) before all.
+    let mut sizes = sizes_of(&cli.resize);
+    sizes.sort_unstable_by(|a, b| b.unwrap_or(u32::MAX).cmp(&a.unwrap_or(u32::MAX)));
     sizes.dedup();
     let size_dirs: Vec<(Option<u32>, Option<PathBuf>)> = if sizes.len() > 1 {
         let out = cli.output.as_deref().expect("checked: several sizes need -o");
-        sizes.iter().map(|&s| (Some(s), Some(out.join(s.to_string())))).collect()
+        let folder = |s: Option<u32>| s.map_or("full".to_string(), |s| s.to_string());
+        sizes.iter().map(|&s| (s, Some(out.join(folder(s))))).collect()
     } else {
-        vec![(sizes.first().copied(), cli.output.clone())]
+        vec![(sizes.first().copied().flatten(), cli.output.clone())]
     };
     let mut jobs = Vec::new();
     let mut job_sizes: HashMap<PathBuf, Option<u32>> = HashMap::new();
@@ -1239,7 +1264,7 @@ fn main() -> Result<()> {
         format: cli.format,
         quality: cli.quality,
         max_bytes: cli.max_size,
-        resize: cli.resize.first().copied(),
+        resize: sizes_of(&cli.resize).first().copied().flatten(),
         aspect: cli.aspect,
         fast: cli.fast,
         exposure: cli.exposure,
@@ -1249,6 +1274,7 @@ fn main() -> Result<()> {
         preview: cli.preview,
         with_jpeg: cli.with_jpeg,
         watermark,
+        watermark_sizes: cli.watermark_sizes.clone(),
         metadata: exif::MetadataOptions {
             strip_all: cli.strip_metadata,
             strip_gps: cli.strip_gps,
@@ -2112,6 +2138,14 @@ mod tests {
         for bad in ["", "4", "4:", "0:1", "4:5:6", "a:b", "101:1"] {
             assert!(aspect_ratio(bad).is_err(), "{bad} was accepted");
         }
+    }
+
+    #[test]
+    fn resize_accepts_full_and_pixels() {
+        let cli = Cli::try_parse_from(["rawdog", "x.arw", "-r", "full,2048", "-o", "out"]).unwrap();
+        assert_eq!(sizes_of(&cli.resize), [None, Some(2048)]);
+        assert!(Cli::try_parse_from(["rawdog", "x.arw", "-r", "0"]).is_err());
+        assert!(Cli::try_parse_from(["rawdog", "x.arw", "-r", "huge"]).is_err());
     }
 
     #[test]
