@@ -149,6 +149,11 @@ struct Cli {
     #[arg(long, requires = "output")]
     gallery: bool,
 
+    /// With --gallery, also write a gallery.html into each output folder
+    /// that holds images, such as one per day with --name "{date}/{stem}"
+    #[arg(long, requires = "gallery")]
+    gallery_per_folder: bool,
+
     /// Output format
     #[arg(short, long, value_enum, default_value_t = OutputFormat::Jpeg)]
     format: OutputFormat,
@@ -1564,6 +1569,26 @@ fn main() -> Result<()> {
         // During --watch the page reloads itself, for a screen at an event.
         let refresh = cli.watch.map(|interval| (interval * 2).max(10));
         write_gallery(dir, &records, &infos, refresh, cli.quiet)?;
+        if cli.gallery_per_folder {
+            let mut folders: Vec<PathBuf> = records
+                .iter()
+                .filter_map(|r| r.output.as_deref()?.parent().map(Path::to_path_buf))
+                .filter(|folder| folder.starts_with(dir) && folder.as_path() != dir)
+                .collect();
+            folders.sort();
+            folders.dedup();
+            for folder in &folders {
+                let here: Vec<report::Record> = records
+                    .iter()
+                    .filter(|r| r.output.as_deref().and_then(Path::parent) == Some(folder.as_path()))
+                    .cloned()
+                    .collect();
+                write_gallery(folder, &here, &infos, refresh, true)?;
+            }
+            if !cli.quiet && !folders.is_empty() {
+                println!("Galleries also in {} folder(s)", folders.len());
+            }
+        }
     }
 
     // Errors scroll away in a long run, so repeat which files failed.
