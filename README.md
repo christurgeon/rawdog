@@ -51,6 +51,12 @@ rawdog ./photos/ -f png -r 2048   # 16-bit PNG, resized
 rawdog ./trip --aspect 4:5 -r 1350
 ```
 
+Several sizes at once, each in its own folder below `-o` (`./delivery/3000/`, `./delivery/2048/`, ...). Each size is developed on its own, so add `--fast` for speed; `--gallery` shows the smallest size:
+
+```sh
+rawdog ./wedding -r 3000,2048,1080 --fast -o ./delivery
+```
+
 Resized images look soft; `--sharpen` adds output sharpening, with an optional amount from 0 to 3 (default 0.5):
 
 ```sh
