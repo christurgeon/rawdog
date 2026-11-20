@@ -99,6 +99,12 @@ struct Cli {
     #[arg(short, long, default_value_t = 92, value_parser = clap::value_parser!(u8).range(1..=100))]
     quality: u8,
 
+    /// Largest JPEG file, such as 2MB or 500KB (1 MB is 1,000,000 bytes).
+    /// The quality is lowered until each file fits; --quality is the
+    /// highest quality used
+    #[arg(long, value_name = "SIZE", value_parser = byte_size)]
+    max_size: Option<u64>,
+
     /// Resize long edge to this many pixels, preserving aspect ratio
     #[arg(short, long, value_parser = clap::value_parser!(u32).range(1..))]
     resize: Option<u32>,
@@ -371,6 +377,28 @@ impl Selection {
     }
 }
 
+/// A file size: a number of bytes, or a number with KB or MB (decimal
+/// units, so a limit given in either convention is met). K and M are the
+/// same as KB and MB.
+fn byte_size(s: &str) -> Result<u64, String> {
+    let error = || "must be a size such as 2MB, 500KB, or 800000".to_string();
+    let upper = s.trim().to_ascii_uppercase();
+    let (number, unit) = match upper.find(|c: char| c.is_ascii_alphabetic()) {
+        Some(i) => upper.split_at(i),
+        None => (upper.as_str(), ""),
+    };
+    let unit = match unit.trim() {
+        "" | "B" => 1.0,
+        "K" | "KB" => 1e3,
+        "M" | "MB" => 1e6,
+        _ => return Err(error()),
+    };
+    match number.trim().parse::<f64>() {
+        Ok(n) if n.is_finite() && n * unit >= 1.0 => Ok((n * unit) as u64),
+        _ => Err(error()),
+    }
+}
+
 fn tint_value(s: &str) -> Result<f32, String> {
     match s.parse::<f32>() {
         Ok(v) if (0.5..=2.0).contains(&v) => Ok(v),
@@ -411,8 +439,13 @@ fn main() -> Result<()> {
         bail!("--gallery needs JPEG or PNG output; browsers do not show TIFF or RAW files.");
     }
 
+    if cli.max_size.is_some() && matches!(cli.format, OutputFormat::Tiff | OutputFormat::Png) {
+        bail!("--max-size needs JPEG output; TIFF and PNG files are lossless.");
+    }
+
     if matches!(cli.format, OutputFormat::Original) {
         let image_options = [
+            ("--max-size", cli.max_size.is_some()),
             ("--resize", cli.resize.is_some()),
             ("--fast", cli.fast),
             ("--preview", cli.preview),
@@ -562,6 +595,7 @@ fn main() -> Result<()> {
     let opts = converter::ConvertOptions {
         format: cli.format,
         quality: cli.quality,
+        max_bytes: cli.max_size,
         resize: cli.resize,
         fast: cli.fast,
         exposure: cli.exposure,
@@ -1207,6 +1241,23 @@ mod tests {
         let explicit_first =
             collect_raw_files(&[sub.join("x.arw"), tmp.path().to_path_buf()], true).unwrap();
         assert_eq!(explicit_first[0].rel_dir, PathBuf::new());
+    }
+
+    #[test]
+    fn byte_size_accepts_decimal_units() {
+        assert_eq!(byte_size("800000"), Ok(800_000));
+        assert_eq!(byte_size("2MB"), Ok(2_000_000));
+        assert_eq!(byte_size("1.5m"), Ok(1_500_000));
+        assert_eq!(byte_size("500 KB"), Ok(500_000));
+        assert_eq!(byte_size("500k"), Ok(500_000));
+        assert_eq!(byte_size("10b"), Ok(10));
+    }
+
+    #[test]
+    fn byte_size_rejects_other_values() {
+        for bad in ["", "MB", "2GB", "2 MiB", "-1MB", "0", "0.0001KB", "nan", "inf"] {
+            assert!(byte_size(bad).is_err(), "{bad} was accepted");
+        }
     }
 
     // -----------------------------------------------------------------------

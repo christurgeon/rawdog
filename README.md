@@ -51,6 +51,12 @@ Resized images look soft; `--sharpen` adds output sharpening, with an optional a
 rawdog ./trip -r 2048 --sharpen
 ```
 
+For a contest or website with a file size limit, `--max-size` lowers the JPEG quality of each file until it fits. `--quality` stays the highest quality used. Sizes are decimal (1 MB is 1,000,000 bytes), so the limit is met in either convention. A file that is too large even at the lowest quality fails with its size; use `-r` to make it smaller:
+
+```sh
+rawdog ./contest -r 3000 --max-size 2MB -o ./entries
+```
+
 Every output carries an sRGB colour profile, so colours are the same in every viewer.
 
 ### Developing
