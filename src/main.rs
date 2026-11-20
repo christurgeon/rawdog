@@ -249,7 +249,7 @@ fn float_in_range<const MIN: i32, const MAX: i32>(s: &str) -> Result<f32, String
 fn write_gallery(
     dir: &Path,
     records: &[report::Record],
-    shift: Option<&timeshift::TimeShift>,
+    infos: &HashMap<PathBuf, naming::NameInfo>,
     quiet: bool,
 ) -> Result<()> {
     let mut shown: Vec<&report::Record> = records
@@ -261,7 +261,14 @@ fn write_gallery(
     let entries: Vec<gallery::Entry> = shown
         .par_iter()
         .map(|r| {
-            let info = naming::NameInfo::read(&r.input, true).shifted(shift);
+            let read;
+            let info = match infos.get(&r.input) {
+                Some(info) => info,
+                None => {
+                    read = naming::NameInfo::read(&r.input, true);
+                    &read
+                }
+            };
             let image = r.output.clone().unwrap_or_default();
             gallery::Entry {
                 thumbnail: gallery::thumbnail(dir, &image),
@@ -276,7 +283,7 @@ fn write_gallery(
                     taken: info.taken.map(|(y, mo, d, h, mi, _)| {
                         format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
                     }),
-                    model: info.model,
+                    model: info.model.clone(),
                     rating: info.rating,
                 },
             }
@@ -715,21 +722,40 @@ fn main() -> Result<()> {
             );
         }
     }
+    let template = cli.name.clone().map(|mut t| {
+        t.seq_start = cli.seq_start;
+        t
+    });
+
+    // Read the metadata of every file once, for selection, naming, and the
+    // gallery. A CR3 or RAF file is read whole, which is slow on a card.
+    let needs_exif = selection.needs_exif()
+        || template.as_ref().is_some_and(|t| t.needs_exif())
+        || cli.gallery;
+    let mut infos: Vec<naming::NameInfo> =
+        if selection.is_active() || template.is_some() || cli.gallery {
+            files
+                .par_iter()
+                .map(|f| {
+                    naming::NameInfo::read(&f.path, needs_exif).shifted(cli.time_shift.as_ref())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
     let mut excluded_records = Vec::new();
     let files = if selection.is_active() {
-        let needs_exif = selection.needs_exif();
-        let excluded: Vec<Option<String>> = files
-            .par_iter()
-            .map(|f| {
-                let info = naming::NameInfo::read(&f.path, needs_exif);
-                selection.exclusion(&info.shifted(cli.time_shift.as_ref()))
-            })
-            .collect();
-        let (kept, dropped): (Vec<_>, Vec<_>) =
-            files.into_iter().zip(excluded).partition(|(_, reason)| reason.is_none());
+        let excluded: Vec<Option<String>> =
+            infos.iter().map(|info| selection.exclusion(info)).collect();
+        let (kept, dropped): (Vec<_>, Vec<_>) = files
+            .into_iter()
+            .zip(std::mem::take(&mut infos))
+            .zip(excluded)
+            .partition(|(_, reason)| reason.is_none());
         excluded_records = dropped
             .iter()
-            .map(|(f, reason)| report::Record {
+            .map(|((f, _), reason)| report::Record {
                 input: f.path.clone(),
                 output: None,
                 status: report::Status::Excluded,
@@ -738,7 +764,7 @@ fn main() -> Result<()> {
             })
             .collect();
         if cli.dry_run {
-            for (f, reason) in &dropped {
+            for ((f, _), reason) in &dropped {
                 println!("exclude {} ({})", f.path.display(), reason.as_deref().unwrap_or(""));
             }
         } else if !cli.quiet && !dropped.is_empty() {
@@ -756,22 +782,22 @@ fn main() -> Result<()> {
             }
             return Ok(());
         }
-        kept.into_iter().map(|(f, _)| f).collect()
+        let (kept, kept_infos): (Vec<_>, Vec<_>) = kept.into_iter().map(|(pair, _)| pair).unzip();
+        infos = kept_infos;
+        kept
     } else {
         files
     };
 
-    let template = cli.name.clone().map(|mut t| {
-        t.seq_start = cli.seq_start;
-        t
-    });
     let jobs = plan_outputs(
         &files,
         cli.output.as_deref(),
         cli.format,
         template.as_ref(),
-        cli.time_shift.as_ref(),
+        (!infos.is_empty()).then_some(infos.as_slice()),
     )?;
+    let infos: HashMap<PathBuf, naming::NameInfo> =
+        files.iter().map(|f| f.path.clone()).zip(infos).collect();
 
     // {seq} numbers the files of each run anew, so an existing output may
     // hold another input's image; skipping it would lose a file.
@@ -999,7 +1025,7 @@ fn main() -> Result<()> {
         write_report(path, &mut records)?;
     }
     if let (true, Some(dir)) = (cli.gallery, cli.output.as_deref()) {
-        write_gallery(dir, &records, cli.time_shift.as_ref(), cli.quiet)?;
+        write_gallery(dir, &records, &infos, cli.quiet)?;
     }
 
     // Errors scroll away in a long run, so repeat which files failed.
@@ -1255,17 +1281,24 @@ fn plan_outputs(
     output_dir: Option<&Path>,
     format: OutputFormat,
     template: Option<&naming::NameTemplate>,
-    shift: Option<&timeshift::TimeShift>,
+    infos: Option<&[naming::NameInfo]>,
 ) -> Result<Vec<(PathBuf, PathBuf)>> {
     // Reading EXIF for the template opens every file, so do it in parallel.
     let named: Option<Vec<PathBuf>> = template.map(|t| {
-        let needs_exif = t.needs_exif();
-        let infos: Vec<naming::NameInfo> = files
-            .par_iter()
-            .map(|f| naming::NameInfo::read(&f.path, needs_exif).shifted(shift))
-            .collect();
+        let read;
+        let infos = match infos {
+            Some(infos) => infos,
+            None => {
+                let needs_exif = t.needs_exif();
+                read = files
+                    .par_iter()
+                    .map(|f| naming::NameInfo::read(&f.path, needs_exif))
+                    .collect::<Vec<_>>();
+                &read
+            }
+        };
         let seqs = if t.uses_seq() {
-            sequence_numbers(files, &infos, t.seq_start)
+            sequence_numbers(files, infos, t.seq_start)
         } else {
             vec![String::new(); files.len()]
         };
