@@ -65,7 +65,23 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     } = *opts;
 
     let mut source = if opts.preview {
-        Source::Preview(load_preview(input)?)
+        // A file whose preview cannot be read is developed too; if the
+        // file is broken, developing reports why.
+        let Some(preview) = load_preview(input).ok().flatten() else {
+            // Phones, Olympus, and some DNG files store no preview. Develop
+            // those instead of failing, at --fast speed when resizing.
+            eprintln!(
+                "Note: {} has no embedded preview that rawdog can read; developing the RAW data instead",
+                input.display()
+            );
+            let mut developed = opts.clone();
+            developed.preview = false;
+            developed.fast = resize.is_some();
+            developed.metadata.srgb = true;
+            return convert_raw(input, output, &developed);
+        };
+        warn_if_preview_is_small(&preview, resize);
+        Source::Preview(preview)
     } else {
         let mut pipeline = open_pipeline(input)?;
 
@@ -202,7 +218,7 @@ impl Source {
 /// Load the JPEG preview that the camera stored in a RAW file, rotated
 /// upright. Its size depends on the camera: about 1616x1080 for Sony, full
 /// resolution for many Canon and Nikon bodies.
-fn load_preview(input: &Path) -> Result<RgbImage> {
+fn load_preview(input: &Path) -> Result<Option<RgbImage>> {
     use rawler::decoders::RawDecodeParams;
     use rawler::rawsource::RawSource;
 
@@ -229,18 +245,26 @@ fn load_preview(input: &Path) -> Result<RgbImage> {
 
     // rawler can panic on files that are not RAW files.
     let first_line = |e: String| e.lines().next().unwrap_or_default().to_string();
+    // The caller names the file in its message.
     match std::panic::catch_unwind(load) {
-        Ok(Ok(Some(preview))) => Ok(preview),
-        Ok(Ok(None)) => Err(anyhow!(
-            "{} has no embedded preview; convert it without --preview",
-            input.display()
-        )),
-        Ok(Err(e)) => Err(anyhow!(
-            "Cannot read a preview from {}: {}",
-            input.display(),
-            first_line(e)
-        )),
-        Err(_) => Err(anyhow!("Cannot read a preview from {}", input.display())),
+        Ok(Ok(preview)) => Ok(preview),
+        Ok(Err(e)) => Err(anyhow!("cannot read the embedded preview: {}", first_line(e))),
+        Err(_) => Err(anyhow!("cannot read the embedded preview")),
+    }
+}
+
+/// Warn once per run when `--resize` asks for more pixels than a preview
+/// has, because a preview is never enlarged.
+fn warn_if_preview_is_small(preview: &RgbImage, resize: Option<u32>) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let long_edge = preview.width().max(preview.height());
+    if resize.is_some_and(|r| r > long_edge)
+        && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        eprintln!(
+            "Note: embedded previews are smaller than --resize (for example {long_edge} pixels \
+             on the long edge) and are not enlarged; convert without --preview for larger images"
+        );
     }
 }
 
