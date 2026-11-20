@@ -573,16 +573,21 @@ fn parse_date(s: &str) -> Result<(u16, u8, u8), String> {
 enum BurstPick {
     /// The frame with exposure compensation closest to 0 EV.
     Ev0,
+    /// The sharpest frame, measured on the embedded preview.
+    Sharpest,
 }
 
-/// For `--burst-pick ev0`: the index of the frame to keep in each burst,
-/// as a flag per file. Ties go to the earlier frame, then the path.
-fn burst_keepers(files: &[InputFile], infos: &[naming::NameInfo], gap: f64) -> Vec<bool> {
+/// For `--burst-pick`: which frame to keep in each burst, as a flag per
+/// file. The frame with the lowest `penalty` wins; ties go to the earlier
+/// frame, then the path.
+fn burst_keepers(
+    files: &[InputFile],
+    infos: &[naming::NameInfo],
+    gap: f64,
+    penalty: &[f64],
+) -> Vec<bool> {
     let bursts = burst_numbers(files, infos, gap);
-    let score = |i: usize| {
-        let bias = infos[i].exposure.bias.map_or(f64::INFINITY, f64::abs);
-        (bias, infos[i].time_ms(), &files[i].path)
-    };
+    let score = |i: usize| (penalty[i], infos[i].time_ms(), &files[i].path);
     let mut best: HashMap<&str, usize> = HashMap::new();
     for (i, burst) in bursts.iter().enumerate() {
         let entry = best.entry(burst.as_str()).or_insert(i);
@@ -1112,8 +1117,28 @@ fn main() -> Result<()> {
     // --burst-pick: one frame of each burst or bracket.
     let files = if cli.burst_pick.is_some() {
         let gap = f64::from(cli.burst_gap);
-        let keep = burst_keepers(&files, &infos, gap);
         let bursts = burst_numbers(&files, &infos, gap);
+        let penalty: Vec<f64> = match cli.burst_pick {
+            Some(BurstPick::Sharpest) => {
+                // Score only frames that share their burst with another.
+                let mut size: HashMap<&str, usize> = HashMap::new();
+                for b in &bursts {
+                    *size.entry(b.as_str()).or_default() += 1;
+                }
+                files
+                    .par_iter()
+                    .zip(&bursts)
+                    .map(|(f, b)| {
+                        if size[b.as_str()] < 2 {
+                            return 0.0;
+                        }
+                        converter::sharpness(&f.path).map_or(f64::INFINITY, |s| -s)
+                    })
+                    .collect()
+            }
+            _ => infos.iter().map(|i| i.exposure.bias.map_or(f64::INFINITY, f64::abs)).collect(),
+        };
+        let keep = burst_keepers(&files, &infos, gap, &penalty);
         let kept_name: HashMap<&str, String> = (0..files.len())
             .filter(|&i| keep[i])
             .map(|i| {
@@ -2342,7 +2367,10 @@ mod tests {
             frame(30, None),
             frame(31, None),
         ];
-        assert_eq!(burst_keepers(&files, &infos, 2.0), [false, true, false, true, false]);
+        let penalty: Vec<f64> = infos.iter().map(|i| i.exposure.bias.map_or(f64::INFINITY, f64::abs)).collect();
+        assert_eq!(burst_keepers(&files, &infos, 2.0, &penalty), [false, true, false, true, false]);
+        // Sharpness: the lowest penalty (highest sharpness) wins.
+        assert_eq!(burst_keepers(&files, &infos, 2.0, &[-1.0, -5.0, -9.0, 0.0, 0.0]), [false, false, true, true, false]);
     }
 
     #[test]
