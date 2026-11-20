@@ -210,10 +210,8 @@ fn load_preview(input: &Path) -> Result<RgbImage> {
             return Ok(None);
         };
         // The preview is stored as the sensor recorded it.
-        let orientation = decoder
-            .raw_metadata(&source, &params)
-            .ok()
-            .and_then(|m| m.exif.orientation)
+        let orientation = crate::naming::sidecar_orientation(input)
+            .or_else(|| decoder.raw_metadata(&source, &params).ok()?.exif.orientation)
             .and_then(|n| u8::try_from(n).ok())
             .and_then(image::metadata::Orientation::from_exif);
         if let Some(orientation) = orientation {
@@ -251,7 +249,7 @@ fn load_preview(input: &Path) -> Result<RgbImage> {
 /// The RAW decoders come first because most RAW files are TIFF containers,
 /// and a raster loader could open one and return only its preview.
 fn open_pipeline(input: &Path) -> Result<Pipeline> {
-    let raw = match decode_with_rawler(input) {
+    let mut raw = match decode_with_rawler(input) {
         Ok(raw) => raw,
         Err(new_decoder) => match rawloader::decode_file(input) {
             Ok(raw) => raw,
@@ -272,6 +270,9 @@ fn open_pipeline(input: &Path) -> Result<Pipeline> {
             }
         },
     };
+    if let Some(orientation) = crate::naming::sidecar_orientation(input) {
+        raw.orientation = rawloader::Orientation::from_u16(orientation);
+    }
     if let Some(problem) = implausible_samples(&raw) {
         return Err(anyhow!(
             "Cannot decode {}: the decoder returned invalid data ({problem}); \

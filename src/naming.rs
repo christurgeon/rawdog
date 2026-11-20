@@ -175,6 +175,20 @@ fn sidecar_paths(path: &Path) -> Vec<PathBuf> {
     sidecars
 }
 
+/// The orientation (EXIF values 1 to 8) in a sidecar XMP file, which
+/// Lightroom and Capture One write when an image is rotated while culling.
+/// It replaces the camera's orientation, as it holds the later decision.
+pub fn sidecar_orientation(path: &Path) -> Option<u16> {
+    sidecar_paths(path)
+        .iter()
+        .filter_map(|p| std::fs::read(p).ok())
+        .find_map(|xmp| {
+            let text = xmp_text(&xmp);
+            let value = xmp_property(&text, "tiff:Orientation")?.trim().parse::<u16>().ok()?;
+            (1..=8).contains(&value).then_some(value)
+        })
+}
+
 /// The colour labels of a RAW file, from a sidecar XMP file or else from
 /// the XMP packet in the file. Cameras do not write labels.
 fn read_labels(path: &Path, fields: &[exif::Field]) -> Vec<String> {
@@ -478,6 +492,19 @@ mod tests {
             <rdf:li>3</rdf:li><rdf:li>9</rdf:li></rdf:Seq></darktable:colorlabels>";
         assert_eq!(xmp_labels(darktable), ["red", "blue"]);
         assert!(xmp_labels(b"<rdf:li>2</rdf:li>").is_empty());
+    }
+
+    #[test]
+    fn sidecar_orientation_reads_lightroom_rotation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let raw = tmp.path().join("DSC1.ARW");
+        assert_eq!(sidecar_orientation(&raw), None);
+        std::fs::write(tmp.path().join("DSC1.xmp"), b"<d tiff:Orientation=\"8\"/>").unwrap();
+        assert_eq!(sidecar_orientation(&raw), Some(8));
+        std::fs::write(tmp.path().join("DSC1.xmp"), b"<tiff:Orientation>6</tiff:Orientation>").unwrap();
+        assert_eq!(sidecar_orientation(&raw), Some(6));
+        std::fs::write(tmp.path().join("DSC1.xmp"), b"<d tiff:Orientation=\"9\"/>").unwrap();
+        assert_eq!(sidecar_orientation(&raw), None);
     }
 
     #[test]

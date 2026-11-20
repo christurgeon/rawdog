@@ -103,6 +103,8 @@ Convert only your picks. Ratings come from sidecar XMP files written by Lightroo
 rawdog -R /Volumes/CARD --min-rating 3 -o ./picks
 ```
 
+A rotation set while culling in Lightroom or Capture One is stored in the same sidecar file, and rawdog applies it in place of the camera's orientation. darktable keeps rotation in its edit history, which rawdog does not read.
+
 Or convert by colour label, from the same sidecar files. Lightroom and Capture One store the label name (`Red`, or the text set in Lightroom's label set); darktable's five colours are read as red, yellow, green, blue, and purple. A file with any of the listed labels is converted:
 
 ```sh
