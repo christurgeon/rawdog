@@ -17,6 +17,8 @@ pub struct MetadataOptions {
     /// The output pixels are sRGB, whatever colour space the camera was set
     /// to. False for `--preview`, which keeps the camera's own encoding.
     pub srgb: bool,
+    /// Print resolution in pixels per inch. Replaces the source value.
+    pub dpi: Option<u16>,
     /// Correction of the camera clock, applied to the capture dates.
     pub time_shift: Option<crate::timeshift::TimeShift>,
 }
@@ -370,6 +372,8 @@ fn fields_for_output<'a>(
     let replaced = |tag: Tag| {
         (tag == Tag::Artist && meta.artist.is_some())
             || (tag == Tag::Copyright && meta.copyright.is_some())
+            || (matches!(tag, Tag::XResolution | Tag::YResolution | Tag::ResolutionUnit)
+                && meta.dpi.is_some())
     };
     let text_field = |tag: Tag, text: &String| exif::Field {
         tag,
@@ -396,9 +400,23 @@ fn fields_for_output<'a>(
             .unwrap_or_else(crate::timeshift::current_year);
         text.replace("{year}", &year.to_string())
     });
+    let resolution = |tag: Tag| {
+        meta.dpi.map(|dpi| exif::Field {
+            tag,
+            ifd_num: exif::In::PRIMARY,
+            value: exif::Value::Rational(vec![exif::Rational { num: dpi.into(), denom: 1 }]),
+        })
+    };
     let added = [
         meta.artist.as_ref().map(|t| text_field(Tag::Artist, t)),
         copyright.as_ref().map(|t| text_field(Tag::Copyright, t)),
+        resolution(Tag::XResolution),
+        resolution(Tag::YResolution),
+        meta.dpi.map(|_| exif::Field {
+            tag: Tag::ResolutionUnit,
+            ifd_num: exif::In::PRIMARY,
+            value: exif::Value::Short(vec![2]), // inches
+        }),
     ];
 
     fields
@@ -866,6 +884,24 @@ mod tests {
         let out = fields_for_output(source.iter(), (300, 200), &meta);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].display_value().to_string(), "\"New\"");
+    }
+
+    #[test]
+    fn dpi_replaces_the_source_resolution() {
+        use exif::{In, Tag, Value};
+        let r = |v| Value::Rational(vec![exif::Rational { num: v, denom: 1 }]);
+        let source = [
+            field(Tag::XResolution, In::PRIMARY, r(350)),
+            field(Tag::YResolution, In::PRIMARY, r(350)),
+            field(Tag::ResolutionUnit, In::PRIMARY, Value::Short(vec![2])),
+        ];
+        let out = fields_for_output(source.iter(), (300, 200), &MetadataOptions::default());
+        assert_eq!(out.len(), 3);
+        let meta = MetadataOptions { dpi: Some(300), strip_all: true, ..Default::default() };
+        let out = fields_for_output(source.iter(), (300, 200), &meta);
+        assert_eq!(tags(&out), vec![Tag::XResolution, Tag::YResolution, Tag::ResolutionUnit]);
+        assert!(matches!(&out[0].value, Value::Rational(v) if v[0].num == 300 && v[0].denom == 1));
+        assert_eq!(out[2].value.get_uint(0), Some(2));
     }
 
     #[test]
