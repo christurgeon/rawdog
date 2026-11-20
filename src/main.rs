@@ -527,6 +527,21 @@ fn parse_defaults(text: &str) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
+/// The defaults as they would be typed: `--strip-gps, --sharpen 0.5`.
+fn defaults_summary(args: &[String]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for arg in args {
+        match parts.last_mut() {
+            Some(last) if !arg.starts_with("--") => {
+                last.push(' ');
+                last.push_str(arg);
+            }
+            _ => parts.push(arg.clone()),
+        }
+    }
+    parts.join(", ")
+}
+
 /// A value that starts with `~/` with the home directory in place of `~`,
 /// as a shell would do on the command line. The defaults file is not read
 /// by a shell. A `~` elsewhere, as in copyright text, is kept.
@@ -824,6 +839,7 @@ fn main() -> Result<()> {
     args.retain(|a| a != "--no-defaults");
     let typed = args.clone();
     let mut defaults_file = None;
+    let mut defaults_used: Vec<String> = Vec::new();
     if !skip_defaults {
         let path = defaults_path();
         if let (Some(path), Some(_)) = (&path, std::env::var_os("RAWDOG_DEFAULTS")) {
@@ -836,6 +852,7 @@ fn main() -> Result<()> {
                 .with_context(|| format!("Failed to read defaults file {}", path.display()))?;
             let defaults = parse_defaults(&text)
                 .map_err(|e| anyhow!("In defaults file {}: {e}", path.display()))?;
+            defaults_used = defaults.clone();
             args.splice(1..1, defaults.into_iter().map(Into::into));
             defaults_file = Some(path);
         }
@@ -853,6 +870,14 @@ fn main() -> Result<()> {
             e.exit()
         }
     };
+
+    // Options from the defaults file act without being typed; name them,
+    // so that a forgotten --watermark or --strip-gps is noticed.
+    if let (Some(path), false) = (&defaults_file, cli.quiet || cli.completions.is_some()) {
+        if !defaults_used.is_empty() {
+            eprintln!("Defaults from {}: {}", path.display(), defaults_summary(&defaults_used));
+        }
+    }
 
     if cli.watch.is_some()
         && (cli.burst_pick.is_some() || cli.name.as_ref().is_some_and(|t| t.uses_seq() || t.uses_burst()))
@@ -2244,6 +2269,14 @@ mod tests {
         let free = free_space(&tmp.path().join("not/yet/made")).unwrap();
         assert!(free > 0);
         assert!(free_space(Path::new("not-made-yet/sub")).is_some());
+    }
+
+    #[test]
+    fn defaults_summary_joins_options_with_their_values() {
+        let args: Vec<String> = ["--strip-gps", "--sharpen", "0.5", "--copyright", "(c) J. Doe"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(defaults_summary(&args), "--strip-gps, --sharpen 0.5, --copyright (c) J. Doe");
     }
 
     #[test]
