@@ -121,7 +121,15 @@ Dates are the camera clock's local date. A file without the metadata that a filt
 rawdog -R /Volumes/CARD -o ~/Pictures --name "{date}/{model}_{stem}"
 ```
 
-Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), `{model}`, and `{rating}` (0 for unrated). A file without that metadata gets `unknown`.
+Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), `{model}`, `{rating}` (0 for unrated), and `{seq}`. A file without that metadata gets `unknown`.
+
+`{seq}` numbers the files of the run in capture order (0001, 0002, ...). Two bodies at a wedding both write `DSC00001`, and a burst puts several frames in one second; with `{seq}` the files of both cameras get one sequence and never share a name:
+
+```sh
+rawdog -R /Volumes/CARD_A /Volumes/CARD_B -o ./wedding --name "{date}/{seq}_{stem}"
+```
+
+The numbers depend on which files the run converts: the same selection gives the same numbers, but adding files to a later run renumbers the files taken after them.
 
 The template path is below the `-o` directory. Without `-o` it is below the directory of each input file. With a template, `-R` does not mirror the input tree, so include `{date}` or another field that keeps equal file names apart.
 

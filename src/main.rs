@@ -54,7 +54,8 @@ struct Cli {
 
     /// Name template for output files, relative to the output directory
     /// and without extension. Fields: {stem} {date} {year} {month} {day}
-    /// {time} {model} {rating}. Example: "{date}/{model}_{stem}"
+    /// {time} {model} {rating} {seq}. {seq} numbers the files of the run
+    /// in capture order: 0001, 0002, ... Example: "{date}/{model}_{stem}"
     #[arg(long, value_name = "TEMPLATE")]
     name: Option<naming::NameTemplate>,
 
@@ -1052,6 +1053,20 @@ fn canonical(path: &Path) -> PathBuf {
 /// Pair each input with its output path. Fails without converting anything
 /// if two inputs would write the same output path.
 ///
+/// The `{seq}` value of each file: its position in capture order, from 1,
+/// with at least four digits. Files with the same capture time are ordered
+/// by path, and files without one come last.
+fn sequence_numbers(files: &[InputFile], infos: &[naming::NameInfo]) -> Vec<String> {
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by_key(|&i| (infos[i].taken.is_none(), infos[i].taken, &files[i].path));
+    let width = files.len().to_string().len().max(4);
+    let mut seqs = vec![String::new(); files.len()];
+    for (n, &i) in order.iter().enumerate() {
+        seqs[i] = format!("{:0width$}", n + 1);
+    }
+    seqs
+}
+
 /// With a name template, the output goes to the template's path below the
 /// output directory (or below the input's directory when there is none), and
 /// the scanned subdirectory is not mirrored.
@@ -1064,10 +1079,16 @@ fn plan_outputs(
     // Reading EXIF for the template opens every file, so do it in parallel.
     let named: Option<Vec<PathBuf>> = template.map(|t| {
         let needs_exif = t.needs_exif();
-        files
+        let infos: Vec<naming::NameInfo> = files
             .par_iter()
-            .map(|f| t.expand(&naming::NameInfo::read(&f.path, needs_exif)))
-            .collect()
+            .map(|f| naming::NameInfo::read(&f.path, needs_exif))
+            .collect();
+        let seqs = if t.uses_seq() {
+            sequence_numbers(files, &infos)
+        } else {
+            vec![String::new(); files.len()]
+        };
+        infos.iter().zip(&seqs).map(|(info, seq)| t.expand(info, seq)).collect()
     });
 
     let mut jobs = Vec::with_capacity(files.len());
@@ -1403,6 +1424,33 @@ mod tests {
             camera: None,
             picks: None,
         }
+    }
+
+    #[test]
+    fn sequence_numbers_follow_capture_time_then_path() {
+        let file = |p: &str| InputFile { path: PathBuf::from(p), rel_dir: PathBuf::new() };
+        let taken = |t: Option<(u16, u8, u8, u8, u8, u8)>| naming::NameInfo {
+            taken: t,
+            ..Default::default()
+        };
+        let files = [file("b/2.arw"), file("a/9.arw"), file("c/1.arw"), file("a/1.arw")];
+        let infos = [
+            taken(Some((2026, 11, 14, 18, 2, 5))),
+            taken(Some((2026, 11, 14, 18, 2, 5))),
+            taken(None),
+            taken(Some((2026, 11, 14, 9, 0, 0))),
+        ];
+        assert_eq!(sequence_numbers(&files, &infos), ["0003", "0002", "0004", "0001"]);
+    }
+
+    #[test]
+    fn sequence_numbers_widen_for_large_runs() {
+        let files: Vec<InputFile> = (0..10_000)
+            .map(|i| InputFile { path: PathBuf::from(format!("{i:05}.arw")), rel_dir: PathBuf::new() })
+            .collect();
+        let infos: Vec<naming::NameInfo> = (0..10_000).map(|_| Default::default()).collect();
+        let seqs = sequence_numbers(&files, &infos);
+        assert_eq!((seqs[0].as_str(), seqs[9_999].as_str()), ("00001", "10000"));
     }
 
     #[test]
