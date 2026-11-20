@@ -55,6 +55,12 @@ Several sizes at once, each in its own folder below `-o` (`./delivery/3000/`, `.
 rawdog ./wedding -r 3000,2048,1080 --fast -o ./delivery
 ```
 
+`full` stands for the full size, and `--watermark-sizes` puts the watermark on some sizes only, so clean finals and marked web copies come from one run:
+
+```sh
+rawdog ./wedding -r full,2048 --watermark ~/logo.png --watermark-sizes 2048 -o ./delivery
+```
+
 Resized images look soft; `--sharpen` adds output sharpening, with an optional amount from 0 to 3 (default 0.5):
 
 ```sh

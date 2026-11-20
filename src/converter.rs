@@ -48,6 +48,8 @@ pub struct ConvertOptions {
     pub with_jpeg: bool,
     /// A logo blended into the bottom-right corner of every image.
     pub watermark: Option<std::sync::Arc<image::RgbaImage>>,
+    /// The `resize` values that get the watermark; empty for all.
+    pub watermark_sizes: Vec<u32>,
     pub metadata: exif_utils::MetadataOptions,
 }
 
@@ -195,7 +197,7 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
             match format {
                 OutputFormat::Jpeg => {
                     let mut img = source.rgb8(opts)?;
-                    if let Some(mark) = &opts.watermark {
+                    if let Some(mark) = watermark_for(opts) {
                         apply_watermark(&mut img, mark);
                     }
                     let bytes = encode_jpeg(&img, input, opts)?;
@@ -203,7 +205,7 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
                 }
                 OutputFormat::Tiff => {
                     let mut img = source.rgb16(opts)?;
-                    if let Some(mark) = &opts.watermark {
+                    if let Some(mark) = watermark_for(opts) {
                         apply_watermark(&mut img, mark);
                     }
                     write_tiff(&img, input, &mut out, opts).with_context(unwritable)?;
@@ -211,7 +213,7 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
                 OutputFormat::Original => unreachable!("handled by copy_original"),
                 OutputFormat::Png => {
                     let mut img = source.rgb16(opts)?;
-                    if let Some(mark) = &opts.watermark {
+                    if let Some(mark) = watermark_for(opts) {
                         apply_watermark(&mut img, mark);
                     }
                     write_png(&img, input, &mut out, opts).with_context(unwritable)?;
@@ -262,7 +264,7 @@ pub fn convert_raw_sizes(
                 .map(|(output, size)| {
                     guarded(|| {
                         let mut img = maybe_resize_8bit(full.clone(), *size);
-                        finish_image(&mut img, opts);
+                        finish_image(&mut img, &sized(*size));
                         let bytes = encode_jpeg(&img, input, &sized(*size))?;
                         write_atomically(output, |out| Ok(out.write_all(&bytes)?))
                     })
@@ -283,7 +285,7 @@ pub fn convert_raw_sizes(
                         if linear {
                             encode_srgb(&mut img);
                         }
-                        finish_image(&mut img, opts);
+                        finish_image(&mut img, &sized(*size));
                         let opts = sized(*size);
                         write_atomically(output, |out| match opts.format {
                             OutputFormat::Tiff => write_tiff(&img, input, out, &opts),
@@ -304,6 +306,13 @@ fn guarded(work: impl FnOnce() -> Result<()>) -> Result<()> {
         .unwrap_or_else(|_| Err(anyhow!("encoding panicked")))
 }
 
+/// The watermark for an output of `opts.resize`, if it gets one.
+fn watermark_for(opts: &ConvertOptions) -> Option<&image::RgbaImage> {
+    let sized = opts.watermark_sizes.is_empty()
+        || opts.resize.is_some_and(|r| opts.watermark_sizes.contains(&r));
+    opts.watermark.as_deref().filter(|_| sized)
+}
+
 /// Output sharpening and the watermark, after the resize.
 fn finish_image<S>(img: &mut ImageBuffer<Rgb<S>, Vec<S>>, opts: &ConvertOptions)
 where
@@ -313,7 +322,7 @@ where
     if let Some(amount) = opts.sharpen {
         sharpen(img, amount);
     }
-    if let Some(mark) = &opts.watermark {
+    if let Some(mark) = watermark_for(opts) {
         apply_watermark(img, mark);
     }
 }
@@ -2013,6 +2022,7 @@ mod tests {
             sharpen: None,
             preview: true,
             watermark: None,
+            watermark_sizes: Vec::new(),
             with_jpeg: false,
             metadata: Default::default(),
         }
@@ -2144,6 +2154,7 @@ mod tests {
                 sharpen: None,
                 preview: false,
                 watermark: None,
+                watermark_sizes: Vec::new(),
                 with_jpeg: false,
                 metadata: Default::default(),
             },
@@ -2173,6 +2184,7 @@ mod tests {
                 sharpen: None,
                 preview: false,
                 watermark: None,
+                watermark_sizes: Vec::new(),
                 with_jpeg: false,
                 metadata: Default::default(),
             },
