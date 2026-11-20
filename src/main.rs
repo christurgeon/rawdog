@@ -109,7 +109,9 @@ struct Cli {
     camera: Option<String>,
 
     /// Convert only files taken with a lens whose name contains this text
-    /// (not case-sensitive), for example "70-200" or "GM"
+    /// (not case-sensitive), for example "70-200" or "GM". Some cameras
+    /// (Nikon DSLRs, Pentax, older Panasonic) record no lens name that
+    /// rawdog reads; their files are excluded
     #[arg(long, value_name = "LENS", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     lens: Option<String>,
 
@@ -357,8 +359,11 @@ fn write_gallery(
 #[cfg(unix)]
 fn free_space(dir: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
-    let existing = dir.ancestors().find(|p| p.exists())?;
-    let path = if existing.as_os_str().is_empty() { Path::new(".") } else { existing };
+    // A relative path ends in "", which is the current directory.
+    let path = dir
+        .ancestors()
+        .map(|p| if p.as_os_str().is_empty() { Path::new(".") } else { p })
+        .find(|p| p.exists())?;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     // SAFETY: statvfs fills the zeroed struct and reads only the
     // NUL-terminated path.
@@ -1961,6 +1966,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let free = free_space(&tmp.path().join("not/yet/made")).unwrap();
         assert!(free > 0);
+        assert!(free_space(Path::new("not-made-yet/sub")).is_some());
     }
 
     #[test]

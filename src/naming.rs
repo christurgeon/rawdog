@@ -137,10 +137,19 @@ pub struct Exposure {
     pub shutter: Option<(u32, u32)>,
 }
 
+/// `v` with up to `decimals` decimals, without trailing zeros: 2.8, 8, 0.95.
+fn trimmed(v: f64, decimals: usize) -> String {
+    let text = format!("{v:.decimals$}");
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        text
+    }
+}
+
 /// `v` with one decimal, without a trailing ".0": 2.8, 8, 4.2.
 fn one_decimal(v: f64) -> String {
-    let text = format!("{v:.1}");
-    text.strip_suffix(".0").map(str::to_string).unwrap_or(text)
+    trimmed(v, 1)
 }
 
 impl Exposure {
@@ -162,7 +171,7 @@ impl Exposure {
         match token {
             Token::Iso => self.iso.map(|v| v.to_string()),
             Token::Focal => self.focal_mm.map(|v| format!("{}mm", one_decimal(v))),
-            Token::Aperture => self.aperture.map(|v| format!("f{}", one_decimal(v))),
+            Token::Aperture => self.aperture.map(|v| format!("f{}", trimmed(v, 2))),
             Token::Shutter => self.shutter_parts().map(|(fraction, v)| {
                 if fraction { format!("1-{v}s") } else { format!("{v}s") }
             }),
@@ -177,7 +186,7 @@ impl Exposure {
             parts.push(if fraction { format!("1/{v} s") } else { format!("{v} s") });
         }
         if let Some(v) = self.aperture {
-            parts.push(format!("f/{}", one_decimal(v)));
+            parts.push(format!("f/{}", trimmed(v, 2)));
         }
         if let Some(v) = self.iso {
             parts.push(format!("ISO {v}"));
@@ -239,9 +248,15 @@ impl NameInfo {
         };
         let decimal = |tag| rational(tag).map(|(n, d)| f64::from(n) / f64::from(d)).filter(|v| *v > 0.0);
         info.exposure = Exposure {
+            // Older Panasonic RW2 files keep the ISO in their own IFD0 tag.
             iso: field(exif::Tag::PhotographicSensitivity)
                 .and_then(|v| v.get_uint(0))
-                .filter(|v| *v > 0),
+                .filter(|v| *v > 0)
+                .or_else(|| {
+                    field(exif::Tag(exif::Context::Tiff, 0x17))
+                        .and_then(|v| v.get_uint(0))
+                        .filter(|v| *v > 0)
+                }),
             focal_mm: decimal(exif::Tag::FocalLength),
             aperture: decimal(exif::Tag::FNumber),
             shutter: rational(exif::Tag::ExposureTime),
@@ -570,6 +585,10 @@ mod tests {
         let long = Exposure { shutter: Some((25, 10)), focal_mm: Some(4.2), ..Default::default() };
         assert_eq!(long.field(Token::Shutter).as_deref(), Some("2.5s"));
         assert_eq!(long.caption(), "2.5 s · 4.2 mm");
+        let noct = Exposure { aperture: Some(0.95), ..Default::default() };
+        assert_eq!(noct.field(Token::Aperture).as_deref(), Some("f0.95"));
+        assert_eq!(trimmed(8.0, 2), "8");
+        assert_eq!(trimmed(2.8, 2), "2.8");
         let burst: NameTemplate = "{burst}/{stem}".parse().unwrap();
         assert!(burst.uses_burst() && burst.needs_exif());
         assert_eq!(burst.expand(&info(), "", "0003"), PathBuf::from("0003/DSC0001"));
