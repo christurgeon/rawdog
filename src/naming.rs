@@ -12,6 +12,8 @@ enum Token {
     Day,
     Time,
     Model,
+    Lens,
+    Serial,
     Rating,
     Seq,
 }
@@ -24,6 +26,8 @@ const TOKENS: &[(&str, Token)] = &[
     ("day", Token::Day),
     ("time", Token::Time),
     ("model", Token::Model),
+    ("lens", Token::Lens),
+    ("serial", Token::Serial),
     ("rating", Token::Rating),
     ("seq", Token::Seq),
 ];
@@ -95,6 +99,9 @@ pub struct NameInfo {
     pub stem: String,
     pub taken: Option<Taken>,
     pub model: Option<String>,
+    pub lens: Option<String>,
+    /// The camera body's serial number.
+    pub serial: Option<String>,
     /// Star rating: 1 to 5, 0 for unrated, -1 for rejected (Lightroom).
     pub rating: Option<i8>,
     /// Colour labels in lower case, such as "red". Empty when unlabelled.
@@ -134,9 +141,14 @@ impl NameInfo {
             .or_else(|| ascii(exif::Tag::DateTime))
             .and_then(|raw| exif::DateTime::from_ascii(&raw).ok())
             .map(|d| (d.year, d.month, d.day, d.hour, d.minute, d.second));
-        info.model = ascii(exif::Tag::Model)
-            .map(|raw| String::from_utf8_lossy(&raw).trim().to_string())
-            .filter(|m| !m.is_empty());
+        let text = |tag| {
+            ascii(tag)
+                .map(|raw| String::from_utf8_lossy(&raw).trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        info.model = text(exif::Tag::Model);
+        info.lens = text(exif::Tag::LensModel);
+        info.serial = text(exif::Tag::BodySerialNumber);
         info.rating = read_rating(path, &fields);
         info.labels = read_labels(path, &fields);
         info
@@ -360,6 +372,8 @@ impl NameTemplate {
                         Token::Day => taken(|(_, _, d, ..)| format!("{d:02}")),
                         Token::Time => taken(|(_, _, _, h, m, s)| format!("{h:02}{m:02}{s:02}")),
                         Token::Model => info.model.clone().unwrap_or_else(unknown),
+                        Token::Lens => info.lens.clone().unwrap_or_else(unknown),
+                        Token::Serial => info.serial.clone().unwrap_or_else(unknown),
                         Token::Rating => info.rating.unwrap_or(0).to_string(),
                         Token::Seq => seq.to_string(),
                     };
@@ -367,7 +381,9 @@ impl NameTemplate {
                     // be the name of the current or the parent directory.
                     let dots_only = !value.is_empty() && value.chars().all(|c| c == '.');
                     out.extend(value.chars().map(|c| match c {
-                        '/' | '\\' | ':' | '\0' => '_',
+                        // Also characters that exFAT and Windows reject, as
+                        // in the lens name "50mm F1.4 DG HSM | A".
+                        '/' | '\\' | ':' | '\0' | '|' | '*' | '?' | '"' | '<' | '>' => '_',
                         '.' if dots_only => '_',
                         c => c,
                     }));
@@ -388,7 +404,9 @@ mod tests {
             taken: Some((2024, 3, 9, 7, 5, 42)),
             model: Some("ILCE-7M3".to_string()),
             rating: Some(4),
-            labels: Vec::new(),
+            lens: Some("FE 24-70mm F2.8 GM II".to_string()),
+            serial: Some("4012345".to_string()),
+            ..Default::default()
         }
     }
 
@@ -495,6 +513,18 @@ mod tests {
         assert_eq!(read_rating(&raw, &in_file), Some(4));
         std::fs::write(tmp.path().join("DSC1.xmp"), b"xmp:Rating=\"5\"").unwrap();
         assert_eq!(read_rating(&raw, &in_file), Some(5));
+    }
+
+    #[test]
+    fn expand_lens_and_serial() {
+        assert_eq!(
+            expand("{lens}/{serial}_{stem}", &info()),
+            PathBuf::from("FE 24-70mm F2.8 GM II/4012345_DSC0001")
+        );
+        let bare = NameInfo { stem: "a".to_string(), ..Default::default() };
+        assert_eq!(expand("{lens}_{serial}", &bare), PathBuf::from("unknown_unknown"));
+        let sigma = NameInfo { lens: Some("50mm F1.4 DG | A <x>*?\"".to_string()), ..Default::default() };
+        assert_eq!(expand("{lens}", &sigma), PathBuf::from("50mm F1.4 DG _ A _x____"));
     }
 
     #[test]
