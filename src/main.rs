@@ -47,6 +47,7 @@ struct Cli {
 
     /// Read more inputs from this file, one path per line; "-" reads
     /// standard input, as in `find ... | rawdog --files-from - -o out`.
+    /// Relative paths are relative to the current directory.
     /// All inputs form one run, so --name {seq}, --report, and --gallery
     /// cover them all
     #[arg(long, value_name = "FILE")]
@@ -890,6 +891,18 @@ fn main() -> Result<()> {
         }
 
         if should_skip(input_path, output_path, cli.overwrite, cli.update) {
+            // A RAW file archived earlier may lack its camera JPEG, because
+            // --with-jpeg was not given then or the copy failed.
+            if opts.with_jpeg {
+                if let Err(e) = converter::copy_companions(input_path, output_path, false) {
+                    eprintln!("Error converting {}: {:#}", input_path.display(), e);
+                    record(input_path, output_path, report::Status::Failed, format!("{e:#}"), 0.0);
+                    failures.lock().unwrap().push(input_path.clone());
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    pb.inc(1);
+                    return;
+                }
+            }
             record(
                 input_path,
                 output_path,
@@ -1184,7 +1197,8 @@ fn canonical(path: &Path) -> PathBuf {
 /// The paths of a `--files-from` list: one per line. Spaces are kept, as
 /// they can be part of a name; empty lines and Windows line ends are not.
 fn input_list(text: &str) -> Vec<PathBuf> {
-    text.lines()
+    text.trim_start_matches('\u{feff}')
+        .lines()
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
         .filter(|line| !line.trim().is_empty())
         .map(PathBuf::from)
@@ -1631,7 +1645,7 @@ mod tests {
     #[test]
     fn input_list_keeps_spaces_and_skips_empty_lines() {
         assert_eq!(
-            input_list("a/IMG 1.CR3\r\n\n  \nb.ARW\n"),
+            input_list("\u{feff}a/IMG 1.CR3\r\n\n  \nb.ARW\n"),
             [PathBuf::from("a/IMG 1.CR3"), PathBuf::from("b.ARW")]
         );
     }
