@@ -38,6 +38,8 @@ pub struct ConvertOptions {
     /// Use the JPEG preview that the camera embedded in the RAW file
     /// instead of developing the RAW data.
     pub preview: bool,
+    /// A logo blended into the bottom-right corner of every image.
+    pub watermark: Option<std::sync::Arc<image::RgbaImage>>,
     pub metadata: exif_utils::MetadataOptions,
 }
 
@@ -113,17 +115,26 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
             let mut out = std::io::BufWriter::new(file);
             match format {
                 OutputFormat::Jpeg => {
-                    let img = source.rgb8(input, opts)?;
+                    let mut img = source.rgb8(input, opts)?;
+                    if let Some(mark) = &opts.watermark {
+                        apply_watermark(&mut img, mark);
+                    }
                     let bytes = encode_jpeg(&img, input, opts)?;
                     out.write_all(&bytes).with_context(unwritable)?;
                 }
                 OutputFormat::Tiff => {
-                    let img = source.rgb16(input, opts)?;
+                    let mut img = source.rgb16(input, opts)?;
+                    if let Some(mark) = &opts.watermark {
+                        apply_watermark(&mut img, mark);
+                    }
                     write_tiff(&img, input, &mut out, opts).with_context(unwritable)?;
                 }
                 OutputFormat::Original => unreachable!("handled by copy_original"),
                 OutputFormat::Png => {
-                    let img = source.rgb16(input, opts)?;
+                    let mut img = source.rgb16(input, opts)?;
+                    if let Some(mark) = &opts.watermark {
+                        apply_watermark(&mut img, mark);
+                    }
                     write_png(&img, input, &mut out, opts).with_context(unwritable)?;
                 }
             }
@@ -869,6 +880,59 @@ where
     }
 }
 
+/// Blend `mark` into the bottom-right corner of `img`. The long side of the
+/// mark is a fifth of the image's short edge, so the mark has the same size
+/// on landscape and portrait images; the margin is 3% of the short edge.
+fn apply_watermark<S>(img: &mut ImageBuffer<Rgb<S>, Vec<S>>, mark: &image::RgbaImage)
+where
+    S: Sample,
+    Rgb<S>: image::Pixel<Subpixel = S> + 'static,
+{
+    let (width, height) = img.dimensions();
+    let short = width.min(height) as f32;
+    let (mark_w, mark_h) = mark.dimensions();
+    let scale = short * 0.2 / mark_w.max(mark_h) as f32;
+    let new_w = ((mark_w as f32 * scale).round() as u32).max(1);
+    let new_h = ((mark_h as f32 * scale).round() as u32).max(1);
+    let margin = (short * 0.03).round() as u32;
+    if new_w + margin > width || new_h + margin > height {
+        return;
+    }
+
+    // Scale with premultiplied alpha, so the colour of transparent pixels
+    // does not leave a dark or light fringe around the mark.
+    let premultiplied = image::Rgba32FImage::from_fn(mark_w, mark_h, |x, y| {
+        let p = mark.get_pixel(x, y);
+        let a = p[3] as f32 / 255.0;
+        image::Rgba([
+            p[0] as f32 / 255.0 * a,
+            p[1] as f32 / 255.0 * a,
+            p[2] as f32 / 255.0 * a,
+            a,
+        ])
+    });
+    let scaled = image::imageops::resize(
+        &premultiplied,
+        new_w,
+        new_h,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    let max = S::DEFAULT_MAX_VALUE.as_f32();
+    let (left, top) = (width - margin - new_w, height - margin - new_h);
+    for (x, y, p) in scaled.enumerate_pixels() {
+        let a = p[3].clamp(0.0, 1.0);
+        if a == 0.0 {
+            continue;
+        }
+        let dst = img.get_pixel_mut(left + x, top + y);
+        for c in 0..3 {
+            let fg = p[c].clamp(0.0, a) * max;
+            dst[c] = S::from_f32(dst[c].as_f32() * (1.0 - a) + fg);
+        }
+    }
+}
+
 /// Lookup table that maps linear 16-bit samples to sRGB-encoded 16-bit samples.
 fn srgb_encode_lut() -> Vec<u16> {
     (0..=u16::MAX)
@@ -959,6 +1023,33 @@ mod tests {
     // Helper to create a solid-color 16-bit test image
     fn make_16bit_image(width: u32, height: u32) -> ImageBuffer<Rgb<u16>, Vec<u16>> {
         ImageBuffer::from_fn(width, height, |_x, _y| Rgb([32768u16, 16384, 8192]))
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_watermark tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn watermark_goes_into_the_bottom_right_corner() {
+        // An opaque white mark, 10x5, on a black 600x400 image: the mark
+        // becomes 80x40 (a fifth of 400) with a margin of 12.
+        let mark = image::RgbaImage::from_pixel(10, 5, image::Rgba([255, 255, 255, 255]));
+        let mut img = RgbImage::new(600, 400);
+        apply_watermark(&mut img, &mark);
+        assert_eq!(img.get_pixel(600 - 12 - 40, 400 - 12 - 20)[0], 255);
+        assert_eq!(img.get_pixel(600 - 12 - 79, 400 - 12 - 39)[1], 255);
+        assert_eq!(img.get_pixel(600 - 12 - 82, 400 - 12 - 20)[0], 0);
+        assert_eq!(img.get_pixel(600 - 5, 400 - 5)[0], 0);
+        assert_eq!(img.get_pixel(10, 10)[0], 0);
+    }
+
+    #[test]
+    fn watermark_blends_with_alpha_in_16_bit() {
+        let mark = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 128]));
+        let mut img: ImageBuffer<Rgb<u16>, Vec<u16>> = ImageBuffer::new(500, 500);
+        apply_watermark(&mut img, &mark);
+        let v = img.get_pixel(500 - 15 - 50, 500 - 15 - 50)[0];
+        assert!((32_000..=33_500).contains(&v), "{v}");
     }
 
     // -----------------------------------------------------------------------
@@ -1352,6 +1443,7 @@ mod tests {
             white_balance: None,
             sharpen: None,
             preview: true,
+            watermark: None,
             metadata: Default::default(),
         }
     }
@@ -1479,6 +1571,7 @@ mod tests {
                 white_balance: None,
                 sharpen: None,
                 preview: false,
+                watermark: None,
                 metadata: Default::default(),
             },
         );
@@ -1504,6 +1597,7 @@ mod tests {
                 white_balance: None,
                 sharpen: None,
                 preview: false,
+                watermark: None,
                 metadata: Default::default(),
             },
         );

@@ -1041,3 +1041,29 @@ fn cli_picks_rejects_an_empty_list() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("names no files"));
 }
+
+#[test]
+fn cli_watermark_marks_the_bottom_right_corner() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("grey.png");
+    image::RgbImage::from_pixel(200, 100, image::Rgb([100, 100, 100]))
+        .save(&input)
+        .unwrap();
+    let mark = tmp.path().join("logo.png");
+    image::RgbaImage::from_pixel(20, 20, image::Rgba([255, 255, 255, 255]))
+        .save(&mark)
+        .unwrap();
+    let out_dir = tmp.path().join("out");
+    let output = run(&[
+        input.as_ref(),
+        "-o".as_ref(),
+        out_dir.as_ref(),
+        "--watermark".as_ref(),
+        mark.as_ref(),
+    ]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // The mark is 20x20 (a fifth of 100) with a margin of 3.
+    let img = image::open(out_dir.join("grey.jpg")).unwrap().into_rgb8();
+    assert!(img.get_pixel(200 - 3 - 10, 100 - 3 - 10)[0] > 240);
+    assert!(img.get_pixel(100, 50)[0] < 200);
+}
