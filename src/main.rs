@@ -37,13 +37,20 @@ pub enum OutputFormat {
     // Options from the defaults file come first; a later value wins.
     args_override_self = true,
     after_help = "Default options can be set in ~/.config/rawdog/defaults (or the file named by \
-                  RAWDOG_DEFAULTS): one option per line, for example `--copyright (c) 2026 J. Doe`."
+                  RAWDOG_DEFAULTS): one option per line, for example `--copyright (c) {year} J. Doe`."
 )]
 struct Cli {
     /// One or more RAW files, or directories that contain RAW files.
     /// Sony ARW and most other camera RAW formats are accepted
-    #[arg(required_unless_present = "completions")]
+    #[arg(required_unless_present_any = ["completions", "files_from"])]
     input: Vec<PathBuf>,
+
+    /// Read more inputs from this file, one path per line; "-" reads
+    /// standard input, as in `find ... | rawdog --files-from - -o out`.
+    /// All inputs form one run, so --name {seq}, --report, and --gallery
+    /// cover them all
+    #[arg(long, value_name = "FILE")]
+    files_from: Option<PathBuf>,
 
     /// Generate shell completion script and exit
     #[arg(long, value_enum, value_name = "SHELL")]
@@ -633,9 +640,28 @@ fn main() -> Result<()> {
     };
 
     // Collect all RAW files from inputs
-    let files = collect_raw_files(&cli.input, cli.recursive)?;
+    let mut inputs = cli.input.clone();
+    if let Some(list) = &cli.files_from {
+        let text = if list.as_os_str() == "-" {
+            std::io::read_to_string(std::io::stdin()).context("Failed to read standard input")?
+        } else {
+            std::fs::read_to_string(list)
+                .with_context(|| format!("Failed to read file list {}", list.display()))?
+        };
+        let listed = input_list(&text);
+        if listed.is_empty() && inputs.is_empty() {
+            let source = if list.as_os_str() == "-" {
+                "Standard input".to_string()
+            } else {
+                format!("The file list {}", list.display())
+            };
+            bail!("{source} names no files.");
+        }
+        inputs.extend(listed);
+    }
+    let files = collect_raw_files(&inputs, cli.recursive)?;
     // Same condition under which collect_raw_files warns "does not exist".
-    let missing_inputs = cli.input.iter().any(|p| !p.is_dir() && !p.is_file());
+    let missing_inputs = inputs.iter().any(|p| !p.is_dir() && !p.is_file());
 
     if files.is_empty() {
         if missing_inputs {
@@ -1155,6 +1181,16 @@ fn canonical(path: &Path) -> PathBuf {
 /// Pair each input with its output path. Fails without converting anything
 /// if two inputs would write the same output path.
 ///
+/// The paths of a `--files-from` list: one per line. Spaces are kept, as
+/// they can be part of a name; empty lines and Windows line ends are not.
+fn input_list(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .filter(|line| !line.trim().is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
 /// The `{seq}` value of each file: its position in capture order, from 1,
 /// with at least four digits. Files with the same capture time are ordered
 /// by path, and files without one come last.
@@ -1590,6 +1626,14 @@ mod tests {
         let infos: Vec<naming::NameInfo> = (0..10_000).map(|_| Default::default()).collect();
         let seqs = sequence_numbers(&files, &infos, 1);
         assert_eq!((seqs[0].as_str(), seqs[9_999].as_str()), ("00001", "10000"));
+    }
+
+    #[test]
+    fn input_list_keeps_spaces_and_skips_empty_lines() {
+        assert_eq!(
+            input_list("a/IMG 1.CR3\r\n\n  \nb.ARW\n"),
+            [PathBuf::from("a/IMG 1.CR3"), PathBuf::from("b.ARW")]
+        );
     }
 
     #[test]

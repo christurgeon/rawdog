@@ -191,6 +191,12 @@ rawdog ./photos/ --quiet                     # print errors only
 
 By default rawdog chooses how many files to convert at the same time from the installed RAM and the size of the largest input, because too many large files at once make the system swap. The choice does not know how much memory other apps use. If a browser or editor already holds most of it, full-size runs can stall while the system swaps; use `-j 1`, or `--fast` for proofs, which needs about a third of the memory.
 
+For a list of files made by another program, `--files-from` reads one path per line from a file, or from standard input with `-`. All files form one run, so `{seq}`, the conflict check, `--report`, and `--gallery` cover them all, which `xargs` does not guarantee:
+
+```sh
+find /Volumes/CARD -name "*.ARW" -newer last-import | rawdog --files-from - -o ./new
+```
+
 `--report` lists each file with its output, its status (converted, skipped, failed, or excluded), the error message, and the time taken. It is JSON if the name ends in `.json`, otherwise CSV.
 
 ### Default options
