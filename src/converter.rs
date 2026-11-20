@@ -568,10 +568,13 @@ fn copy_original(input: &Path, output: &Path, with_jpeg: bool) -> Result<()> {
             copy.set_modified(modified).with_context(unwritable)?;
         }
         drop(copy);
-        if !same_contents(input, &tmp)? {
+        let (same, hash) = compare_copy(input, &tmp, manifest::enabled())?;
+        if !same {
             return Err(anyhow!("the copy differs from the original; the disk may be failing"));
         }
-        std::fs::rename(&tmp, output).with_context(unwritable)
+        std::fs::rename(&tmp, output).with_context(unwritable)?;
+        manifest::record(output, hash);
+        Ok(())
     })();
 
     if result.is_err() {
@@ -636,10 +639,12 @@ fn copy_verified(source: &Path, destination: &Path, keep_time: bool) -> Result<(
                 std::fs::File::options().write(true).open(&tmp)?.set_modified(modified)?;
             }
         }
-        if !same_contents(source, &tmp)? {
+        let (same, hash) = compare_copy(source, &tmp, manifest::enabled())?;
+        if !same {
             return Err(anyhow!("the copy differs from the original"));
         }
         std::fs::rename(&tmp, destination)?;
+        manifest::record(destination, hash);
         Ok(())
     })();
     if result.is_err() {
@@ -677,23 +682,111 @@ fn copy_sidecars(input: &Path, output: &Path) -> Result<()> {
 
 /// True if the two files have the same bytes.
 fn same_contents(a: &Path, b: &Path) -> Result<bool> {
+    Ok(compare_copy(a, b, false)?.0)
+}
+
+/// Compare `copy` with `original` byte for byte. With `hash`, also return
+/// the SHA-256 of the copy as hex, computed in the same pass.
+fn compare_copy(original: &Path, copy: &Path, hash: bool) -> Result<(bool, Option<String>)> {
+    use sha2::Digest;
     use std::io::Read;
     let open = |p: &Path| {
         std::fs::File::open(p).with_context(|| format!("Failed to read {}", p.display()))
     };
-    let (mut fa, mut fb) = (open(a)?, open(b)?);
+    let (mut fa, mut fb) = (open(original)?, open(copy)?);
     if fa.metadata()?.len() != fb.metadata()?.len() {
-        return Ok(false);
+        return Ok((false, None));
     }
+    let mut hasher = hash.then(sha2::Sha256::new);
     let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
     loop {
         let n = fa.read(&mut ba)?;
         if n == 0 {
-            return Ok(true);
+            let hex = hasher.map(|h| h.finalize().iter().map(|b| format!("{b:02x}")).collect());
+            return Ok((true, hex));
         }
         fb.read_exact(&mut bb[..n])?;
         if ba[..n] != bb[..n] {
-            return Ok(false);
+            return Ok((false, None));
+        }
+        if let Some(h) = hasher.as_mut() {
+            h.update(&bb[..n]);
+        }
+    }
+}
+
+/// `--manifest`: the SHA-256 of every verified copy of a run, written to a
+/// `SHA256SUMS` file in each destination folder at the end.
+pub mod manifest {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static ENTRIES: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+
+    pub const FILE_NAME: &str = "SHA256SUMS";
+
+    pub fn enable() {
+        ENABLED.store(true, Ordering::Relaxed);
+    }
+
+    pub fn enabled() -> bool {
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn record(path: &Path, hash: Option<String>) {
+        if let Some(hash) = hash {
+            ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).push((path.to_path_buf(), hash));
+        }
+    }
+
+    /// Merge the recorded hashes into each folder's `SHA256SUMS`, in the
+    /// format that `shasum -a 256 -c` reads. A file copied again replaces
+    /// its line. Returns the number of files written.
+    pub fn write() -> std::io::Result<usize> {
+        let entries = std::mem::take(&mut *ENTRIES.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut by_dir: BTreeMap<PathBuf, Vec<(String, String)>> = BTreeMap::new();
+        for (path, hash) in entries {
+            let dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            by_dir.entry(dir).or_default().push((name, hash));
+        }
+        for (dir, new) in &by_dir {
+            let file = dir.join(FILE_NAME);
+            let mut lines: BTreeMap<String, String> = std::fs::read_to_string(&file)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.split_once("  "))
+                .map(|(hash, name)| (name.to_string(), hash.to_string()))
+                .collect();
+            for (name, hash) in new {
+                lines.insert(name.clone(), hash.clone());
+            }
+            let text: String = lines.iter().map(|(name, hash)| format!("{hash}  {name}\n")).collect();
+            let tmp = dir.join(format!(".{FILE_NAME}.rawdog-tmp"));
+            std::fs::write(&tmp, text)?;
+            std::fs::rename(&tmp, &file)?;
+        }
+        Ok(by_dir.len())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn write_merges_into_the_existing_manifest() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let file = tmp.path().join(super::FILE_NAME);
+            std::fs::write(&file, "aaaa  A.ARW\nbbbb  B.ARW\n").unwrap();
+            super::record(&tmp.path().join("B.ARW"), Some("cccc".to_string()));
+            super::record(&tmp.path().join("C.JPG"), Some("dddd".to_string()));
+            super::record(&tmp.path().join("D.ARW"), None);
+            assert_eq!(super::write().unwrap(), 1);
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "aaaa  A.ARW\ncccc  B.ARW\ndddd  C.JPG\n"
+            );
         }
     }
 }
@@ -1580,6 +1673,21 @@ mod tests {
         copy_companions(&input, &out.join("2024_DSC1.ARW"), false).unwrap();
         assert_eq!(std::fs::read(out.join("2024_DSC1.HIF")).unwrap(), b"heif");
         assert_eq!(std::fs::read(&copied).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn compare_copy_hashes_the_copy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::write(&a, b"abc").unwrap();
+        std::fs::write(&b, b"abc").unwrap();
+        let (same, hash) = compare_copy(&a, &b, true).unwrap();
+        assert!(same);
+        assert_eq!(
+            hash.as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert_eq!(compare_copy(&a, &b, false).unwrap(), (true, None));
     }
 
     #[test]

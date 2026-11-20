@@ -216,6 +216,12 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["fast", "exposure", "wb"])]
     preview: bool,
 
+    /// With -f original, write a SHA256SUMS file into each destination
+    /// folder, so `shasum -a 256 -c SHA256SUMS` can later prove that the
+    /// archive is unchanged
+    #[arg(long)]
+    manifest: bool,
+
     /// With -f original, also copy the JPEG or HEIF that the camera wrote
     /// next to each RAW file with the same name (RAW+JPEG)
     #[arg(long)]
@@ -624,6 +630,9 @@ fn main() -> Result<()> {
     if cli.with_jpeg && !matches!(cli.format, OutputFormat::Original) {
         bail!("--with-jpeg copies the camera's JPEG files, so it needs -f original.");
     }
+    if cli.manifest && !matches!(cli.format, OutputFormat::Original) {
+        bail!("--manifest records the checksums of copied RAW files, so it needs -f original.");
+    }
 
     if matches!(cli.format, OutputFormat::Original) {
         let image_options = [
@@ -908,6 +917,9 @@ fn main() -> Result<()> {
         },
     };
 
+    if cli.manifest {
+        converter::manifest::enable();
+    }
     let failures: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     let records: Mutex<Vec<report::Record>> = Mutex::new(excluded_records);
     let record = |input: &Path, output: &Path, status, message: String, seconds: f64| {
@@ -1031,6 +1043,13 @@ fn main() -> Result<()> {
     });
 
     pb.finish_and_clear();
+
+    if cli.manifest {
+        let folders = converter::manifest::write().context("Failed to write SHA256SUMS")?;
+        if !cli.quiet && folders > 0 {
+            println!("Checksums written to {} in {folders} folder(s)", converter::manifest::FILE_NAME);
+        }
+    }
 
     let s = succeeded.load(Ordering::Relaxed);
     let f = failed.load(Ordering::Relaxed);
