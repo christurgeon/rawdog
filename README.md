@@ -179,6 +179,12 @@ rawdog -R /Volumes/CARD_A /Volumes/CARD_B -o ./wedding --name "{date}/{seq}_{ste
 rawdog -R /Volumes/CARD -r 2048 --fast -o ./cull --name "{burst}/{stem}"
 ```
 
+To deliver one frame of each exposure bracket, `--burst-pick ev0` keeps the frame with the exposure compensation closest to 0 EV (the normal exposure) and excludes the others; frames belong together as for `{burst}`, and `--dry-run` shows which frame each burst keeps:
+
+```sh
+rawdog -R /Volumes/CARD -r 2048 -o ./rooms --burst-pick ev0 --dry-run
+```
+
 `{seq}` and `{burst}` numbers are counted per run, so adding files to a later run renumbers the files taken after them. For that reason such a run refuses to start when any of its output files exists; use `--overwrite` to replace them, or write to an empty directory. To add a second day or a late card to an existing set, continue the numbering with `--seq-start`. Numbers have four digits, or more past 9999; a name with five digits does not sort after one with four, so keep a numbering below 10,000 files.
 
 ```sh

@@ -135,6 +135,8 @@ pub struct Exposure {
     pub aperture: Option<f64>,
     /// Exposure time as a fraction of a second.
     pub shutter: Option<(u32, u32)>,
+    /// Exposure compensation in EV, as set for a bracket.
+    pub bias: Option<f64>,
 }
 
 /// `v` with up to `decimals` decimals, without trailing zeros: 2.8, 8, 0.95.
@@ -260,6 +262,13 @@ impl NameInfo {
             focal_mm: decimal(exif::Tag::FocalLength),
             aperture: decimal(exif::Tag::FNumber),
             shutter: rational(exif::Tag::ExposureTime),
+            bias: match field(exif::Tag::ExposureBiasValue) {
+                Some(exif::Value::SRational(v)) => v
+                    .first()
+                    .filter(|r| r.denom != 0)
+                    .map(|r| f64::from(r.num) / f64::from(r.denom)),
+                _ => None,
+            },
         };
         info.rating = read_rating(path, &fields);
         info.labels = read_labels(path, &fields);
@@ -577,6 +586,7 @@ mod tests {
                 focal_mm: Some(70.0),
                 aperture: Some(2.8),
                 shutter: Some((1, 250)),
+                bias: None,
             },
             ..info()
         };
