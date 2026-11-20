@@ -26,7 +26,17 @@ pub struct MetadataOptions {
 /// An sRGB ICC profile, generated once.
 pub fn srgb_icc_profile() -> &'static [u8] {
     static PROFILE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    PROFILE.get_or_init(|| moxcms::ColorProfile::new_srgb().encode().unwrap_or_default())
+    PROFILE.get_or_init(|| {
+        let mut icc = moxcms::ColorProfile::new_srgb().encode().unwrap_or_default();
+        // The encoder stamps the current time into the header, which made
+        // two conversions of the same file differ. Use a fixed date. The
+        // profile ID, which would cover the date, is left empty (zero).
+        const DATE: [u8; 12] = [0x07, 0xe8, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0]; // 2024-01-01 00:00:00
+        if icc.len() >= 100 && icc[84..100].iter().all(|b| *b == 0) {
+            icc[24..36].copy_from_slice(&DATE);
+        }
+        icc
+    })
 }
 
 /// TIFF tag that holds an ICC profile.
@@ -1032,6 +1042,8 @@ mod tests {
         assert_eq!(&icc[12..16], b"mntr");
         assert_eq!(&icc[16..20], b"RGB ");
         assert_eq!(&icc[36..40], b"acsp");
+        // A fixed creation date, so outputs are reproducible.
+        assert_eq!(&icc[24..30], &[0x07, 0xe8, 0, 1, 0, 1]);
     }
 
     #[test]
