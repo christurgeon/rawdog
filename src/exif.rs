@@ -17,6 +17,8 @@ pub struct MetadataOptions {
     /// The output pixels are sRGB, whatever colour space the camera was set
     /// to. False for `--preview`, which keeps the camera's own encoding.
     pub srgb: bool,
+    /// Write the rating and colour label into the output as XMP.
+    pub keep_rating: bool,
     /// Print resolution in pixels per inch. Replaces the source value.
     pub dpi: Option<u16>,
     /// Correction of the camera clock, applied to the capture dates.
@@ -555,6 +557,73 @@ pub fn inject_exif_into_jpeg(jpeg_bytes: &[u8], exif_data: &[u8]) -> Result<Vec<
     Ok(output)
 }
 
+/// An XMP packet with `xmp:Rating` and `xmp:Label`, which Lightroom and
+/// other catalogs read on import. `None` when there is neither.
+pub fn rating_xmp(rating: Option<i8>, label: Option<&str>) -> Option<String> {
+    if rating.is_none() && label.is_none() {
+        return None;
+    }
+    let escape = |s: &str| {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    };
+    let mut attributes = String::new();
+    if let Some(rating) = rating {
+        attributes.push_str(&format!(" xmp:Rating=\"{rating}\""));
+    }
+    if let Some(label) = label {
+        // Lightroom's own labels start with a capital: Red, Green.
+        let mut chars = label.chars();
+        let label: String = chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default();
+        attributes.push_str(&format!(" xmp:Label=\"{}\"", escape(&label)));
+    }
+    Some(format!(
+        "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\
+         <x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+         <rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"{attributes}/>\
+         </rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>"
+    ))
+}
+
+/// Add an XMP packet to a JPEG, in the APP1 segment that XMP readers look
+/// for, after the other application segments.
+pub fn inject_xmp_into_jpeg(jpeg_bytes: &[u8], xmp: &str) -> Result<Vec<u8>> {
+    use img_parts::jpeg::{markers, Jpeg, JpegSegment};
+    let mut jpeg = Jpeg::from_bytes(jpeg_bytes.to_vec().into())
+        .map_err(|e| anyhow::anyhow!("Failed to parse JPEG for XMP: {}", e))?;
+    let mut contents = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+    contents.extend_from_slice(xmp.as_bytes());
+    let segments = jpeg.segments_mut();
+    let at = segments
+        .iter()
+        .position(|s| !(markers::APP0..=markers::APP15).contains(&s.marker()))
+        .unwrap_or(segments.len());
+    segments.insert(at, JpegSegment::new_with_contents(markers::APP1, contents.into()));
+    let mut output = Vec::with_capacity(jpeg.len());
+    jpeg.encoder()
+        .write_to(&mut output)
+        .map_err(|e| anyhow::anyhow!("Failed to write JPEG with XMP: {}", e))?;
+    Ok(output)
+}
+
+/// Add an XMP packet to a PNG, in the iTXt chunk that XMP readers look for,
+/// before the image data.
+pub fn inject_xmp_into_png(png_bytes: &[u8], xmp: &str) -> Result<Vec<u8>> {
+    use img_parts::png::{Png, PngChunk};
+    let mut png = Png::from_bytes(png_bytes.to_vec().into())
+        .map_err(|e| anyhow::anyhow!("Failed to parse PNG for XMP: {}", e))?;
+    // Keyword, no compression, empty language tag and translated keyword.
+    let mut contents = b"XML:com.adobe.xmp\0\0\0\0\0".to_vec();
+    contents.extend_from_slice(xmp.as_bytes());
+    let chunks = png.chunks_mut();
+    let at = chunks.iter().position(|c| c.kind() == *b"IDAT").unwrap_or(chunks.len());
+    chunks.insert(at, PngChunk::new(*b"iTXt", contents.into()));
+    let mut output = Vec::with_capacity(png.len());
+    png.encoder()
+        .write_to(&mut output)
+        .map_err(|e| anyhow::anyhow!("Failed to write PNG with XMP: {}", e))?;
+    Ok(output)
+}
+
 /// Inject raw EXIF bytes (a TIFF blob) into an already-encoded PNG buffer.
 ///
 /// Returns the new PNG bytes with the EXIF data embedded in an eXIf chunk.
@@ -591,6 +660,30 @@ pub fn inject_exif_into_png(png_bytes: &[u8], exif_data: &[u8]) -> Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rating_xmp_is_read_back_by_the_rating_parser() {
+        let xmp = rating_xmp(Some(4), Some("red")).unwrap();
+        assert!(xmp.contains(r#"xmp:Rating="4""#) && xmp.contains(r#"xmp:Label="Red""#), "{xmp}");
+        assert_eq!(rating_xmp(None, None), None);
+        assert!(rating_xmp(None, Some("a<b")).unwrap().contains("A&lt;b"));
+
+        let img: image::RgbImage = image::ImageBuffer::from_pixel(2, 2, image::Rgb([1u8, 2, 3]));
+        let mut jpeg = Vec::new();
+        img.write_with_encoder(image::codecs::jpeg::JpegEncoder::new(&mut jpeg)).unwrap();
+        let with = inject_xmp_into_jpeg(&jpeg, &xmp).unwrap();
+        assert!(with.windows(29).any(|w| w == b"http://ns.adobe.com/xap/1.0/\0"));
+        assert!(image::load_from_memory(&with).is_ok());
+
+        let mut png = Vec::new();
+        img.write_with_encoder(image::codecs::png::PngEncoder::new(&mut png)).unwrap();
+        let with = inject_xmp_into_png(&png, &xmp).unwrap();
+        let parsed = img_parts::png::Png::from_bytes(with.clone().into()).unwrap();
+        let kinds: Vec<[u8; 4]> = parsed.chunks().iter().map(|c| c.kind()).collect();
+        let itxt = kinds.iter().position(|k| k == b"iTXt").unwrap();
+        assert!(itxt < kinds.iter().position(|k| k == b"IDAT").unwrap());
+        assert!(image::load_from_memory(&with).is_ok());
+    }
 
     #[test]
     fn extract_exif_returns_none_for_nonexistent_file() {

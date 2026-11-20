@@ -224,6 +224,8 @@ rawdog ./trip -r 2048 --strip-gps --artist "J. Doe" --copyright "(c) {year} J. D
 
 For print, `--dpi 300` sets the print resolution that labs and layout software read; without it the camera's value (often 72 or 350) is copied.
 
+`--keep-rating` writes each file's star rating and colour label into the output as XMP, so the culling decisions come along when the images are imported into Lightroom or another catalog. It is off by default, so a client does not see ratings.
+
 `--strip-metadata` copies no metadata at all.
 
 ### Watching a folder
