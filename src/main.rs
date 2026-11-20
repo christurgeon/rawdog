@@ -76,10 +76,17 @@ struct Cli {
           value_parser = clap::value_parser!(u32).range(1..))]
     seq_start: u32,
 
-    /// Largest gap in seconds between two frames of one {burst}
-    #[arg(long, value_name = "SECONDS", requires = "name", default_value_t = 2,
+    /// Largest gap in seconds between two frames of one {burst} or of one
+    /// group for --burst-pick
+    #[arg(long, value_name = "SECONDS", default_value_t = 2,
           value_parser = clap::value_parser!(u32).range(0..=3600))]
     burst_gap: u32,
+
+    /// Keep one frame of each burst or exposure bracket. "ev0" keeps the
+    /// frame with the exposure compensation closest to 0, the normal
+    /// exposure of a bracket. Frames belong together as for {burst}
+    #[arg(long, value_name = "RULE", value_enum)]
+    burst_pick: Option<BurstPick>,
 
     /// Convert only files rated at least this many stars (1 to 5). Ratings
     /// come from sidecar XMP files (Lightroom, Capture One, darktable) or
@@ -555,6 +562,35 @@ fn parse_date(s: &str) -> Result<(u16, u8, u8), String> {
     Ok((y, m, d))
 }
 
+/// How `--burst-pick` chooses the frame of a burst.
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+enum BurstPick {
+    /// The frame with exposure compensation closest to 0 EV.
+    Ev0,
+}
+
+/// For `--burst-pick ev0`: the index of the frame to keep in each burst,
+/// as a flag per file. Ties go to the earlier frame, then the path.
+fn burst_keepers(files: &[InputFile], infos: &[naming::NameInfo], gap: u32) -> Vec<bool> {
+    let bursts = burst_numbers(files, infos, gap);
+    let score = |i: usize| {
+        let bias = infos[i].exposure.bias.map_or(f64::INFINITY, f64::abs);
+        (bias, infos[i].taken, &files[i].path)
+    };
+    let mut best: HashMap<&str, usize> = HashMap::new();
+    for (i, burst) in bursts.iter().enumerate() {
+        let entry = best.entry(burst.as_str()).or_insert(i);
+        if score(i).partial_cmp(&score(*entry)) == Some(std::cmp::Ordering::Less) {
+            *entry = i;
+        }
+    }
+    let mut keep = vec![false; files.len()];
+    for &i in best.values() {
+        keep[i] = true;
+    }
+    keep
+}
+
 /// The selection options of a run.
 struct Selection {
     min_rating: Option<i8>,
@@ -991,9 +1027,10 @@ fn main() -> Result<()> {
     // gallery. A CR3 or RAF file is read whole, which is slow on a card.
     let needs_exif = selection.needs_exif()
         || template.as_ref().is_some_and(|t| t.needs_exif())
-        || cli.gallery;
+        || cli.gallery
+        || cli.burst_pick.is_some();
     let mut infos: Vec<naming::NameInfo> =
-        if selection.is_active() || template.is_some() || cli.gallery {
+        if selection.is_active() || template.is_some() || cli.gallery || cli.burst_pick.is_some() {
             files
                 .par_iter()
                 .map(|f| {
@@ -1043,6 +1080,47 @@ fn main() -> Result<()> {
             return Ok(());
         }
         let (kept, kept_infos): (Vec<_>, Vec<_>) = kept.into_iter().map(|(pair, _)| pair).unzip();
+        infos = kept_infos;
+        kept
+    } else {
+        files
+    };
+
+    // --burst-pick: one frame of each burst or bracket.
+    let files = if cli.burst_pick.is_some() {
+        let keep = burst_keepers(&files, &infos, cli.burst_gap);
+        let bursts = burst_numbers(&files, &infos, cli.burst_gap);
+        let kept_name: HashMap<&str, String> = (0..files.len())
+            .filter(|&i| keep[i])
+            .map(|i| {
+                let name = files[i].path.file_name().unwrap_or_default().to_string_lossy();
+                (bursts[i].as_str(), name.into_owned())
+            })
+            .collect();
+        let mut dropped = 0;
+        for i in (0..files.len()).filter(|&i| !keep[i]) {
+            let reason = format!("same burst as {}", kept_name[bursts[i].as_str()]);
+            if cli.dry_run {
+                println!("exclude {} ({reason})", files[i].path.display());
+            }
+            excluded_records.push(report::Record {
+                input: files[i].path.clone(),
+                output: None,
+                status: report::Status::Excluded,
+                message: reason,
+                seconds: 0.0,
+            });
+            dropped += 1;
+        }
+        if !cli.quiet && !cli.dry_run && dropped > 0 {
+            println!("{dropped} file(s) excluded by --burst-pick");
+        }
+        let mut flags = keep.into_iter();
+        let (kept, kept_infos): (Vec<_>, Vec<_>) = files
+            .into_iter()
+            .zip(std::mem::take(&mut infos))
+            .filter(|_| flags.next().unwrap_or(false))
+            .unzip();
         infos = kept_infos;
         kept
     } else {
@@ -2208,6 +2286,27 @@ mod tests {
         assert_eq!(burst_numbers(&files, &infos, 2), ["0003", "0001", "0001", "0001", "0002", "0004"]);
         // With no gap allowed, every frame in a different second stands alone.
         assert_eq!(burst_numbers(&files, &infos, 0), ["0005", "0001", "0002", "0003", "0004", "0006"]);
+    }
+
+    #[test]
+    fn burst_pick_keeps_the_frame_closest_to_0_ev() {
+        let file = |p: &str| InputFile { path: PathBuf::from(p), rel_dir: PathBuf::new() };
+        let frame = |s: u8, bias: Option<f64>| naming::NameInfo {
+            taken: Some((2026, 11, 14, 10, 0, s)),
+            exposure: naming::Exposure { bias, ..Default::default() },
+            ..Default::default()
+        };
+        let files = [file("a"), file("b"), file("c"), file("d"), file("e")];
+        // A bracket at 0, 0, 1 s (-2, 0, +2 EV), then two frames at 30 s
+        // without compensation recorded.
+        let infos = [
+            frame(0, Some(-2.0)),
+            frame(0, Some(0.0)),
+            frame(1, Some(2.0)),
+            frame(30, None),
+            frame(31, None),
+        ];
+        assert_eq!(burst_keepers(&files, &infos, 2), [false, true, false, true, false]);
     }
 
     #[test]
