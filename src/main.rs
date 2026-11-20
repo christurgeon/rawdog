@@ -63,7 +63,7 @@ struct Cli {
 
     /// Name template for output files, relative to the output directory
     /// and without extension. Fields: {stem} {date} {year} {month} {day}
-    /// {time} {model} {lens} {serial} {rating} {seq}. {seq} numbers the files of the run
+    /// {time} {model} {lens} {serial} {rating} {seq} {burst}. {seq} numbers the files of the run
     /// in capture order: 0001, 0002, ... Example: "{date}/{model}_{stem}"
     #[arg(long, value_name = "TEMPLATE")]
     name: Option<naming::NameTemplate>,
@@ -72,6 +72,11 @@ struct Cli {
     #[arg(long, value_name = "N", requires = "name", default_value_t = 1,
           value_parser = clap::value_parser!(u32).range(1..))]
     seq_start: u32,
+
+    /// Largest gap in seconds between two frames of one {burst}
+    #[arg(long, value_name = "SECONDS", requires = "name", default_value_t = 2,
+          value_parser = clap::value_parser!(u32).range(0..=3600))]
+    burst_gap: u32,
 
     /// Convert only files rated at least this many stars (1 to 5). Ratings
     /// come from sidecar XMP files (Lightroom, Capture One, darktable) or
@@ -742,6 +747,7 @@ fn main() -> Result<()> {
     }
     let template = cli.name.clone().map(|mut t| {
         t.seq_start = cli.seq_start;
+        t.burst_gap = cli.burst_gap;
         t
     });
 
@@ -819,7 +825,7 @@ fn main() -> Result<()> {
 
     // {seq} numbers the files of each run anew, so an existing output may
     // hold another input's image; skipping it would lose a file.
-    if cli.name.as_ref().is_some_and(|t| t.uses_seq()) && !cli.overwrite {
+    if cli.name.as_ref().is_some_and(|t| t.uses_seq() || t.uses_burst()) && !cli.overwrite {
         let existing = jobs.iter().filter(|(_, output)| output.exists()).count();
         if existing > 0 {
             bail!(
@@ -1293,6 +1299,28 @@ fn sequence_numbers(files: &[InputFile], infos: &[naming::NameInfo], start: u32)
     seqs
 }
 
+/// The `{burst}` value of each file: bursts are numbered from 1 in capture
+/// order, and a frame taken more than `gap` seconds after the one before
+/// starts a new burst. A file without a capture time is a burst of its own.
+fn burst_numbers(files: &[InputFile], infos: &[naming::NameInfo], gap: u32) -> Vec<String> {
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by_key(|&i| (infos[i].taken.is_none(), infos[i].taken, &files[i].path));
+    let mut numbers = vec![0usize; files.len()];
+    let mut burst = 0;
+    let mut previous: Option<i64> = None;
+    for &i in &order {
+        let time = infos[i].taken.map(timeshift::to_seconds);
+        let joins = matches!((previous, time), (Some(p), Some(t)) if t - p <= i64::from(gap));
+        if !joins {
+            burst += 1;
+        }
+        numbers[i] = burst;
+        previous = time;
+    }
+    let width = burst.to_string().len().max(4);
+    numbers.iter().map(|n| format!("{n:0width$}")).collect()
+}
+
 /// With a name template, the output goes to the template's path below the
 /// output directory (or below the input's directory when there is none), and
 /// the scanned subdirectory is not mirrored.
@@ -1322,7 +1350,12 @@ fn plan_outputs(
         } else {
             vec![String::new(); files.len()]
         };
-        infos.iter().zip(&seqs).map(|(info, seq)| t.expand(info, seq)).collect()
+        let bursts = if t.uses_burst() {
+            burst_numbers(files, infos, t.burst_gap)
+        } else {
+            vec![String::new(); files.len()]
+        };
+        (0..files.len()).map(|i| t.expand(&infos[i], &seqs[i], &bursts[i])).collect()
     });
 
     let mut jobs = Vec::with_capacity(files.len());
@@ -1720,6 +1753,25 @@ mod tests {
         assert_eq!(sequence_numbers(&files, &infos, 1), ["0003", "0002", "0004", "0001"]);
         assert_eq!(sequence_numbers(&files, &infos, 413), ["0415", "0414", "0416", "0413"]);
         assert_eq!(sequence_numbers(&files, &infos, 9998), ["10000", "09999", "10001", "09998"]);
+    }
+
+    #[test]
+    fn burst_numbers_split_at_gaps() {
+        let file = |p: &str| InputFile { path: PathBuf::from(p), rel_dir: PathBuf::new() };
+        let at = |s: u8| naming::NameInfo { taken: Some((2026, 11, 14, 18, 2, s)), ..Default::default() };
+        let files = [file("e"), file("a"), file("b"), file("c"), file("d"), file("f")];
+        let infos = [
+            at(30),
+            at(0),
+            at(1),
+            at(3),
+            at(10),
+            naming::NameInfo::default(),
+        ];
+        // 0, 1, 3 are one burst (gaps of 1 and 2 s); 10 and 30 stand alone.
+        assert_eq!(burst_numbers(&files, &infos, 2), ["0003", "0001", "0001", "0001", "0002", "0004"]);
+        // With no gap allowed, every frame in a different second stands alone.
+        assert_eq!(burst_numbers(&files, &infos, 0), ["0005", "0001", "0002", "0003", "0004", "0006"]);
     }
 
     #[test]
