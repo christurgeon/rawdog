@@ -63,7 +63,7 @@ struct Cli {
 
     /// Name template for output files, relative to the output directory
     /// and without extension. Fields: {stem} {date} {year} {month} {day}
-    /// {time} {model} {lens} {serial} {rating} {seq} {burst}. {seq} numbers the files of the run
+    /// {time} {model} {lens} {serial} {rating} {label} {seq} {burst}. {seq} numbers the files of the run
     /// in capture order: 0001, 0002, ... Example: "{date}/{model}_{stem}"
     #[arg(long, value_name = "TEMPLATE")]
     name: Option<naming::NameTemplate>,

@@ -15,6 +15,7 @@ enum Token {
     Lens,
     Serial,
     Rating,
+    Label,
     Seq,
     Burst,
 }
@@ -30,6 +31,7 @@ const TOKENS: &[(&str, Token)] = &[
     ("lens", Token::Lens),
     ("serial", Token::Serial),
     ("rating", Token::Rating),
+    ("label", Token::Label),
     ("seq", Token::Seq),
     ("burst", Token::Burst),
 ];
@@ -409,6 +411,7 @@ impl NameTemplate {
                         },
                         Token::Seq => seq.to_string(),
                         Token::Burst => burst.to_string(),
+                        Token::Label => info.labels.first().cloned().unwrap_or_else(|| "none".to_string()),
                     };
                     // A value must not add path components, and must not
                     // be the name of the current or the parent directory.
@@ -456,6 +459,9 @@ mod tests {
             PathBuf::from("2024-03-09/0042_DSC0001")
         );
         assert!(!"{stem}".parse::<NameTemplate>().unwrap().uses_seq());
+        let labelled = NameInfo { labels: vec!["red".to_string(), "blue".to_string()], ..info() };
+        assert_eq!(expand("{label}/{stem}", &labelled), PathBuf::from("red/DSC0001"));
+        assert_eq!(expand("{label}/{stem}", &info()), PathBuf::from("none/DSC0001"));
         let burst: NameTemplate = "{burst}/{stem}".parse().unwrap();
         assert!(burst.uses_burst() && burst.needs_exif());
         assert_eq!(burst.expand(&info(), "", "0003"), PathBuf::from("0003/DSC0001"));
