@@ -214,6 +214,16 @@ For print, `--dpi 300` sets the print resolution that labs and layout software r
 
 `--strip-metadata` copies no metadata at all.
 
+### Watching a folder
+
+For tethered or event shooting, `--watch` keeps running and converts new files as they arrive, checking every 5 seconds (or the number given). A file is converted once it has not changed for 3 seconds, so a file that is still being copied is left for the next check. With `--gallery`, the page is updated each time:
+
+```sh
+rawdog ./incoming -r 2048 --fast -o ./live --gallery --watch
+```
+
+Stop it with Ctrl-C.
+
 ### Large runs and scripts
 
 ```sh
