@@ -1003,3 +1003,41 @@ fn cli_max_size_needs_jpeg_output() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--max-size needs JPEG output"), "{stderr}");
 }
+
+#[test]
+fn cli_picks_converts_only_listed_files_and_warns_about_others() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("card");
+    fs::create_dir_all(&dir).unwrap();
+    for name in ["a", "b", "c"] {
+        image::RgbImage::from_pixel(64, 64, image::Rgb([100, 100, 100]))
+            .save(dir.join(format!("{name}.png")))
+            .unwrap();
+    }
+    let list = tmp.path().join("picks.txt");
+    fs::write(&list, "A.jpg, c.JPG\nmissing.jpg\n").unwrap();
+    let out_dir = tmp.path().join("out");
+    let inputs: Vec<_> = ["a", "b", "c"].iter().map(|n| dir.join(format!("{n}.png"))).collect();
+    let mut args: Vec<&std::ffi::OsStr> = inputs.iter().map(|p| p.as_os_str()).collect();
+    args.extend(["-o".as_ref(), out_dir.as_os_str(), "--picks".as_ref(), list.as_os_str()]);
+    let output = run(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let mut names: Vec<String> = files_under(&out_dir)
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["a.jpg", "c.jpg"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("1 name(s) in") && stderr.contains("match no RAW file: missing.jpg"), "{stderr}");
+}
+
+#[test]
+fn cli_picks_rejects_an_empty_list() {
+    let tmp = TempDir::new().unwrap();
+    let list = tmp.path().join("picks.txt");
+    fs::write(&list, " \n, \n").unwrap();
+    let output = run(&["x.arw".as_ref(), "--picks".as_ref(), list.as_ref()]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("names no files"));
+}
