@@ -57,7 +57,7 @@ pub struct NameTemplate {
     /// The first `{seq}` number.
     pub seq_start: u32,
     /// Largest gap in seconds between two frames of one `{burst}`.
-    pub burst_gap: u32,
+    pub burst_gap: f64,
 }
 
 impl FromStr for NameTemplate {
@@ -105,7 +105,7 @@ impl FromStr for NameTemplate {
         if literal.is_empty() || literal.ends_with('/') || escapes {
             return Err("must be a relative file path without '..'".to_string());
         }
-        Ok(NameTemplate { parts, seq_start: 1, burst_gap: 2 })
+        Ok(NameTemplate { parts, seq_start: 1, burst_gap: 2.0 })
     }
 }
 
@@ -116,6 +116,8 @@ use crate::timeshift::Taken;
 pub struct NameInfo {
     pub stem: String,
     pub taken: Option<Taken>,
+    /// Milliseconds within the capture second, for frames of a fast burst.
+    pub subsec_ms: Option<u16>,
     pub model: Option<String>,
     pub lens: Option<String>,
     /// The camera body's serial number.
@@ -233,6 +235,7 @@ impl NameInfo {
             .or_else(|| ascii(exif::Tag::DateTime))
             .and_then(|raw| exif::DateTime::from_ascii(&raw).ok())
             .map(|d| (d.year, d.month, d.day, d.hour, d.minute, d.second));
+        info.subsec_ms = ascii(exif::Tag::SubSecTimeOriginal).and_then(|raw| subsec_ms(&raw));
         let text = |tag| {
             ascii(tag)
                 .map(|raw| String::from_utf8_lossy(&raw).trim().to_string())
@@ -284,6 +287,30 @@ impl NameInfo {
         }
         self
     }
+}
+
+impl NameInfo {
+    /// The capture time in milliseconds since 1970 (camera clock), with the
+    /// fraction of a second when the camera records it.
+    pub fn time_ms(&self) -> Option<i64> {
+        let seconds = crate::timeshift::to_seconds(self.taken?);
+        Some(seconds * 1000 + i64::from(self.subsec_ms.unwrap_or(0)))
+    }
+}
+
+/// The digits of a SubSecTime value as milliseconds: "5" is 500, "12" is
+/// 120, "1234" is 123.
+fn subsec_ms(raw: &[u8]) -> Option<u16> {
+    let digits: String = String::from_utf8_lossy(raw)
+        .trim()
+        .trim_end_matches('\0')
+        .chars()
+        .take(3)
+        .collect();
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    format!("{digits:0<3}").parse().ok()
 }
 
 /// The sidecar XMP files that may belong to `path`: `NAME.xmp` (Lightroom,
@@ -723,6 +750,15 @@ mod tests {
         assert_eq!(expand("{lens}_{serial}", &bare), PathBuf::from("unknown_unknown"));
         let sigma = NameInfo { lens: Some("50mm F1.4 DG | A <x>*?\"".to_string()), ..Default::default() };
         assert_eq!(expand("{lens}", &sigma), PathBuf::from("50mm F1.4 DG _ A _x____"));
+    }
+
+    #[test]
+    fn subsec_digits_become_milliseconds() {
+        assert_eq!(subsec_ms(b"5"), Some(500));
+        assert_eq!(subsec_ms(b"12"), Some(120));
+        assert_eq!(subsec_ms(b"1234"), Some(123));
+        assert_eq!(subsec_ms(b"  "), None);
+        assert_eq!(subsec_ms(b"x1"), None);
     }
 
     #[test]

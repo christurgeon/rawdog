@@ -243,6 +243,7 @@ fn decoder_fields(path: &Path) -> Option<Vec<exif::Field>> {
     push(Tag::Artist, text(e.artist));
     push(Tag::Copyright, text(e.copyright));
     push(Tag::DateTimeOriginal, text(e.date_time_original));
+    push(Tag::SubSecTimeOriginal, text(e.sub_sec_time_original));
     push(Tag::DateTimeDigitized, text(e.create_date));
     push(Tag::DateTime, text(e.modify_date));
     push(Tag::ExposureTime, rational(e.exposure_time));

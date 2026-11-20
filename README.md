@@ -173,7 +173,7 @@ A file without the metadata for a field gets `unknown`; some cameras, such as So
 rawdog -R /Volumes/CARD_A /Volumes/CARD_B -o ./wedding --name "{date}/{seq}_{stem}"
 ```
 
-`{burst}` puts each burst of a wildlife or sports sequence, or each exposure bracket, into its own folder for culling. A frame taken more than `--burst-gap` seconds (default 2) after the one before starts a new burst. Capture times have one-second steps, so a gap of 0 separates frames from different seconds only:
+`{burst}` puts each burst of a wildlife or sports sequence, or each exposure bracket, into its own folder for culling. A frame taken more than `--burst-gap` seconds (default 2, fractions such as 0.3 allowed) after the one before starts a new burst. Capture times include the fraction of a second when the camera records it (most current bodies do), so a fast burst separates from the next one, and `{seq}` keeps frames of one second in order:
 
 ```sh
 rawdog -R /Volumes/CARD -r 2048 --fast -o ./cull --name "{burst}/{stem}"
