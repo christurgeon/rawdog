@@ -54,7 +54,8 @@ struct Cli {
 
     /// Name template for output files, relative to the output directory
     /// and without extension. Fields: {stem} {date} {year} {month} {day}
-    /// {time} {model} {rating}. Example: "{date}/{model}_{stem}"
+    /// {time} {model} {rating} {seq}. {seq} numbers the files of the run
+    /// in capture order: 0001, 0002, ... Example: "{date}/{model}_{stem}"
     #[arg(long, value_name = "TEMPLATE")]
     name: Option<naming::NameTemplate>,
 
@@ -79,6 +80,12 @@ struct Cli {
     #[arg(long, value_name = "MODEL", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     camera: Option<String>,
 
+    /// Convert only the files named in this file, such as a list a client
+    /// sent back from the gallery. Names are separated by lines, commas,
+    /// or spaces, and may include an extension (DSC01234 or DSC01234.jpg)
+    #[arg(long, value_name = "FILE")]
+    picks: Option<PathBuf>,
+
     /// Write what happened to each file to this file: JSON if the name ends
     /// in .json, otherwise CSV. Columns: input, output, status (converted,
     /// skipped, failed, excluded), message, seconds
@@ -98,6 +105,12 @@ struct Cli {
     /// JPEG quality (1-100, ignored for tiff/png)
     #[arg(short, long, default_value_t = 92, value_parser = clap::value_parser!(u8).range(1..=100))]
     quality: u8,
+
+    /// Largest JPEG file, such as 2MB or 500KB (1 MB is 1,000,000 bytes).
+    /// The quality is lowered until each file fits; --quality is the
+    /// highest quality used
+    #[arg(long, value_name = "SIZE", value_parser = byte_size)]
+    max_size: Option<u64>,
 
     /// Resize long edge to this many pixels, preserving aspect ratio
     #[arg(short, long, value_parser = clap::value_parser!(u32).range(1..))]
@@ -157,6 +170,12 @@ struct Cli {
     /// colours; the size depends on the camera (1616x1080 for Sony)
     #[arg(long, conflicts_with_all = ["fast", "exposure", "wb"])]
     preview: bool,
+
+    /// Blend this logo (a PNG, which may be transparent) into the
+    /// bottom-right corner of every image. Its long side is a fifth of the
+    /// image's short edge
+    #[arg(long, value_name = "PNG")]
+    watermark: Option<PathBuf>,
 
     /// Overwrite existing output files (default: skip if exists)
     #[arg(long)]
@@ -331,10 +350,15 @@ struct Selection {
     since: Option<(u16, u8, u8)>,
     until: Option<(u16, u8, u8)>,
     camera: Option<String>,
+    picks: Option<Picks>,
 }
 
 impl Selection {
     fn is_active(&self) -> bool {
+        self.needs_exif() || self.picks.is_some()
+    }
+
+    fn needs_exif(&self) -> bool {
         self.min_rating.is_some()
             || self.since.is_some()
             || self.until.is_some()
@@ -344,6 +368,9 @@ impl Selection {
     /// Why a file is excluded, if it is. A file without the metadata that a
     /// filter needs is excluded.
     fn exclusion(&self, info: &naming::NameInfo) -> Option<String> {
+        if self.picks.as_ref().is_some_and(|p| !p.contains(&info.stem)) {
+            return Some("not in the picks list".to_string());
+        }
         if let Some(min) = self.min_rating {
             match info.rating {
                 Some(r) if r >= min => {}
@@ -374,6 +401,81 @@ impl Selection {
             }
         }
         None
+    }
+}
+
+/// The file names of a `--picks` list, compared without letter case.
+struct Picks {
+    /// Each name as written, in lower case, and in lower case without its
+    /// extension. A name is kept whole too, because a stem can contain a dot.
+    names: Vec<(String, String, String)>,
+}
+
+impl Picks {
+    fn parse(text: &str) -> Picks {
+        let names = text
+            .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+            .filter(|n| !n.is_empty())
+            // A name copied from a path or a URL keeps only its last part.
+            .map(|n| n.rsplit(['/', '\\']).next().unwrap_or(n))
+            .filter(|n| !n.is_empty())
+            .map(|n| {
+                let lower = n.to_lowercase();
+                // Only a short extension with a letter is removed, so that
+                // "IMG.0001" stays whole.
+                let bare = match lower.rsplit_once('.') {
+                    Some((stem, ext))
+                        if !stem.is_empty()
+                            && ext.len() <= 4
+                            && ext.chars().any(|c| c.is_ascii_alphabetic()) =>
+                    {
+                        stem.to_string()
+                    }
+                    _ => lower.clone(),
+                };
+                (n.to_string(), lower, bare)
+            })
+            .collect();
+        Picks { names }
+    }
+
+    fn contains(&self, stem: &str) -> bool {
+        let stem = stem.to_lowercase();
+        self.names.iter().any(|n| n.1 == stem || n.2 == stem)
+    }
+
+    /// The listed names that match none of `stems`, in list order.
+    fn unmatched(&self, stems: &[String]) -> Vec<&str> {
+        let stems: HashSet<String> = stems.iter().map(|s| s.to_lowercase()).collect();
+        let mut seen = HashSet::new();
+        self.names
+            .iter()
+            .filter(|n| !stems.contains(&n.1) && !stems.contains(&n.2))
+            .filter(|n| seen.insert(&n.2))
+            .map(|n| n.0.as_str())
+            .collect()
+    }
+}
+
+/// A file size: a number of bytes, or a number with KB or MB (decimal
+/// units, so a limit given in either convention is met). K and M are the
+/// same as KB and MB.
+fn byte_size(s: &str) -> Result<u64, String> {
+    let error = || "must be a size such as 2MB, 500KB, or 800000".to_string();
+    let upper = s.trim().to_ascii_uppercase();
+    let (number, unit) = match upper.find(|c: char| c.is_ascii_alphabetic()) {
+        Some(i) => upper.split_at(i),
+        None => (upper.as_str(), ""),
+    };
+    let unit = match unit.trim() {
+        "" | "B" => 1.0,
+        "K" | "KB" => 1e3,
+        "M" | "MB" => 1e6,
+        _ => return Err(error()),
+    };
+    match number.trim().parse::<f64>() {
+        Ok(n) if n.is_finite() && n * unit >= 1.0 => Ok((n * unit) as u64),
+        _ => Err(error()),
     }
 }
 
@@ -417,8 +519,13 @@ fn main() -> Result<()> {
         bail!("--gallery needs JPEG or PNG output; browsers do not show TIFF or RAW files.");
     }
 
+    if cli.max_size.is_some() && matches!(cli.format, OutputFormat::Tiff | OutputFormat::Png) {
+        bail!("--max-size needs JPEG output; TIFF and PNG files are lossless.");
+    }
+
     if matches!(cli.format, OutputFormat::Original) {
         let image_options = [
+            ("--max-size", cli.max_size.is_some()),
             ("--resize", cli.resize.is_some()),
             ("--fast", cli.fast),
             ("--preview", cli.preview),
@@ -429,6 +536,7 @@ fn main() -> Result<()> {
             ("--strip-metadata", cli.strip_metadata),
             ("--artist", cli.artist.is_some()),
             ("--copyright", cli.copyright.is_some()),
+            ("--watermark", cli.watermark.is_some()),
         ];
         let used: Vec<&str> = image_options
             .iter()
@@ -447,6 +555,28 @@ fn main() -> Result<()> {
         bail!("Output path {} exists and is not a directory.", dir.display());
     }
 
+    let picks = match &cli.picks {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read picks list {}", path.display()))?;
+            let picks = Picks::parse(&text);
+            if picks.names.is_empty() {
+                bail!("The picks list {} names no files.", path.display());
+            }
+            Some(picks)
+        }
+        None => None,
+    };
+
+    let watermark = match &cli.watermark {
+        Some(path) => Some(std::sync::Arc::new(
+            image::open(path)
+                .with_context(|| format!("Failed to read watermark {}", path.display()))?
+                .into_rgba8(),
+        )),
+        None => None,
+    };
+
     // Collect all RAW files from inputs
     let files = collect_raw_files(&cli.input, cli.recursive)?;
     // Same condition under which collect_raw_files warns "does not exist".
@@ -464,12 +594,29 @@ fn main() -> Result<()> {
         since: cli.since,
         until: cli.until,
         camera: cli.camera.clone(),
+        picks,
     };
+    if let (Some(picks), Some(path)) = (&selection.picks, &cli.picks) {
+        let stems: Vec<String> = files
+            .iter()
+            .map(|f| f.path.file_stem().unwrap_or_default().to_string_lossy().into_owned())
+            .collect();
+        let unmatched = picks.unmatched(&stems);
+        if !unmatched.is_empty() {
+            eprintln!(
+                "Warning: {} name(s) in {} match no RAW file: {}",
+                unmatched.len(),
+                path.display(),
+                unmatched.join(", ")
+            );
+        }
+    }
     let mut excluded_records = Vec::new();
     let files = if selection.is_active() {
+        let needs_exif = selection.needs_exif();
         let excluded: Vec<Option<String>> = files
             .par_iter()
-            .map(|f| selection.exclusion(&naming::NameInfo::read(&f.path, true)))
+            .map(|f| selection.exclusion(&naming::NameInfo::read(&f.path, needs_exif)))
             .collect();
         let (kept, dropped): (Vec<_>, Vec<_>) =
             files.into_iter().zip(excluded).partition(|(_, reason)| reason.is_none());
@@ -568,6 +715,7 @@ fn main() -> Result<()> {
     let opts = converter::ConvertOptions {
         format: cli.format,
         quality: cli.quality,
+        max_bytes: cli.max_size,
         resize: cli.resize,
         fast: cli.fast,
         exposure: cli.exposure,
@@ -575,6 +723,7 @@ fn main() -> Result<()> {
         sharpen: cli.sharpen,
         preview: cli.preview,
         look: cli.look,
+        watermark,
         metadata: exif::MetadataOptions {
             strip_all: cli.strip_metadata,
             strip_gps: cli.strip_gps,
@@ -928,6 +1077,20 @@ fn canonical(path: &Path) -> PathBuf {
 /// Pair each input with its output path. Fails without converting anything
 /// if two inputs would write the same output path.
 ///
+/// The `{seq}` value of each file: its position in capture order, from 1,
+/// with at least four digits. Files with the same capture time are ordered
+/// by path, and files without one come last.
+fn sequence_numbers(files: &[InputFile], infos: &[naming::NameInfo]) -> Vec<String> {
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by_key(|&i| (infos[i].taken.is_none(), infos[i].taken, &files[i].path));
+    let width = files.len().to_string().len().max(4);
+    let mut seqs = vec![String::new(); files.len()];
+    for (n, &i) in order.iter().enumerate() {
+        seqs[i] = format!("{:0width$}", n + 1);
+    }
+    seqs
+}
+
 /// With a name template, the output goes to the template's path below the
 /// output directory (or below the input's directory when there is none), and
 /// the scanned subdirectory is not mirrored.
@@ -940,10 +1103,16 @@ fn plan_outputs(
     // Reading EXIF for the template opens every file, so do it in parallel.
     let named: Option<Vec<PathBuf>> = template.map(|t| {
         let needs_exif = t.needs_exif();
-        files
+        let infos: Vec<naming::NameInfo> = files
             .par_iter()
-            .map(|f| t.expand(&naming::NameInfo::read(&f.path, needs_exif)))
-            .collect()
+            .map(|f| naming::NameInfo::read(&f.path, needs_exif))
+            .collect();
+        let seqs = if t.uses_seq() {
+            sequence_numbers(files, &infos)
+        } else {
+            vec![String::new(); files.len()]
+        };
+        infos.iter().zip(&seqs).map(|(info, seq)| t.expand(info, seq)).collect()
     });
 
     let mut jobs = Vec::with_capacity(files.len());
@@ -1216,6 +1385,23 @@ mod tests {
         assert_eq!(explicit_first[0].rel_dir, PathBuf::new());
     }
 
+    #[test]
+    fn byte_size_accepts_decimal_units() {
+        assert_eq!(byte_size("800000"), Ok(800_000));
+        assert_eq!(byte_size("2MB"), Ok(2_000_000));
+        assert_eq!(byte_size("1.5m"), Ok(1_500_000));
+        assert_eq!(byte_size("500 KB"), Ok(500_000));
+        assert_eq!(byte_size("500k"), Ok(500_000));
+        assert_eq!(byte_size("10b"), Ok(10));
+    }
+
+    #[test]
+    fn byte_size_rejects_other_values() {
+        for bad in ["", "MB", "2GB", "2 MiB", "-1MB", "0", "0.0001KB", "nan", "inf"] {
+            assert!(byte_size(bad).is_err(), "{bad} was accepted");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // defaults file tests
     // -----------------------------------------------------------------------
@@ -1260,7 +1446,63 @@ mod tests {
             since: None,
             until: None,
             camera: None,
+            picks: None,
         }
+    }
+
+    #[test]
+    fn sequence_numbers_follow_capture_time_then_path() {
+        let file = |p: &str| InputFile { path: PathBuf::from(p), rel_dir: PathBuf::new() };
+        let taken = |t: Option<(u16, u8, u8, u8, u8, u8)>| naming::NameInfo {
+            taken: t,
+            ..Default::default()
+        };
+        let files = [file("b/2.arw"), file("a/9.arw"), file("c/1.arw"), file("a/1.arw")];
+        let infos = [
+            taken(Some((2026, 11, 14, 18, 2, 5))),
+            taken(Some((2026, 11, 14, 18, 2, 5))),
+            taken(None),
+            taken(Some((2026, 11, 14, 9, 0, 0))),
+        ];
+        assert_eq!(sequence_numbers(&files, &infos), ["0003", "0002", "0004", "0001"]);
+    }
+
+    #[test]
+    fn sequence_numbers_widen_for_large_runs() {
+        let files: Vec<InputFile> = (0..10_000)
+            .map(|i| InputFile { path: PathBuf::from(format!("{i:05}.arw")), rel_dir: PathBuf::new() })
+            .collect();
+        let infos: Vec<naming::NameInfo> = (0..10_000).map(|_| Default::default()).collect();
+        let seqs = sequence_numbers(&files, &infos);
+        assert_eq!((seqs[0].as_str(), seqs[9_999].as_str()), ("00001", "10000"));
+    }
+
+    #[test]
+    fn picks_parse_names_in_any_list_form() {
+        let picks = Picks::parse("DSC01234.jpg, dsc01300\r\nproofs/DSC01400.JPG;  IMG.0001\n\n");
+        for stem in ["DSC01234", "DSC01300", "dsc01400", "IMG.0001"] {
+            assert!(picks.contains(stem), "{stem}");
+        }
+        assert!(!picks.contains("DSC01235"));
+        assert!(!picks.contains("IMG"));
+    }
+
+    #[test]
+    fn picks_report_unmatched_names_once() {
+        let picks = Picks::parse("DSC1.jpg DSC2 dsc2.JPG DSC3");
+        let stems = ["dsc1".to_string(), "DSC9".to_string()];
+        assert_eq!(picks.unmatched(&stems), vec!["DSC2", "DSC3"]);
+    }
+
+    #[test]
+    fn selection_by_picks() {
+        let sel = Selection {
+            picks: Some(Picks::parse("x.jpg")),
+            ..selection()
+        };
+        assert!(sel.exclusion(&info(None, None, None)).is_none());
+        let other = naming::NameInfo { stem: "y".to_string(), ..Default::default() };
+        assert_eq!(sel.exclusion(&other).unwrap(), "not in the picks list");
     }
 
     #[test]

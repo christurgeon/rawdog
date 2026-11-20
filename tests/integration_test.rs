@@ -958,3 +958,131 @@ fn cli_reports_a_bad_line_in_the_defaults_file() {
     assert!(stderr.contains("line 2"), "{stderr}");
     assert!(!output.status.success());
 }
+
+/// A 256x256 image of noise, whose JPEG size depends strongly on quality.
+fn write_noise_png(path: &std::path::Path) {
+    let mut state = 12345u32;
+    let img = image::RgbImage::from_fn(256, 256, |_, _| {
+        state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        let v = (state >> 16) as u8;
+        image::Rgb([v, v.wrapping_mul(3), v.wrapping_add(90)])
+    });
+    img.save(path).unwrap();
+}
+
+#[test]
+fn cli_max_size_lowers_quality_until_the_file_fits() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("noise.png");
+    write_noise_png(&input);
+    let out_dir = tmp.path().join("out");
+
+    let output = run(&[input.as_ref(), "-o".as_ref(), out_dir.as_ref()]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let full = fs::metadata(out_dir.join("noise.jpg")).unwrap().len();
+
+    let limit = full / 3;
+    let output = run(&[
+        input.as_ref(),
+        "-o".as_ref(),
+        out_dir.as_ref(),
+        "--overwrite".as_ref(),
+        "--max-size".as_ref(),
+        limit.to_string().as_ref(),
+    ]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let fitted = fs::metadata(out_dir.join("noise.jpg")).unwrap().len();
+    assert!(fitted <= limit, "{fitted} > {limit}");
+    assert!(fitted > limit / 2, "quality lowered too far: {fitted} for {limit}");
+}
+
+#[test]
+fn cli_max_size_fails_when_lowest_quality_is_too_large() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("noise.png");
+    write_noise_png(&input);
+    let out_dir = tmp.path().join("out");
+    let output = run(&[
+        input.as_ref(),
+        "-o".as_ref(),
+        out_dir.as_ref(),
+        "--max-size".as_ref(),
+        "1KB".as_ref(),
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("larger than --max-size 1 KB"), "{stderr}");
+    assert!(files_under(&out_dir).is_empty(), "{:?}", files_under(&out_dir));
+}
+
+#[test]
+fn cli_max_size_needs_jpeg_output() {
+    let output = run(&["x.arw".as_ref(), "-f".as_ref(), "png".as_ref(), "--max-size".as_ref(), "2MB".as_ref()]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--max-size needs JPEG output"), "{stderr}");
+}
+
+#[test]
+fn cli_picks_converts_only_listed_files_and_warns_about_others() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("card");
+    fs::create_dir_all(&dir).unwrap();
+    for name in ["a", "b", "c"] {
+        image::RgbImage::from_pixel(64, 64, image::Rgb([100, 100, 100]))
+            .save(dir.join(format!("{name}.png")))
+            .unwrap();
+    }
+    let list = tmp.path().join("picks.txt");
+    fs::write(&list, "A.jpg, c.JPG\nmissing.jpg\n").unwrap();
+    let out_dir = tmp.path().join("out");
+    let inputs: Vec<_> = ["a", "b", "c"].iter().map(|n| dir.join(format!("{n}.png"))).collect();
+    let mut args: Vec<&std::ffi::OsStr> = inputs.iter().map(|p| p.as_os_str()).collect();
+    args.extend(["-o".as_ref(), out_dir.as_os_str(), "--picks".as_ref(), list.as_os_str()]);
+    let output = run(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let mut names: Vec<String> = files_under(&out_dir)
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["a.jpg", "c.jpg"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("1 name(s) in") && stderr.contains("match no RAW file: missing.jpg"), "{stderr}");
+}
+
+#[test]
+fn cli_picks_rejects_an_empty_list() {
+    let tmp = TempDir::new().unwrap();
+    let list = tmp.path().join("picks.txt");
+    fs::write(&list, " \n, \n").unwrap();
+    let output = run(&["x.arw".as_ref(), "--picks".as_ref(), list.as_ref()]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("names no files"));
+}
+
+#[test]
+fn cli_watermark_marks_the_bottom_right_corner() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("grey.png");
+    image::RgbImage::from_pixel(200, 100, image::Rgb([100, 100, 100]))
+        .save(&input)
+        .unwrap();
+    let mark = tmp.path().join("logo.png");
+    image::RgbaImage::from_pixel(20, 20, image::Rgba([255, 255, 255, 255]))
+        .save(&mark)
+        .unwrap();
+    let out_dir = tmp.path().join("out");
+    let output = run(&[
+        input.as_ref(),
+        "-o".as_ref(),
+        out_dir.as_ref(),
+        "--watermark".as_ref(),
+        mark.as_ref(),
+    ]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // The mark is 20x20 (a fifth of 100) with a margin of 3.
+    let img = image::open(out_dir.join("grey.jpg")).unwrap().into_rgb8();
+    assert!(img.get_pixel(200 - 3 - 10, 100 - 3 - 10)[0] > 240);
+    assert!(img.get_pixel(100, 50)[0] < 200);
+}

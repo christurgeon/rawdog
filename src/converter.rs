@@ -21,6 +21,9 @@ pub struct ConvertOptions {
     pub format: OutputFormat,
     /// JPEG quality, 1-100. Ignored for TIFF and PNG.
     pub quality: u8,
+    /// Largest JPEG file in bytes. The quality is lowered until the file
+    /// fits; `quality` is the highest quality tried.
+    pub max_bytes: Option<u64>,
     /// Maximum length of the long edge in pixels.
     pub resize: Option<u32>,
     /// Scale during RAW decoding instead of after it. Needs `resize`.
@@ -37,6 +40,8 @@ pub struct ConvertOptions {
     pub preview: bool,
     /// Tone curve for RAW development.
     pub look: Look,
+    /// A logo blended into the bottom-right corner of every image.
+    pub watermark: Option<std::sync::Arc<image::RgbaImage>>,
     pub metadata: exif_utils::MetadataOptions,
 }
 
@@ -128,16 +133,26 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
             let mut out = std::io::BufWriter::new(file);
             match format {
                 OutputFormat::Jpeg => {
-                    let img = source.rgb8(input, opts)?;
-                    write_jpeg(&img, input, &mut out, opts).with_context(unwritable)?;
+                    let mut img = source.rgb8(input, opts)?;
+                    if let Some(mark) = &opts.watermark {
+                        apply_watermark(&mut img, mark);
+                    }
+                    let bytes = encode_jpeg(&img, input, opts)?;
+                    out.write_all(&bytes).with_context(unwritable)?;
                 }
                 OutputFormat::Tiff => {
-                    let img = source.rgb16(input, opts)?;
+                    let mut img = source.rgb16(input, opts)?;
+                    if let Some(mark) = &opts.watermark {
+                        apply_watermark(&mut img, mark);
+                    }
                     write_tiff(&img, input, &mut out, opts).with_context(unwritable)?;
                 }
                 OutputFormat::Original => unreachable!("handled by copy_original"),
                 OutputFormat::Png => {
-                    let img = source.rgb16(input, opts)?;
+                    let mut img = source.rgb16(input, opts)?;
+                    if let Some(mark) = &opts.watermark {
+                        apply_watermark(&mut img, mark);
+                    }
                     write_png(&img, input, &mut out, opts).with_context(unwritable)?;
                 }
             }
@@ -698,43 +713,87 @@ fn render_16bit_sharpened(
     Ok(img)
 }
 
-fn write_jpeg(
-    img: &RgbImage,
-    input: &Path,
-    out: &mut impl Write,
-    opts: &ConvertOptions,
-) -> Result<()> {
-    // Encode JPEG to an in-memory buffer so we can inject EXIF metadata
-    // before writing to disk.
-    let mut jpeg_buf = Vec::new();
-    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, opts.quality);
-    if opts.metadata.srgb {
-        encoder.set_icc_profile(exif_utils::srgb_icc_profile().to_vec())?;
-    }
-    img.write_with_encoder(encoder)
-        .context("Failed to encode JPEG")?;
-
-    // Inject EXIF metadata into the JPEG if available. Failures here are
-    // non-fatal: we still produce the output image.
-    let exif_data = exif_utils::extract_exif(input, img.dimensions(), &opts.metadata)
+/// The complete JPEG file, with metadata, at `opts.quality` or, with
+/// `opts.max_bytes`, at the highest quality that fits.
+fn encode_jpeg(img: &RgbImage, input: &Path, opts: &ConvertOptions) -> Result<Vec<u8>> {
+    // Metadata failures are non-fatal: we still produce the output image.
+    let mut exif_data = exif_utils::extract_exif(input, img.dimensions(), &opts.metadata)
         .ok()
         .flatten();
-    let final_bytes = match exif_data {
-        Some(exif) => match exif_utils::inject_exif_into_jpeg(&jpeg_buf, &exif) {
-            Ok(with_exif) => with_exif,
-            Err(e) => {
-                eprintln!(
-                    "Warning: metadata of {} was not copied: {e}",
-                    input.display()
-                );
-                jpeg_buf
+    let mut encode = |quality: u8| -> Result<Vec<u8>> {
+        let mut jpeg_buf = Vec::new();
+        let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, quality);
+        if opts.metadata.srgb {
+            encoder.set_icc_profile(exif_utils::srgb_icc_profile().to_vec())?;
+        }
+        img.write_with_encoder(encoder)
+            .context("Failed to encode JPEG")?;
+        if let Some(exif) = &exif_data {
+            match exif_utils::inject_exif_into_jpeg(&jpeg_buf, exif) {
+                Ok(with_exif) => return Ok(with_exif),
+                Err(e) => {
+                    eprintln!(
+                        "Warning: metadata of {} was not copied: {e}",
+                        input.display()
+                    );
+                    exif_data = None;
+                }
             }
-        },
-        None => jpeg_buf,
+        }
+        Ok(jpeg_buf)
     };
+    match opts.max_bytes {
+        None => encode(opts.quality),
+        Some(limit) => fit_jpeg(limit, opts.quality, &mut encode),
+    }
+}
 
-    out.write_all(&final_bytes)?;
-    Ok(())
+/// The output of `encode` at the highest quality, up to `max_quality`,
+/// whose size is at most `limit` bytes. JPEG size grows with quality, so
+/// a binary search finds it.
+fn fit_jpeg(
+    limit: u64,
+    max_quality: u8,
+    encode: &mut impl FnMut(u8) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let fits = |bytes: &Vec<u8>| bytes.len() as u64 <= limit;
+    let first = encode(max_quality)?;
+    if fits(&first) {
+        return Ok(first);
+    }
+    let mut smallest = first.len();
+    let mut best = None;
+    let (mut low, mut high) = (1, max_quality - 1);
+    while low <= high {
+        let quality = low + (high - low) / 2;
+        let bytes = encode(quality)?;
+        if fits(&bytes) {
+            best = Some(bytes);
+            low = quality + 1;
+        } else {
+            smallest = smallest.min(bytes.len());
+            if quality == 1 {
+                break;
+            }
+            high = quality - 1;
+        }
+    }
+    best.ok_or_else(|| {
+        anyhow!(
+            "the JPEG is {} at the lowest quality, larger than --max-size {}; use --resize for a smaller image",
+            format_size(smallest as u64),
+            format_size(limit)
+        )
+    })
+}
+
+/// A file size in the decimal units that `--max-size` accepts.
+fn format_size(bytes: u64) -> String {
+    match bytes {
+        0..1_000 => format!("{bytes} bytes"),
+        1_000..1_000_000 => format!("{:.0} KB", bytes as f64 / 1e3),
+        _ => format!("{:.1} MB", bytes as f64 / 1e6),
+    }
 }
 
 fn write_tiff(
@@ -871,6 +930,59 @@ where
     }
 }
 
+/// Blend `mark` into the bottom-right corner of `img`. The long side of the
+/// mark is a fifth of the image's short edge, so the mark has the same size
+/// on landscape and portrait images; the margin is 3% of the short edge.
+fn apply_watermark<S>(img: &mut ImageBuffer<Rgb<S>, Vec<S>>, mark: &image::RgbaImage)
+where
+    S: Sample,
+    Rgb<S>: image::Pixel<Subpixel = S> + 'static,
+{
+    let (width, height) = img.dimensions();
+    let short = width.min(height) as f32;
+    let (mark_w, mark_h) = mark.dimensions();
+    let scale = short * 0.2 / mark_w.max(mark_h) as f32;
+    let new_w = ((mark_w as f32 * scale).round() as u32).max(1);
+    let new_h = ((mark_h as f32 * scale).round() as u32).max(1);
+    let margin = (short * 0.03).round() as u32;
+    if new_w + margin > width || new_h + margin > height {
+        return;
+    }
+
+    // Scale with premultiplied alpha, so the colour of transparent pixels
+    // does not leave a dark or light fringe around the mark.
+    let premultiplied = image::Rgba32FImage::from_fn(mark_w, mark_h, |x, y| {
+        let p = mark.get_pixel(x, y);
+        let a = p[3] as f32 / 255.0;
+        image::Rgba([
+            p[0] as f32 / 255.0 * a,
+            p[1] as f32 / 255.0 * a,
+            p[2] as f32 / 255.0 * a,
+            a,
+        ])
+    });
+    let scaled = image::imageops::resize(
+        &premultiplied,
+        new_w,
+        new_h,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    let max = S::DEFAULT_MAX_VALUE.as_f32();
+    let (left, top) = (width - margin - new_w, height - margin - new_h);
+    for (x, y, p) in scaled.enumerate_pixels() {
+        let a = p[3].clamp(0.0, 1.0);
+        if a == 0.0 {
+            continue;
+        }
+        let dst = img.get_pixel_mut(left + x, top + y);
+        for c in 0..3 {
+            let fg = p[c].clamp(0.0, a) * max;
+            dst[c] = S::from_f32(dst[c].as_f32() * (1.0 - a) + fg);
+        }
+    }
+}
+
 /// Lookup table that maps linear 16-bit samples to sRGB-encoded 16-bit samples.
 fn srgb_encode_lut() -> Vec<u16> {
     (0..=u16::MAX)
@@ -961,6 +1073,79 @@ mod tests {
     // Helper to create a solid-color 16-bit test image
     fn make_16bit_image(width: u32, height: u32) -> ImageBuffer<Rgb<u16>, Vec<u16>> {
         ImageBuffer::from_fn(width, height, |_x, _y| Rgb([32768u16, 16384, 8192]))
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_watermark tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn watermark_goes_into_the_bottom_right_corner() {
+        // An opaque white mark, 10x5, on a black 600x400 image: the mark
+        // becomes 80x40 (a fifth of 400) with a margin of 12.
+        let mark = image::RgbaImage::from_pixel(10, 5, image::Rgba([255, 255, 255, 255]));
+        let mut img = RgbImage::new(600, 400);
+        apply_watermark(&mut img, &mark);
+        assert_eq!(img.get_pixel(600 - 12 - 40, 400 - 12 - 20)[0], 255);
+        assert_eq!(img.get_pixel(600 - 12 - 79, 400 - 12 - 39)[1], 255);
+        assert_eq!(img.get_pixel(600 - 12 - 82, 400 - 12 - 20)[0], 0);
+        assert_eq!(img.get_pixel(600 - 5, 400 - 5)[0], 0);
+        assert_eq!(img.get_pixel(10, 10)[0], 0);
+    }
+
+    #[test]
+    fn watermark_blends_with_alpha_in_16_bit() {
+        let mark = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 128]));
+        let mut img: ImageBuffer<Rgb<u16>, Vec<u16>> = ImageBuffer::new(500, 500);
+        apply_watermark(&mut img, &mark);
+        let v = img.get_pixel(500 - 15 - 50, 500 - 15 - 50)[0];
+        assert!((32_000..=33_500).contains(&v), "{v}");
+    }
+
+    // -----------------------------------------------------------------------
+    // fit_jpeg tests
+    // -----------------------------------------------------------------------
+
+    /// An encoder whose output has `10 * quality` bytes, which counts calls.
+    fn fake_encoder(calls: &mut u32) -> impl FnMut(u8) -> Result<Vec<u8>> + '_ {
+        move |quality| {
+            *calls += 1;
+            Ok(vec![0; 10 * quality as usize])
+        }
+    }
+
+    #[test]
+    fn fit_jpeg_keeps_max_quality_when_it_fits() {
+        let mut calls = 0;
+        let bytes = fit_jpeg(2000, 92, &mut fake_encoder(&mut calls)).unwrap();
+        assert_eq!(bytes.len(), 920);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn fit_jpeg_finds_highest_quality_that_fits() {
+        for limit in [10, 11, 455, 500, 919] {
+            let mut calls = 0;
+            let bytes = fit_jpeg(limit, 92, &mut fake_encoder(&mut calls)).unwrap();
+            assert_eq!(bytes.len() as u64, limit / 10 * 10, "limit {limit}");
+            assert!(calls <= 8, "{calls} encodes for limit {limit}");
+        }
+    }
+
+    #[test]
+    fn fit_jpeg_reports_size_at_lowest_quality() {
+        let mut calls = 0;
+        let err = fit_jpeg(9, 92, &mut fake_encoder(&mut calls)).unwrap_err();
+        assert!(err.to_string().contains("10 bytes at the lowest quality"), "{err}");
+        let err = fit_jpeg(9, 1, &mut fake_encoder(&mut calls)).unwrap_err();
+        assert!(err.to_string().contains("10 bytes"), "{err}");
+    }
+
+    #[test]
+    fn format_size_uses_decimal_units() {
+        assert_eq!(format_size(999), "999 bytes");
+        assert_eq!(format_size(512_000), "512 KB");
+        assert_eq!(format_size(2_340_000), "2.3 MB");
     }
 
     // -----------------------------------------------------------------------
@@ -1301,6 +1486,7 @@ mod tests {
         ConvertOptions {
             format: crate::OutputFormat::Jpeg,
             quality: 92,
+            max_bytes: None,
             resize,
             fast: false,
             exposure: None,
@@ -1308,6 +1494,7 @@ mod tests {
             sharpen: None,
             preview: true,
             look: Look::Flat,
+            watermark: None,
             metadata: Default::default(),
         }
     }
@@ -1444,6 +1631,7 @@ mod tests {
             &ConvertOptions {
                 format: crate::OutputFormat::Jpeg,
                 quality: 92,
+                max_bytes: None,
                 resize: None,
                 fast: false,
                 exposure: None,
@@ -1451,6 +1639,7 @@ mod tests {
                 sharpen: None,
                 preview: false,
                 look: Look::Flat,
+                watermark: None,
                 metadata: Default::default(),
             },
         );
@@ -1469,6 +1658,7 @@ mod tests {
             &ConvertOptions {
                 format: crate::OutputFormat::Jpeg,
                 quality: 92,
+                max_bytes: None,
                 resize: None,
                 fast: false,
                 exposure: None,
@@ -1476,6 +1666,7 @@ mod tests {
                 sharpen: None,
                 preview: false,
                 look: Look::Flat,
+                watermark: None,
                 metadata: Default::default(),
             },
         );

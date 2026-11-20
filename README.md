@@ -51,6 +51,12 @@ Resized images look soft; `--sharpen` adds output sharpening, with an optional a
 rawdog ./trip -r 2048 --sharpen
 ```
 
+For a contest or website with a file size limit, `--max-size` lowers the JPEG quality of each file until it fits. `--quality` stays the highest quality used. Sizes are decimal (1 MB is 1,000,000 bytes), so the limit is met in either convention. A file that is too large even at the lowest quality fails with its size; use `-r` to make it smaller:
+
+```sh
+rawdog ./contest -r 3000 --max-size 2MB -o ./entries
+```
+
 Every output carries an sRGB colour profile, so colours are the same in every viewer.
 
 ### Developing
@@ -85,6 +91,12 @@ rawdog ./card -r 2048 --fast -o ./proofs
 rawdog ./wedding -r 1600 --fast -o ./proofs --gallery
 ```
 
+`--watermark` blends a logo into the bottom-right corner of every image, for proofs and web exports. Use a PNG with a transparent background. The long side of the logo is a fifth of the image's short edge, so it has the same size on landscape and portrait images:
+
+```sh
+rawdog ./wedding -r 2048 --watermark ~/logo.png -o ./web
+```
+
 ### Selecting files
 
 Convert only your picks. Ratings come from sidecar XMP files written by Lightroom, Capture One, or darktable, or from the rating set in the camera:
@@ -99,6 +111,14 @@ Convert one day of a multi-day card, from one of two bodies:
 rawdog -R /Volumes/CARD --since 2026-11-14 --until 2026-11-14 --camera 7M4 -o ./day2
 ```
 
+Convert the frames a client chose from the gallery. Each image in `gallery.html` has a tick box, and the page lists the names of the ticked images to copy and send back; ticks are kept when the page is opened again in the same browser. Paste the names into a file; names may be separated by lines, commas, or spaces, and may keep their extension:
+
+```sh
+rawdog -R /Volumes/CARD --picks picks.txt -o ./finals
+```
+
+Names are compared with the RAW file names, without letter case, so proofs made with `--name` need their `{stem}` in the name. rawdog warns about each listed name that matches no RAW file, so a typing error is not missed.
+
 Dates are the camera clock's local date. A file without the metadata that a filter needs is excluded; `--dry-run` lists each excluded file with the reason.
 
 ### Naming and importing
@@ -109,7 +129,15 @@ Dates are the camera clock's local date. A file without the metadata that a filt
 rawdog -R /Volumes/CARD -o ~/Pictures --name "{date}/{model}_{stem}"
 ```
 
-Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), `{model}`, and `{rating}` (0 for unrated). A file without that metadata gets `unknown`.
+Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), `{model}`, `{rating}` (0 for unrated), and `{seq}`. A file without that metadata gets `unknown`.
+
+`{seq}` numbers the files of the run in capture order (0001, 0002, ...). Two bodies at a wedding both write `DSC00001`, and a burst puts several frames in one second; with `{seq}` the files of both cameras get one sequence and never share a name:
+
+```sh
+rawdog -R /Volumes/CARD_A /Volumes/CARD_B -o ./wedding --name "{date}/{seq}_{stem}"
+```
+
+The numbers depend on which files the run converts: the same selection gives the same numbers, but adding files to a later run renumbers the files taken after them.
 
 The template path is below the `-o` directory. Without `-o` it is below the directory of each input file. With a template, `-R` does not mirror the input tree, so include `{date}` or another field that keeps equal file names apart.
 
@@ -141,7 +169,7 @@ rawdog -R /Volumes/CARD -o ./jpegs --report run.csv
 rawdog ./photos/ --quiet                     # print errors only
 ```
 
-By default rawdog chooses how many files to convert at the same time from the installed RAM and the size of the largest input, because too many large files at once make the system swap.
+By default rawdog chooses how many files to convert at the same time from the installed RAM and the size of the largest input, because too many large files at once make the system swap. The choice does not know how much memory other apps use. If a browser or editor already holds most of it, full-size runs can stall while the system swaps; use `-j 1`, or `--fast` for proofs, which needs about a third of the memory.
 
 `--report` lists each file with its output, its status (converted, skipped, failed, or excluded), the error message, and the time taken. It is JSON if the name ends in `.json`, otherwise CSV.
 
