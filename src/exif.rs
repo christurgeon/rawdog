@@ -91,6 +91,16 @@ pub fn read_source_exif(path: &Path) -> Result<Option<exif::Exif>> {
 /// How much of a file `read_source_exif` reads first.
 const HEAD_BYTES: u64 = 1 << 20;
 
+/// The first `HEAD_BYTES` of a file as a decoder source. A CR3 file keeps
+/// its metadata boxes at the start, and `RawSource::new` would read the
+/// whole file (it maps and loads it), which is slow from a memory card.
+/// Callers fall back to the whole file when the start is not enough.
+pub fn head_source(path: &Path) -> Option<rawler::rawsource::RawSource> {
+    let mut head = Vec::new();
+    std::fs::File::open(path).ok()?.take(HEAD_BYTES).read_to_end(&mut head).ok()?;
+    Some(rawler::rawsource::RawSource::new_from_slice(&head))
+}
+
 enum Parsed {
     Complete(exif::Exif),
     /// Some fields could not be read; in a truncated buffer that can mean
@@ -177,12 +187,17 @@ fn decoder_fields(path: &Path) -> Option<Vec<exif::Field>> {
     use rawler::rawsource::RawSource;
 
     // rawler can panic on files that are not RAW files.
-    let meta = std::panic::catch_unwind(|| {
-        let source = RawSource::new(path).ok()?;
-        let decoder = rawler::get_decoder(&source).ok()?;
-        decoder.raw_metadata(&source, &RawDecodeParams::default()).ok()
-    })
-    .ok()??;
+    let read = |source: RawSource| {
+        std::panic::catch_unwind(move || {
+            let decoder = rawler::get_decoder(&source).ok()?;
+            decoder.raw_metadata(&source, &RawDecodeParams::default()).ok()
+        })
+        .ok()
+        .flatten()
+    };
+    let meta = head_source(path)
+        .and_then(read)
+        .or_else(|| read(RawSource::new(path).ok()?))?;
     let e = meta.exif;
 
     let mut fields = Vec::new();
