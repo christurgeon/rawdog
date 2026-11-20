@@ -71,14 +71,11 @@ pub fn white_balance_reference(path: &Path) -> Result<WhiteBalanceReference> {
     })
 }
 
-/// Convert a single ARW file to the specified output format.
-pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<()> {
-    if matches!(opts.format, OutputFormat::Original) {
-        return copy_original(input, output, opts.with_jpeg);
-    }
-
+/// Open the pixels of `input`: its embedded preview with `--preview`, or
+/// the RAW data with the development options applied. `None` when a
+/// preview was asked for but cannot be read.
+fn prepare_source(input: &Path, opts: &ConvertOptions) -> Result<Option<Source>> {
     let ConvertOptions {
-        format,
         resize,
         fast,
         exposure,
@@ -86,21 +83,13 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         ..
     } = *opts;
 
-    let mut source = if opts.preview {
+    let source = if opts.preview {
         // A file whose preview cannot be read is developed too; if the
         // file is broken, developing reports why.
         let Some(preview) = load_preview(input).ok().flatten() else {
             // Phones, Olympus, and some DNG files store no preview. Develop
             // those instead of failing, at --fast speed when resizing.
-            eprintln!(
-                "Note: {} has no embedded preview that rawdog can read; developing the RAW data instead",
-                input.display()
-            );
-            let mut developed = opts.clone();
-            developed.preview = false;
-            developed.fast = resize.is_some();
-            developed.metadata.srgb = true;
-            return convert_raw(input, output, &developed);
+            return Ok(None);
         };
         warn_if_preview_is_small(&preview, resize);
         Source::Preview(preview)
@@ -156,6 +145,32 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         }
         Source::Developed(Box::new(pipeline))
     };
+    Ok(Some(source))
+}
+
+/// The options for developing a file whose preview cannot be read.
+fn developed_instead_of_preview(input: &Path, opts: &ConvertOptions) -> ConvertOptions {
+    eprintln!(
+        "Note: {} has no embedded preview that rawdog can read; developing the RAW data instead",
+        input.display()
+    );
+    let mut developed = opts.clone();
+    developed.preview = false;
+    developed.fast = opts.resize.is_some();
+    developed.metadata.srgb = true;
+    developed
+}
+
+/// Convert a single ARW file to the specified output format.
+pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<()> {
+    if matches!(opts.format, OutputFormat::Original) {
+        return copy_original(input, output, opts.with_jpeg);
+    }
+
+    let format = opts.format;
+    let Some(mut source) = prepare_source(input, opts)? else {
+        return convert_raw(input, output, &developed_instead_of_preview(input, opts));
+    };
 
     // Ensure output directory exists
     if let Some(parent) = output.parent() {
@@ -203,6 +218,107 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
             std::fs::rename(&tmp, output).with_context(unwritable)
         });
 
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Convert `input` to several sizes, developing it only once: at the
+/// largest size, without sharpening, from which each output is resized,
+/// sharpened, and marked. One result per output, in order.
+pub fn convert_raw_sizes(
+    input: &Path,
+    outputs: &[(PathBuf, Option<u32>)],
+    opts: &ConvertOptions,
+) -> Vec<Result<()>> {
+    let all_fail = |e: anyhow::Error| outputs.iter().map(|_| Err(anyhow!("{e:#}"))).collect();
+    let largest = if outputs.iter().any(|(_, size)| size.is_none()) {
+        None
+    } else {
+        outputs.iter().filter_map(|(_, size)| *size).max()
+    };
+    let base = ConvertOptions { resize: largest, sharpen: None, ..opts.clone() };
+    let mut source = match prepare_source(input, &base) {
+        Ok(Some(source)) => source,
+        Ok(None) => {
+            return convert_raw_sizes(input, outputs, &developed_instead_of_preview(input, opts))
+        }
+        Err(e) => return all_fail(e),
+    };
+    let sized = |size: Option<u32>| ConvertOptions { resize: size, ..opts.clone() };
+    match opts.format {
+        OutputFormat::Jpeg => {
+            let full = match source.rgb8(&base) {
+                Ok(img) => img,
+                Err(e) => return all_fail(e),
+            };
+            outputs
+                .iter()
+                .map(|(output, size)| {
+                    let mut img = maybe_resize_8bit(full.clone(), *size);
+                    finish_image(&mut img, opts);
+                    let bytes = encode_jpeg(&img, input, &sized(*size))?;
+                    write_atomically(output, |out| Ok(out.write_all(&bytes)?))
+                })
+                .collect()
+        }
+        OutputFormat::Tiff | OutputFormat::Png => {
+            let full = match source.rgb16(&base) {
+                Ok(img) => img,
+                Err(e) => return all_fail(e),
+            };
+            outputs
+                .iter()
+                .map(|(output, size)| {
+                    let mut img = maybe_resize_16bit(full.clone(), *size);
+                    finish_image(&mut img, opts);
+                    let opts = sized(*size);
+                    write_atomically(output, |out| match opts.format {
+                        OutputFormat::Tiff => write_tiff(&img, input, out, &opts),
+                        _ => write_png(&img, input, out, &opts),
+                    })
+                })
+                .collect()
+        }
+        OutputFormat::Original => all_fail(anyhow!("-f original copies files; it has no sizes")),
+    }
+}
+
+/// Output sharpening and the watermark, after the resize.
+fn finish_image<S>(img: &mut ImageBuffer<Rgb<S>, Vec<S>>, opts: &ConvertOptions)
+where
+    S: Sample,
+    Rgb<S>: image::Pixel<Subpixel = S> + 'static,
+{
+    if let Some(amount) = opts.sharpen {
+        sharpen(img, amount);
+    }
+    if let Some(mark) = &opts.watermark {
+        apply_watermark(img, mark);
+    }
+}
+
+/// Write `output` through a temporary file that is renamed when complete,
+/// so a failed or interrupted write never leaves a partial file.
+fn write_atomically(
+    output: &Path,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<()>,
+) -> Result<()> {
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create output directory {}", parent.display()))?;
+    }
+    let tmp = temp_path_for(output);
+    let _guard = TempFileGuard::register(&tmp);
+    let unwritable = || format!("Failed to write output file {}", output.display());
+    let result = std::fs::File::create(&tmp).with_context(unwritable).and_then(|file| {
+        let mut out = std::io::BufWriter::new(file);
+        write(&mut out).with_context(unwritable)?;
+        out.flush().with_context(unwritable)?;
+        drop(out);
+        std::fs::rename(&tmp, output).with_context(unwritable)
+    });
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }

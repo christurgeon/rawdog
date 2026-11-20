@@ -1076,7 +1076,8 @@ fn main() -> Result<()> {
         std::process::exit(130);
     });
 
-    let convert_one = |(input_path, output_path): &(PathBuf, PathBuf)| {
+    // Refuse or skip a job; true if it is to be converted.
+    let precheck = |(input_path, output_path): &(PathBuf, PathBuf)| -> bool {
         if let Some(reason) = refusal(input_path, output_path, &dir_names) {
             pb.suspend(|| {
                 eprintln!("Error converting {}: {reason}", input_path.display());
@@ -1085,7 +1086,7 @@ fn main() -> Result<()> {
             failures.lock().unwrap().push(input_path.clone());
             failed.fetch_add(1, Ordering::Relaxed);
             pb.inc(1);
-            return;
+            return false;
         }
 
         if should_skip(input_path, output_path, cli.overwrite, cli.update) {
@@ -1107,7 +1108,7 @@ fn main() -> Result<()> {
                 failures.lock().unwrap().push(input_path.clone());
                 failed.fetch_add(1, Ordering::Relaxed);
                 pb.inc(1);
-                return;
+                return false;
             }
             record(
                 input_path,
@@ -1118,29 +1119,15 @@ fn main() -> Result<()> {
             );
             skipped.fetch_add(1, Ordering::Relaxed);
             pb.inc(1);
-            return;
+            return false;
         }
+        true
+    };
 
-        // The RAW decoder can panic on corrupt files. Report that as a
-        // failure of this file instead of aborting the batch.
-        let started = std::time::Instant::now();
-        pb.set_message(
-            input_path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-        );
-        let result = std::panic::catch_unwind(|| {
-            match job_sizes.get(output_path) {
-                Some(&size) if size != opts.resize => {
-                    let sized = converter::ConvertOptions { resize: size, ..opts.clone() };
-                    converter::convert_raw(input_path, output_path, &sized)
-                }
-                _ => converter::convert_raw(input_path, output_path, &opts),
-            }
-        })
-        .unwrap_or_else(|_| Err(anyhow!("decoder panicked; the file is probably corrupt")));
-
+    // Record the result of a conversion.
+    let finish = |(input_path, output_path): &(PathBuf, PathBuf), result: Result<()>, seconds: f64| {
         match result {
             Ok(()) => {
-                let seconds = started.elapsed().as_secs_f64();
                 record(input_path, output_path, report::Status::Converted, String::new(), seconds);
                 succeeded.fetch_add(1, Ordering::Relaxed);
             }
@@ -1148,29 +1135,106 @@ fn main() -> Result<()> {
                 pb.suspend(|| {
                     eprintln!("Error converting {}: {:#}", input_path.display(), e);
                 });
-                let seconds = started.elapsed().as_secs_f64();
                 record(input_path, output_path, report::Status::Failed, format!("{e:#}"), seconds);
                 failures.lock().unwrap().push(input_path.clone());
                 failed.fetch_add(1, Ordering::Relaxed);
             }
         }
-
         pb.inc(1);
+    };
+
+    // The RAW decoder can panic on corrupt files. Report that as a failure
+    // of this file instead of aborting the batch.
+    let panicked = || anyhow!("decoder panicked; the file is probably corrupt");
+    let convert_one = |job: &(PathBuf, PathBuf)| {
+        if !precheck(job) {
+            return;
+        }
+        let (input_path, output_path) = job;
+        let started = std::time::Instant::now();
+        pb.set_message(
+            input_path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        );
+        let result = std::panic::catch_unwind(|| match job_sizes.get(output_path) {
+            Some(&size) if size != opts.resize => {
+                let sized = converter::ConvertOptions { resize: size, ..opts.clone() };
+                converter::convert_raw(input_path, output_path, &sized)
+            }
+            _ => converter::convert_raw(input_path, output_path, &opts),
+        })
+        .unwrap_or_else(|_| Err(panicked()));
+        finish(job, result, started.elapsed().as_secs_f64());
+    };
+
+    // With several sizes, the jobs of one input are converted together, from
+    // one decode.
+    let convert_group = |group: &[&(PathBuf, PathBuf)]| {
+        let todo: Vec<&(PathBuf, PathBuf)> = group.iter().copied().filter(|job| precheck(job)).collect();
+        let [first, ..] = todo[..] else {
+            return;
+        };
+        if todo.len() == 1 {
+            // Already prechecked; convert it the usual way.
+            let (input_path, output_path) = first;
+            let started = std::time::Instant::now();
+            let size = job_sizes.get(output_path).copied().flatten();
+            let sized = converter::ConvertOptions { resize: size, ..opts.clone() };
+            let result = std::panic::catch_unwind(|| converter::convert_raw(input_path, output_path, &sized))
+                .unwrap_or_else(|_| Err(panicked()));
+            finish(first, result, started.elapsed().as_secs_f64());
+            return;
+        }
+        let input_path = &first.0;
+        pb.set_message(
+            input_path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        );
+        let outputs: Vec<(PathBuf, Option<u32>)> = todo
+            .iter()
+            .map(|(_, output)| (output.clone(), job_sizes.get(output).copied().flatten()))
+            .collect();
+        let started = std::time::Instant::now();
+        let results = std::panic::catch_unwind(|| converter::convert_raw_sizes(input_path, &outputs, &opts))
+            .unwrap_or_else(|_| todo.iter().map(|_| Err(panicked())).collect());
+        let seconds = started.elapsed().as_secs_f64() / todo.len() as f64;
+        for (job, result) in todo.into_iter().zip(results) {
+            finish(job, result, seconds);
+        }
     };
 
     // The worker threads only limit how many files are open at once. The
     // decoder runs its own parallel loops on the global thread pool, so each
     // file still uses every core.
     let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..workers.min(jobs.len()) {
-            scope.spawn(|| {
-                while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    convert_one(job);
-                }
+    if size_dirs.len() > 1 {
+        let mut groups: Vec<Vec<&(PathBuf, PathBuf)>> = Vec::new();
+        let mut index: HashMap<&Path, usize> = HashMap::new();
+        for job in &jobs {
+            let i = *index.entry(job.0.as_path()).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
             });
+            groups[i].push(job);
         }
-    });
+        std::thread::scope(|scope| {
+            for _ in 0..workers.min(groups.len()) {
+                scope.spawn(|| {
+                    while let Some(group) = groups.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        convert_group(group);
+                    }
+                });
+            }
+        });
+    } else {
+        std::thread::scope(|scope| {
+            for _ in 0..workers.min(jobs.len()) {
+                scope.spawn(|| {
+                    while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        convert_one(job);
+                    }
+                });
+            }
+        });
+    }
 
     pb.finish_and_clear();
 
