@@ -747,16 +747,37 @@ fn main() -> Result<()> {
     let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let skip_defaults = args.iter().any(|a| a == "--no-defaults");
     args.retain(|a| a != "--no-defaults");
+    let typed = args.clone();
+    let mut defaults_file = None;
     if !skip_defaults {
-        if let Some(path) = defaults_path().filter(|p| p.is_file()) {
+        let path = defaults_path();
+        if let (Some(path), Some(_)) = (&path, std::env::var_os("RAWDOG_DEFAULTS")) {
+            if !path.is_file() {
+                eprintln!("Warning: RAWDOG_DEFAULTS names {}, which is not a file", path.display());
+            }
+        }
+        if let Some(path) = path.filter(|p| p.is_file()) {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read defaults file {}", path.display()))?;
             let defaults = parse_defaults(&text)
                 .map_err(|e| anyhow!("In defaults file {}: {e}", path.display()))?;
             args.splice(1..1, defaults.into_iter().map(Into::into));
+            defaults_file = Some(path);
         }
     }
-    let cli = Cli::parse_from(&args);
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(e) => {
+            // An error that the typed arguments alone do not have comes
+            // from the defaults file; say so, since the user did not type it.
+            if let (Some(path), true) = (&defaults_file, e.use_stderr()) {
+                if Cli::try_parse_from(&typed).is_ok() {
+                    eprintln!("In defaults file {}:", path.display());
+                }
+            }
+            e.exit()
+        }
+    };
 
     if cli.watch.is_some() && cli.name.as_ref().is_some_and(|t| t.uses_seq() || t.uses_burst()) {
         bail!(
@@ -876,6 +897,19 @@ fn main() -> Result<()> {
         None => None,
     };
 
+    // A report that cannot be written would be lost after the whole run.
+    if let Some(path) = &cli.report {
+        let existed = path.exists();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .with_context(|| format!("Cannot write the report file {}", path.display()))?;
+        if !existed {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     // Collect all RAW files from inputs
     let mut inputs = cli.input.clone();
     if let Some(list) = &cli.files_from {
@@ -896,7 +930,7 @@ fn main() -> Result<()> {
         }
         inputs.extend(listed);
     }
-    let mut files = collect_raw_files(&inputs, cli.recursive)?;
+    let mut files = collect_raw_files_except(&inputs, cli.recursive, cli.output.as_deref())?;
     if std::env::var_os(WATCH_ROUND).is_some() {
         // A file that changed in the last seconds may still be copying.
         let settled = |f: &InputFile| {
@@ -1524,7 +1558,20 @@ struct InputFile {
 /// Paths can be individual files or directories.
 /// When `recursive` is true, directories are scanned recursively.
 /// Inputs that resolve to the same file are kept only once.
+#[cfg(test)]
 fn collect_raw_files(inputs: &[PathBuf], recursive: bool) -> Result<Vec<InputFile>> {
+    collect_raw_files_except(inputs, recursive, None)
+}
+
+/// `collect_raw_files`, without descending into `skip`: an output directory
+/// inside a scanned input directory, whose copies (with `-f original`)
+/// would otherwise be found again on every run.
+fn collect_raw_files_except(
+    inputs: &[PathBuf],
+    recursive: bool,
+    skip: Option<&Path>,
+) -> Result<Vec<InputFile>> {
+    let skip = skip.and_then(|p| p.canonicalize().ok());
     let mut files = Vec::new();
 
     for path in inputs {
@@ -1533,6 +1580,11 @@ fn collect_raw_files(inputs: &[PathBuf], recursive: bool) -> Result<Vec<InputFil
                 let walker = WalkDir::new(path)
                     .follow_links(false)
                     .into_iter()
+                    .filter_entry(|e| {
+                        e.depth() == 0
+                            || !e.file_type().is_dir()
+                            || skip.as_ref().is_none_or(|s| e.path().canonicalize().ok().as_ref() != Some(s))
+                    })
                     .filter_map(|entry| match entry {
                         Ok(e) => Some(e),
                         Err(e) => {

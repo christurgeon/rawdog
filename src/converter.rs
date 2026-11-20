@@ -75,6 +75,10 @@ pub fn white_balance_reference(path: &Path) -> Result<WhiteBalanceReference> {
 /// the RAW data with the development options applied. `None` when a
 /// preview was asked for but cannot be read.
 fn prepare_source(input: &Path, opts: &ConvertOptions) -> Result<Option<Source>> {
+    // Name a permission problem as such, not as a corrupt file.
+    if let Err(e) = std::fs::File::open(input) {
+        bail!("cannot read the file: {e}");
+    }
     let ConvertOptions {
         resize,
         fast,
