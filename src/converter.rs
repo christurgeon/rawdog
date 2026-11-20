@@ -525,16 +525,19 @@ fn copy_original(input: &Path, output: &Path, with_jpeg: bool) -> Result<()> {
     }
     copy_sidecars(input, output)?;
     if with_jpeg {
-        copy_companions(input, output)?;
+        // The RAW file was just copied, so a camera JPEG already at the
+        // destination may belong to another image ({seq} renumbers).
+        copy_companions(input, output, true)?;
     }
     Ok(())
 }
 
 /// Copy the JPEG or HEIF files that a camera set to RAW+JPEG wrote next to
 /// `input` with the same name, such as `DSC1.JPG` for `DSC1.ARW`. Each copy
-/// keeps its modification time and is compared with the original; an
-/// existing file at the destination is kept.
-fn copy_companions(input: &Path, output: &Path) -> Result<()> {
+/// keeps its modification time and is compared with the original. With
+/// `replace`, an existing file at the destination is replaced; otherwise
+/// it is kept.
+pub fn copy_companions(input: &Path, output: &Path, replace: bool) -> Result<()> {
     const EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "hif", "heic"];
     let (Some(dir), Some(stem)) = (input.parent(), input.file_stem()) else {
         return Ok(());
@@ -555,7 +558,7 @@ fn copy_companions(input: &Path, output: &Path) -> Result<()> {
             continue;
         }
         let destination = output.with_extension(ext);
-        if destination.exists() {
+        if destination.exists() && (!replace || same_contents(&source, &destination)?) {
             continue;
         }
         copy_verified(&source, &destination, true).map_err(|e| {
@@ -1442,6 +1445,9 @@ mod tests {
         assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
 
         let out = tmp.path().join("archive");
+        // A JPEG of another image at the destination is replaced.
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("2024_DSC1.JPG"), b"another image").unwrap();
         copy_original(&input, &out.join("2024_DSC1.ARW"), true).unwrap();
         let mut names: Vec<String> = std::fs::read_dir(&out)
             .unwrap()
@@ -1452,6 +1458,14 @@ mod tests {
         let copied = out.join("2024_DSC1.JPG");
         assert_eq!(std::fs::read(&copied).unwrap(), b"jpeg");
         assert_eq!(std::fs::metadata(&copied).unwrap().modified().unwrap(), old);
+
+        // Without `replace`, a missing companion is added and an existing
+        // one is kept.
+        std::fs::remove_file(out.join("2024_DSC1.HIF")).unwrap();
+        std::fs::write(&copied, b"kept").unwrap();
+        copy_companions(&input, &out.join("2024_DSC1.ARW"), false).unwrap();
+        assert_eq!(std::fs::read(out.join("2024_DSC1.HIF")).unwrap(), b"heif");
+        assert_eq!(std::fs::read(&copied).unwrap(), b"kept");
     }
 
     #[test]
