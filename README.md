@@ -161,7 +161,7 @@ The template path is below the `-o` directory. Without `-o` it is below the dire
 rawdog -R /Volumes/CARD -f original -o ~/Archive --name "{year}/{date}/{stem}"
 ```
 
-Each copy is compared byte for byte with the original and keeps its modification time; the card is never changed. XMP sidecars (`NAME.xmp` from Lightroom or Capture One, `NAME.ARW.xmp` from darktable) are copied with their RAW file, and a sidecar that already exists in the archive is kept. Image options such as `-r` cannot be used with `-f original`.
+Each copy is compared byte for byte with the original and keeps its modification time; the card is never changed. XMP sidecars (`NAME.xmp` from Lightroom or Capture One, `NAME.ARW.xmp` from darktable) are copied with their RAW file, and a sidecar that already exists in the archive is kept. With `--with-jpeg`, the JPEG or HEIF that a camera set to RAW+JPEG wrote next to each RAW file (`DSC1.JPG` or `DSC1.HIF` for `DSC1.ARW`) is copied and checked in the same way. Image options such as `-r` cannot be used with `-f original`.
 
 ### Metadata
 
