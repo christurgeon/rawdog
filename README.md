@@ -2,16 +2,14 @@
 
 Raw files in, images out. No Lightroom, no fuss.
 
-A no-nonsense RAW converter supporting JPEG, TIFF, and PNG output. Built for Sony ARW; it also accepts most other camera RAW formats (DNG, CR2, CR3, NEF, RAF, ORF, RW2, PEF, and more).
+A no-nonsense RAW converter for JPEG, TIFF, and PNG output, with the tools a photographer needs around it: proofs and client galleries, culling by rating or label, naming and importing cards, and delivery sizes. Built for Sony ARW; it also accepts most other camera RAW formats (DNG, CR2, CR3, NEF, RAF, ORF, RW2, PEF, and more). See [Supported cameras](#supported-cameras).
 
-Two decoder libraries are used. [rawler](https://github.com/dnglab/dnglab) is tried first: it knows cameras up to now (for example the Sony a7 IV, a7R V, and a1), Canon CR3, and the exact sensor crop of most bodies. [rawloader](https://github.com/pedrocr/rawloader) decodes a few files that rawler does not. For CR3 files the main metadata fields are copied (camera, lens, exposure, date, GPS).
-
-Not supported: Nikon High Efficiency NEF (Z 8, Z f), and some phone DNG files (Samsung Galaxy S23 Ultra). rawdog reports an error for these instead of writing a broken image.
-
-## Installation
+## Quick start
 
 ```sh
-cargo install --path .
+cargo install --path .              # needs Rust: https://rustup.rs
+rawdog photo.ARW                    # photo.jpg next to the RAW file
+rawdog -R /Volumes/CARD -o ./jpegs  # a whole card, folders kept
 ```
 
 ## Usage
@@ -51,7 +49,7 @@ rawdog ./photos/ -f png -r 2048   # 16-bit PNG, resized
 rawdog ./trip --aspect 4:5 -r 1350
 ```
 
-Several sizes at once, each in its own folder below `-o` (`./delivery/3000/`, `./delivery/2048/`, ...). Each size is developed on its own, so add `--fast` for speed; `--gallery` shows the smallest size:
+Several sizes at once, each in its own folder below `-o` (`./delivery/3000/`, `./delivery/2048/`, ...). Each size is developed on its own, so add `--fast` for speed. `--gallery` shows the smallest size and is written into its folder (`./delivery/1080/gallery.html`):
 
 ```sh
 rawdog ./wedding -r 3000,2048,1080 --fast -o ./delivery
@@ -89,7 +87,7 @@ rawdog ./timelapse --wb-from ./timelapse/DSC00412.ARW -r 3840 -o ./frames
 
 ### Culling and proofs
 
-`--preview` writes the JPEG preview that the camera embedded in each RAW file, with the camera's own colours. It is the fastest way to look through a card. A file without a preview that rawdog can read (phones, Olympus, some DNG files) is developed instead, with a note. A preview is never enlarged, so `-r` larger than the preview has no effect. The size depends on the camera: 1616x1080 for Sony bodies, full resolution for many Canon and Nikon bodies.
+`--preview` writes the JPEG preview that the camera embedded in each RAW file, with the camera's own colours. It is the fastest way to look through a card. A file without a preview that rawdog can read (phones, Olympus, some DNG files) is developed instead, with a note. A preview is never enlarged, so `-r` larger than the preview has no effect. The size depends on the camera: 1616x1080 for most Sony bodies (1440x1080 for the a7C), and from 1620x1080 (Nikon Z 6) up to full resolution (Nikon Z 8, many Canon bodies) for others.
 
 ```sh
 rawdog -R /Volumes/CARD --preview -o ./proofs
@@ -118,6 +116,7 @@ rawdog ./wedding -r 2048 --watermark ~/logo.png -o ./web
 Convert only your picks. Ratings come from sidecar XMP files written by Lightroom, Capture One, or darktable, or from the rating set in the camera:
 
 ```sh
+rawdog -R /Volumes/CARD --min-rating 3 -o ./picks --dry-run   # what would be converted, and why files are excluded
 rawdog -R /Volumes/CARD --min-rating 3 -o ./picks
 ```
 
@@ -145,29 +144,45 @@ Names are compared with the RAW file names, without letter case, so proofs made 
 
 Dates are the camera clock's local date. A file without the metadata that a filter needs is excluded; `--dry-run` lists each excluded file with the reason.
 
-### Naming and importing
+### Naming output files
 
-`--name` sets the output path from a template. Import a card into folders by capture date, with the camera model in each file name:
+`--name` sets the output path from a template. The path is below the `-o` directory, or below the directory of each input file without `-o`. Sort a card into folders by capture date, with the camera model in each file name:
 
 ```sh
 rawdog -R /Volumes/CARD -o ~/Pictures --name "{date}/{model}_{stem}"
 ```
 
-Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), `{model}`, `{lens}`, `{serial}` (the body's serial number, to keep two bodies of one model apart), `{rating}` (0 for unrated, `rejected` for a file rejected in Lightroom), `{label}` (the colour label in lower case, `none` without one), `{seq}`, and `{burst}`. A file without that metadata gets `unknown`; some cameras, such as Sony bodies, do not record the serial number in standard metadata. Characters that are not allowed in file names on exFAT drives or Windows (`/ \ : | * ? " < >`) become `_`.
+| Field | Value |
+|---|---|
+| `{stem}` | input file name without extension |
+| `{date}`, `{year}`, `{month}`, `{day}` | capture date: 2024-03-09, 2024, 03, 09 |
+| `{time}` | capture time: 070542 |
+| `{model}`, `{lens}` | camera model, lens model |
+| `{serial}` | the body's serial number, to keep two bodies of one model apart |
+| `{rating}` | 1 to 5, 0 for unrated, `rejected` for a file rejected in Lightroom |
+| `{label}` | colour label in lower case, `none` without one |
+| `{seq}` | number in capture order: 0001, 0002, ... |
+| `{burst}` | number of a group of frames taken close together |
 
-`{seq}` numbers the files of the run in capture order (0001, 0002, ...). Numbers have four digits, or more when they pass 9999; a name with five digits does not sort after one with four, so keep a numbering below 10,000 files. Two bodies at a wedding both write `DSC00001`, and a burst puts several frames in one second; with `{seq}` the files of both cameras get one sequence and never share a name:
+A file without the metadata for a field gets `unknown`; some cameras, such as Sony bodies, do not record the serial number in standard metadata. Characters that are not allowed in file names on exFAT drives or Windows (`/ \ : | * ? " < >`) become `_`. With a template, `-R` does not mirror the input tree, so include `{date}` or another field that keeps equal file names apart.
+
+`{seq}` gives the files of both bodies at a wedding one sequence, although both cameras write `DSC00001` and a burst puts several frames in one second:
 
 ```sh
 rawdog -R /Volumes/CARD_A /Volumes/CARD_B -o ./wedding --name "{date}/{seq}_{stem}"
 ```
 
-`{burst}` numbers groups of frames taken close together, so each burst of a wildlife or sports sequence, or each exposure bracket, goes into its own folder for culling. A frame taken more than `--burst-gap` seconds (default 2) after the one before starts a new burst. Capture times have one-second steps, so a gap of 0 separates frames from different seconds only:
+`{burst}` puts each burst of a wildlife or sports sequence, or each exposure bracket, into its own folder for culling. A frame taken more than `--burst-gap` seconds (default 2) after the one before starts a new burst. Capture times have one-second steps, so a gap of 0 separates frames from different seconds only:
 
 ```sh
 rawdog -R /Volumes/CARD -r 2048 --fast -o ./cull --name "{burst}/{stem}"
 ```
 
-Like `{seq}`, `{burst}` numbers are counted per run, and a run refuses to start when its output files exist.
+`{seq}` and `{burst}` numbers are counted per run, so adding files to a later run renumbers the files taken after them. For that reason such a run refuses to start when any of its output files exists; use `--overwrite` to replace them, or write to an empty directory. To add a second day or a late card to an existing set, continue the numbering with `--seq-start`. Numbers have four digits, or more past 9999; a name with five digits does not sort after one with four, so keep a numbering below 10,000 files.
+
+```sh
+rawdog -R /Volumes/DAY2 -o ./wedding --name "{date}/{seq}_{stem}" --seq-start 413
+```
 
 If a camera clock was set wrong, `--time-shift` corrects the capture time: for every camera (`+1h`), or per camera model to line up two bodies before numbering them:
 
@@ -177,13 +192,7 @@ rawdog -R /Volumes/CARD_A /Volumes/CARD_B -o ./wedding --name "{date}/{seq}_{ste
 
 Offsets use `d`, `h`, `m`, and `s`, such as `-1d`, `+30m`, or `+1h2m5s`. A camera model matches like `--camera`; a camera that no rule names is not shifted, unless one offset is given without a model. The corrected time is used by the template, `--since`, `--until`, and the gallery, and replaces the capture dates in the output metadata. With `-f original` the RAW files are copied unchanged; only their names use the corrected time.
 
-The numbers depend on which files the run converts, so adding files to a later run renumbers the files taken after them. For that reason a `{seq}` run refuses to start when any of its output files exists; use `--overwrite` to replace them, or write to an empty directory. To add a second day or a late card to an existing set, continue the numbering with `--seq-start`:
-
-```sh
-rawdog -R /Volumes/DAY2 -o ./wedding --name "{date}/{seq}_{stem}" --seq-start 413
-```
-
-The template path is below the `-o` directory. Without `-o` it is below the directory of each input file. With a template, `-R` does not mirror the input tree, so include `{date}` or another field that keeps equal file names apart.
+### Importing and archiving a card
 
 `-f original` copies the RAW files themselves instead of converting them, for example into an archive by date:
 
@@ -191,7 +200,9 @@ The template path is below the `-o` directory. Without `-o` it is below the dire
 rawdog -R /Volumes/CARD -f original -o ~/Archive --name "{year}/{date}/{stem}"
 ```
 
-Each copy is compared byte for byte with the original and keeps its modification time; the card is never changed. XMP sidecars (`NAME.xmp` from Lightroom or Capture One, `NAME.ARW.xmp` from darktable) are copied with their RAW file, and a sidecar that already exists in the archive is kept. With `--with-jpeg`, the JPEG or HEIF that a camera set to RAW+JPEG wrote next to each RAW file (`DSC1.JPG` or `DSC1.HIF` for `DSC1.ARW`) is copied and checked in the same way. It replaces a file of the same name at the destination, so it always matches its RAW file; for a RAW file already in the archive, a missing JPEG is added. Image options such as `-r` cannot be used with `-f original`.
+Each copy is compared byte for byte with the original and keeps its modification time; the card is never changed. XMP sidecars (`NAME.xmp` from Lightroom or Capture One, `NAME.ARW.xmp` from darktable) are copied with their RAW file, and a sidecar that already exists in the archive is kept. Image options such as `-r` cannot be used with `-f original`.
+
+With `--with-jpeg`, the JPEG or HEIF that a camera set to RAW+JPEG wrote next to each RAW file (`DSC1.JPG` or `DSC1.HIF` for `DSC1.ARW`) is copied and checked in the same way. It replaces a file of the same name at the destination, so it always matches its RAW file; for a RAW file already in the archive, a missing JPEG is added.
 
 For an archive that must stay provably unchanged, `--manifest` writes a `SHA256SUMS` file into each destination folder with the checksum of every copy, computed while the copy is checked. Later runs add their files to it, including files already in the archive from a run without `--manifest`: those are compared with the originals first, so a damaged copy is reported. An interrupted run keeps the checksums of the copies it finished. Check a folder at any time with the system's own tool:
 
@@ -232,6 +243,7 @@ rawdog ./photos/ --update                    # convert again only RAW files newe
 rawdog ./photos/ -j 2                        # convert two files at a time
 rawdog -R /Volumes/CARD -o ./jpegs --report run.csv
 rawdog ./photos/ --quiet                     # print errors only
+rawdog --completions zsh > ~/.zfunc/_rawdog  # shell completion (bash, zsh, fish, ...)
 ```
 
 By default rawdog chooses how many files to convert at the same time from the installed RAM and the size of the largest input, because too many large files at once make the system swap. The choice does not know how much memory other apps use. If a browser or editor already holds most of it, full-size runs can stall while the system swaps; use `-j 1`, or `--fast` for proofs, which needs about a third of the memory.
@@ -271,7 +283,7 @@ rawdog exits with `0` when every input converted or was skipped. It exits
 non-zero when any conversion failed, when an input path does not exist, when
 no RAW files were found, or when outputs conflict. Valid inputs are still
 converted when some other inputs fail or are missing.
-A refused or failed file also gives a non-zero exit status, with `--dry-run` too.
+A refused or failed file also gives a non-zero exit status, with `--dry-run` too. A run whose selection options exclude every file is not an error: it prints "No RAW files match the selection options." and exits with `0`.
 
 ## macOS Finder Integration
 
@@ -329,6 +341,12 @@ osascript -e "display notification \"$(echo "$RESULT" | grep -E 'succeeded|No RA
 ```
 
 If the action doesn't appear, check **System Settings → Privacy & Security → Extensions → Finder**.
+
+## Supported cameras
+
+Two decoder libraries are used. [rawler](https://github.com/dnglab/dnglab) is tried first: it knows cameras up to now (for example the Sony a7 IV, a7R V, and a1), Canon CR3, and the exact sensor crop of most bodies. [rawloader](https://github.com/pedrocr/rawloader) decodes a few files that rawler does not. For CR3 files the main metadata fields are copied (camera, lens, exposure, date, GPS).
+
+Not supported: Nikon High Efficiency NEF (Z 8, Z f), and some phone DNG files (Samsung Galaxy S23 Ultra). rawdog reports an error for these instead of writing a broken image.
 
 ## License
 
