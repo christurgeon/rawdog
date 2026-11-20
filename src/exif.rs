@@ -530,7 +530,8 @@ fn gpx_position<'a>(
     // The file's own time zone wins; --gpx-tz is for files without one.
     let offset = ascii(Tag::OffsetTimeOriginal)
         .and_then(|o| crate::gpx::parse_offset(&o))
-        .or_else(|| meta.gpx_tz.as_ref()?.at(local + shift_seconds));
+        // Zone changes are given in camera-clock time, before --time-shift.
+        .or_else(|| meta.gpx_tz.as_ref()?.at(local));
     let Some(offset) = offset else {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {

@@ -455,8 +455,8 @@ fn load_preview(input: &Path) -> Result<Option<RgbImage>> {
 /// readable preview.
 pub fn sharpness(input: &Path) -> Option<f64> {
     let preview = load_preview(input).ok().flatten()?;
-    let small = image::imageops::thumbnail(&preview, 800, 800);
-    let grey = image::DynamicImage::ImageRgb8(small).into_luma8();
+    // DynamicImage::thumbnail keeps the aspect ratio.
+    let grey = image::DynamicImage::ImageRgb8(preview).thumbnail(800, 800).into_luma8();
     Some(laplacian_variance(&grey))
 }
 

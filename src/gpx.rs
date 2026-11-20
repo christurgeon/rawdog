@@ -98,6 +98,9 @@ impl FromStr for Zones {
         };
         let mut zones = Zones { first: None, changes: Vec::new() };
         for part in s.split(',').map(str::trim) {
+            if part.is_empty() {
+                return Err("an empty part; remove the extra comma".to_string());
+            }
             match part.split_once('=') {
                 None if zones.first.is_none() && zones.changes.is_empty() => {
                     zones.first = Some(parse_offset(part).ok_or_else(|| error(part))?);
@@ -111,6 +114,9 @@ impl FromStr for Zones {
             }
         }
         zones.changes.sort_unstable();
+        if zones.changes.windows(2).any(|w| w[0].0 == w[1].0) {
+            return Err("two changes at the same time".to_string());
+        }
         Ok(zones)
     }
 }
@@ -131,7 +137,19 @@ impl Zones {
 /// "2026-11-17" (midnight), in seconds since 1970.
 fn parse_local(s: &str) -> Option<i64> {
     let number = |range: std::ops::Range<usize>| s.get(range)?.parse::<u16>().ok();
+    let separators_ok = s.get(4..5) == Some("-")
+        && s.get(7..8) == Some("-")
+        && (s.len() == 10 || (s.get(10..11) == Some("T") && s.get(13..14) == Some(":")))
+        && (s.len() != 19 || s.get(16..17) == Some(":"));
+    if !separators_ok {
+        return None;
+    }
     let (y, mo, d) = (number(0..4)?, number(5..7)? as u8, number(8..10)? as u8);
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if !(1..=12).contains(&mo) || d < 1 || d > days[usize::from(mo) - 1] {
+        return None;
+    }
     let (h, mi, sec) = match s.len() {
         10 => (0, 0, 0),
         16 => (number(11..13)? as u8, number(14..16)? as u8, 0),
@@ -249,7 +267,17 @@ mod tests {
         let only_change: Zones = "2026-11-17=+05:30".parse().unwrap();
         assert_eq!(only_change.at(utc(10, 0, 0)), None);
         assert_eq!("+02:00".parse::<Zones>().unwrap().at(0), Some(7200));
-        for bad in ["", "soon", "+01:00,+02:00", "2026-13-01=+01:00", "2026-11-17T25:00=+01:00"] {
+        for bad in [
+            "",
+            "soon",
+            "+01:00,+02:00",
+            "2026-13-01=+01:00",
+            "2026-11-17T25:00=+01:00",
+            "2026x11x17=+01:00",
+            "2026-02-31=+01:00",
+            "+01:00,",
+            "2026-11-17=+01:00,2026-11-17=+02:00",
+        ] {
             assert!(bad.parse::<Zones>().is_err(), "{bad}");
         }
     }
