@@ -45,6 +45,12 @@ rawdog photo.ARW -f tiff          # 16-bit TIFF
 rawdog ./photos/ -f png -r 2048   # 16-bit PNG, resized
 ```
 
+`--aspect` crops the centre of each image to a ratio before the resize. The ratio follows each image's orientation, so `4:5` makes portraits 1080x1350 and landscapes 1350x1080 here:
+
+```sh
+rawdog ./trip --aspect 4:5 -r 1350
+```
+
 Resized images look soft; `--sharpen` adds output sharpening, with an optional amount from 0 to 3 (default 0.5):
 
 ```sh

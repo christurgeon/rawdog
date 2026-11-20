@@ -26,6 +26,9 @@ pub struct ConvertOptions {
     pub max_bytes: Option<u64>,
     /// Maximum length of the long edge in pixels.
     pub resize: Option<u32>,
+    /// Crop to this aspect ratio (long side, short side), centred, in the
+    /// orientation of each image. Applied before `resize`.
+    pub aspect: Option<(u32, u32)>,
     /// Scale during RAW decoding instead of after it. Needs `resize`.
     pub fast: bool,
     /// Exposure change in stops (EV).
@@ -71,7 +74,7 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         // full demosaic followed by a Lanczos resize, and slightly softer.
         // Two extra pixels are requested because `trim_fast_edge` removes
         // one pixel from every side. Very small sizes use the normal path.
-        if let (true, Some(max_edge)) = (fast, resize) {
+        if let (true, Some(max_edge)) = (fast, fast_decode_edge(resize, opts.aspect)) {
             if max_edge >= FAST_MIN_EDGE {
                 pipeline.globals.settings.maxwidth = max_edge as usize + 2;
                 pipeline.globals.settings.maxheight = max_edge as usize + 2;
@@ -166,7 +169,8 @@ impl Source {
         match self {
             Source::Developed(pipeline) => render_8bit(pipeline, input, opts),
             Source::Preview(img) => {
-                let mut img = maybe_resize_8bit(std::mem::take(img), opts.resize);
+                let img = crop_to_aspect(std::mem::take(img), opts.aspect);
+                let mut img = maybe_resize_8bit(img, opts.resize);
                 if let Some(amount) = opts.sharpen {
                     sharpen(&mut img, amount);
                 }
@@ -185,7 +189,7 @@ impl Source {
             Source::Developed(pipeline) => render_16bit_sharpened(pipeline, input, opts),
             Source::Preview(img) => {
                 let wide = image::DynamicImage::ImageRgb8(std::mem::take(img)).into_rgb16();
-                let mut img = maybe_resize_16bit(wide, opts.resize);
+                let mut img = maybe_resize_16bit(crop_to_aspect(wide, opts.aspect), opts.resize);
                 if let Some(amount) = opts.sharpen {
                     sharpen(&mut img, amount);
                 }
@@ -702,7 +706,9 @@ fn render_8bit(pipeline: &mut Pipeline, input: &Path, opts: &ConvertOptions) -> 
     let img: RgbImage = ImageBuffer::from_raw(width, height, decoded.data)
         .context("Failed to construct image buffer from decoded data")?;
 
-    let mut img = maybe_resize_8bit(trim_fast_edge(img, opts.resize, opts.fast), opts.resize);
+    let decode_edge = fast_decode_edge(opts.resize, opts.aspect);
+    let img = crop_to_aspect(trim_fast_edge(img, decode_edge, opts.fast), opts.aspect);
+    let mut img = maybe_resize_8bit(img, opts.resize);
     if let Some(amount) = opts.sharpen {
         sharpen(&mut img, amount);
     }
@@ -714,7 +720,7 @@ fn render_16bit_sharpened(
     input: &Path,
     opts: &ConvertOptions,
 ) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
-    let mut img = render_16bit(pipeline, input, opts.resize, opts.fast)?;
+    let mut img = render_16bit(pipeline, input, opts.resize, opts.fast, opts.aspect)?;
     if let Some(amount) = opts.sharpen {
         sharpen(&mut img, amount);
     }
@@ -869,6 +875,7 @@ fn render_16bit(
     input: &Path,
     resize: Option<u32>,
     fast: bool,
+    aspect: Option<(u32, u32)>,
 ) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
     // imagepipe's full pipeline (always used for RAW files) returns linear
     // 16-bit data, while its raster fast path returns the source file's
@@ -889,7 +896,8 @@ fn render_16bit(
             .context("Failed to construct 16-bit image buffer from decoded data")?;
 
     // Resize in linear light, then encode.
-    let mut img = maybe_resize_16bit(trim_fast_edge(img, resize, fast), resize);
+    let trimmed = trim_fast_edge(img, fast_decode_edge(resize, aspect), fast);
+    let mut img = maybe_resize_16bit(crop_to_aspect(trimmed, aspect), resize);
     if is_linear {
         let lut = srgb_encode_lut();
         for v in img.iter_mut() {
@@ -1034,6 +1042,47 @@ where
     }
 }
 
+/// The long edge that `fast` asks the decoder for. A crop to another aspect
+/// ratio removes up to half of the long edge of a 2:1 image, so the decoder
+/// gives twice the size and the crop still fills `resize`.
+fn fast_decode_edge(resize: Option<u32>, aspect: Option<(u32, u32)>) -> Option<u32> {
+    resize.map(|edge| if aspect.is_some() { edge.saturating_mul(2) } else { edge })
+}
+
+/// Crop the centre of `img` to `aspect` (long side, short side), in the
+/// image's own orientation: 4:5 makes a portrait 4:5 and a landscape 5:4.
+fn crop_to_aspect<P>(
+    img: ImageBuffer<P, Vec<P::Subpixel>>,
+    aspect: Option<(u32, u32)>,
+) -> ImageBuffer<P, Vec<P::Subpixel>>
+where
+    P: image::Pixel + 'static,
+{
+    let Some((long_ratio, short_ratio)) = aspect else {
+        return img;
+    };
+    let (width, height) = img.dimensions();
+    let (long, short) = (width.max(height) as u64, width.min(height) as u64);
+    let (long_ratio, short_ratio) = (long_ratio as u64, short_ratio as u64);
+    // Keep the short side and shorten the long side, or the other way round.
+    let (new_long, new_short) = if long * short_ratio > short * long_ratio {
+        ((short * long_ratio + short_ratio / 2) / short_ratio, short)
+    } else {
+        (long, (long * short_ratio + long_ratio / 2) / long_ratio)
+    };
+    let (new_long, new_short) = (new_long.max(1) as u32, new_short.max(1) as u32);
+    let (new_w, new_h) = if width >= height {
+        (new_long, new_short)
+    } else {
+        (new_short, new_long)
+    };
+    if (new_w, new_h) == (width, height) {
+        return img;
+    }
+    let (x, y) = ((width - new_w) / 2, (height - new_h) / 2);
+    image::imageops::crop_imm(&img, x, y, new_w, new_h).to_image()
+}
+
 fn maybe_resize_8bit(
     img: ImageBuffer<Rgb<u8>, Vec<u8>>,
     resize: Option<u32>,
@@ -1108,6 +1157,26 @@ mod tests {
         apply_watermark(&mut img, &mark);
         let v = img.get_pixel(500 - 15 - 50, 500 - 15 - 50)[0];
         assert!((32_000..=33_500).contains(&v), "{v}");
+    }
+
+    #[test]
+    fn crop_to_aspect_follows_the_orientation() {
+        let landscape = RgbImage::new(6000, 4000);
+        assert_eq!(crop_to_aspect(landscape.clone(), Some((5, 4))).dimensions(), (5000, 4000));
+        assert_eq!(crop_to_aspect(landscape.clone(), Some((16, 9))).dimensions(), (6000, 3375));
+        assert_eq!(crop_to_aspect(landscape.clone(), Some((1, 1))).dimensions(), (4000, 4000));
+        assert_eq!(crop_to_aspect(landscape.clone(), Some((3, 2))).dimensions(), (6000, 4000));
+        assert_eq!(crop_to_aspect(landscape, None).dimensions(), (6000, 4000));
+        let portrait = RgbImage::new(4000, 6000);
+        assert_eq!(crop_to_aspect(portrait, Some((5, 4))).dimensions(), (4000, 5000));
+    }
+
+    #[test]
+    fn crop_to_aspect_keeps_the_centre() {
+        let img = RgbImage::from_fn(30, 10, |x, _| image::Rgb([x as u8, 0, 0]));
+        let out = crop_to_aspect(img, Some((1, 1)));
+        assert_eq!(out.dimensions(), (10, 10));
+        assert_eq!(out.get_pixel(0, 0)[0], 10);
     }
 
     // -----------------------------------------------------------------------
@@ -1311,7 +1380,7 @@ mod tests {
 
         let mut p16 = Pipeline::new_from_file(&png).unwrap();
         p16.globals.settings.use_fastpath = false;
-        let out16 = render_16bit(&mut p16, &png, None, false).unwrap();
+        let out16 = render_16bit(&mut p16, &png, None, false, None).unwrap();
 
         let (m8, m16) = (mean_u8(&out8.data), mean_u16_as_u8(out16.as_raw()));
         assert!(
@@ -1328,7 +1397,7 @@ mod tests {
         let png = write_gradient_png(tmp.path());
 
         let mut p16 = Pipeline::new_from_file(&png).unwrap();
-        let out16 = render_16bit(&mut p16, &png, None, false).unwrap();
+        let out16 = render_16bit(&mut p16, &png, None, false, None).unwrap();
         let expected = image::open(&png).unwrap().to_rgb16();
         assert_eq!(out16.as_raw(), expected.as_raw());
     }
@@ -1541,6 +1610,7 @@ mod tests {
             quality: 92,
             max_bytes: None,
             resize,
+            aspect: None,
             fast: false,
             exposure: None,
             white_balance: None,
@@ -1670,6 +1740,7 @@ mod tests {
                 quality: 92,
                 max_bytes: None,
                 resize: None,
+                aspect: None,
                 fast: false,
                 exposure: None,
                 white_balance: None,
@@ -1697,6 +1768,7 @@ mod tests {
                 quality: 92,
                 max_bytes: None,
                 resize: None,
+                aspect: None,
                 fast: false,
                 exposure: None,
                 white_balance: None,
