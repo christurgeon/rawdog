@@ -187,7 +187,7 @@ rawdog -R /Volumes/CARD -f original -o ~/Archive --name "{year}/{date}/{stem}"
 
 Each copy is compared byte for byte with the original and keeps its modification time; the card is never changed. XMP sidecars (`NAME.xmp` from Lightroom or Capture One, `NAME.ARW.xmp` from darktable) are copied with their RAW file, and a sidecar that already exists in the archive is kept. With `--with-jpeg`, the JPEG or HEIF that a camera set to RAW+JPEG wrote next to each RAW file (`DSC1.JPG` or `DSC1.HIF` for `DSC1.ARW`) is copied and checked in the same way. It replaces a file of the same name at the destination, so it always matches its RAW file; for a RAW file already in the archive, a missing JPEG is added. Image options such as `-r` cannot be used with `-f original`.
 
-For an archive that must stay provably unchanged, `--manifest` writes a `SHA256SUMS` file into each destination folder with the checksum of every copy, computed while the copy is checked. Later runs add their files to it. Check a folder at any time with the system's own tool:
+For an archive that must stay provably unchanged, `--manifest` writes a `SHA256SUMS` file into each destination folder with the checksum of every copy, computed while the copy is checked. Later runs add their files to it, including files already in the archive from a run without `--manifest`: those are compared with the originals first, so a damaged copy is reported. An interrupted run keeps the checksums of the copies it finished. Check a folder at any time with the system's own tool:
 
 ```sh
 rawdog -R /Volumes/CARD -f original --manifest -o ~/Archive --name "{year}/{date}/{stem}"

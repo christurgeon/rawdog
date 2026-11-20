@@ -957,6 +957,8 @@ fn main() -> Result<()> {
     // usual exit status after SIGINT.
     let _ = ctrlc::set_handler(|| {
         converter::remove_active_temp_files();
+        // Keep the checksums of the copies that are complete.
+        let _ = converter::manifest::write();
         std::process::exit(130);
     });
 
@@ -974,16 +976,24 @@ fn main() -> Result<()> {
 
         if should_skip(input_path, output_path, cli.overwrite, cli.update) {
             // A RAW file archived earlier may lack its camera JPEG, because
-            // --with-jpeg was not given then or the copy failed.
-            if opts.with_jpeg {
-                if let Err(e) = converter::copy_companions(input_path, output_path, false) {
-                    eprintln!("Error converting {}: {:#}", input_path.display(), e);
-                    record(input_path, output_path, report::Status::Failed, format!("{e:#}"), 0.0);
-                    failures.lock().unwrap().push(input_path.clone());
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    pb.inc(1);
-                    return;
+            // --with-jpeg was not given then or the copy failed, and may lack
+            // a manifest line.
+            let archived = || -> Result<()> {
+                if matches!(opts.format, OutputFormat::Original) {
+                    converter::add_existing_to_manifest(input_path, output_path)?;
                 }
+                if opts.with_jpeg {
+                    converter::copy_companions(input_path, output_path, false)?;
+                }
+                Ok(())
+            };
+            if let Err(e) = archived() {
+                eprintln!("Error converting {}: {:#}", input_path.display(), e);
+                record(input_path, output_path, report::Status::Failed, format!("{e:#}"), 0.0);
+                failures.lock().unwrap().push(input_path.clone());
+                failed.fetch_add(1, Ordering::Relaxed);
+                pb.inc(1);
+                return;
             }
             record(
                 input_path,

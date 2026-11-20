@@ -590,6 +590,24 @@ fn copy_original(input: &Path, output: &Path, with_jpeg: bool) -> Result<()> {
     Ok(())
 }
 
+/// For `--manifest`: an archived copy that an earlier run made, and that is
+/// not yet in its folder's manifest, is compared with the original and
+/// added. A copy that differs is an error.
+pub fn add_existing_to_manifest(input: &Path, output: &Path) -> Result<()> {
+    if !manifest::enabled() || manifest::listed(output) {
+        return Ok(());
+    }
+    let (same, hash) = compare_copy(input, output, true)?;
+    if !same {
+        bail!(
+            "the archived copy {} differs from the original; replace it with --overwrite",
+            output.display()
+        );
+    }
+    manifest::record(output, hash);
+    Ok(())
+}
+
 /// Copy the JPEG or HEIF files that a camera set to RAW+JPEG wrote next to
 /// `input` with the same name, such as `DSC1.JPG` for `DSC1.ARW`. Each copy
 /// keeps its modification time and is compared with the original. With
@@ -736,6 +754,26 @@ pub mod manifest {
         ENABLED.load(Ordering::Relaxed)
     }
 
+    /// True if `path` has a line in its folder's `SHA256SUMS`.
+    pub fn listed(path: &Path) -> bool {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return false;
+        };
+        let name = name.to_string_lossy();
+        parse(&std::fs::read_to_string(dir.join(FILE_NAME)).unwrap_or_default())
+            .any(|(listed, _)| listed == name)
+    }
+
+    /// (name, hash) of each line, in text (`hash  name`) or binary
+    /// (`hash *name`) form.
+    fn parse(text: &str) -> impl Iterator<Item = (&str, &str)> {
+        text.lines().filter_map(|line| {
+            let (hash, rest) = line.split_once(' ')?;
+            let name = rest.strip_prefix(' ').or_else(|| rest.strip_prefix('*'))?;
+            Some((name, hash))
+        })
+    }
+
     pub(super) fn record(path: &Path, hash: Option<String>) {
         if let Some(hash) = hash {
             ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).push((path.to_path_buf(), hash));
@@ -755,11 +793,9 @@ pub mod manifest {
         }
         for (dir, new) in &by_dir {
             let file = dir.join(FILE_NAME);
-            let mut lines: BTreeMap<String, String> = std::fs::read_to_string(&file)
-                .unwrap_or_default()
-                .lines()
-                .filter_map(|line| line.split_once("  "))
-                .map(|(hash, name)| (name.to_string(), hash.to_string()))
+            let existing = std::fs::read_to_string(&file).unwrap_or_default();
+            let mut lines: BTreeMap<String, String> = parse(&existing)
+                .map(|(name, hash)| (name.to_string(), hash.to_string()))
                 .collect();
             for (name, hash) in new {
                 lines.insert(name.clone(), hash.clone());
@@ -778,7 +814,9 @@ pub mod manifest {
         fn write_merges_into_the_existing_manifest() {
             let tmp = tempfile::TempDir::new().unwrap();
             let file = tmp.path().join(super::FILE_NAME);
-            std::fs::write(&file, "aaaa  A.ARW\nbbbb  B.ARW\n").unwrap();
+            std::fs::write(&file, "aaaa *A.ARW\nbbbb  B.ARW\n").unwrap();
+            assert!(super::listed(&tmp.path().join("A.ARW")));
+            assert!(!super::listed(&tmp.path().join("C.JPG")));
             super::record(&tmp.path().join("B.ARW"), Some("cccc".to_string()));
             super::record(&tmp.path().join("C.JPG"), Some("dddd".to_string()));
             super::record(&tmp.path().join("D.ARW"), None);
