@@ -298,6 +298,7 @@ fn write_gallery(
     dir: &Path,
     records: &[report::Record],
     infos: &HashMap<PathBuf, naming::NameInfo>,
+    refresh: Option<u64>,
     quiet: bool,
 ) -> Result<()> {
     let mut shown: Vec<&report::Record> = records
@@ -346,7 +347,11 @@ fn write_gallery(
     std::fs::create_dir_all(dir)
         .with_context(|| format!("Failed to create output directory {}", dir.display()))?;
     let page = dir.join("gallery.html");
-    std::fs::write(&page, gallery::render(&title, dir, &entries))
+    // Written through a temporary file, so that a browser showing the page
+    // during --watch never loads half of it.
+    let tmp = dir.join(".gallery.html.rawdog-tmp");
+    std::fs::write(&tmp, gallery::render(&title, dir, &entries, refresh))
+        .and_then(|()| std::fs::rename(&tmp, &page))
         .with_context(|| format!("Failed to write {}", page.display()))?;
     if !quiet {
         println!("Gallery: {}", page.display());
@@ -1350,7 +1355,9 @@ fn main() -> Result<()> {
     // With several sizes, the gallery shows the smallest, in its folder.
     let gallery_dir = size_dirs.last().and_then(|(_, dir)| dir.clone());
     if let (true, Some(dir)) = (cli.gallery, gallery_dir.as_deref()) {
-        write_gallery(dir, &records, &infos, cli.quiet)?;
+        // During --watch the page reloads itself, for a screen at an event.
+        let refresh = cli.watch.map(|interval| (interval * 2).max(10));
+        write_gallery(dir, &records, &infos, refresh, cli.quiet)?;
     }
 
     // Errors scroll away in a long run, so repeat which files failed.
