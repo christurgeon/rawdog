@@ -1124,3 +1124,26 @@ fn cli_preview_develops_a_file_without_a_preview() {
     assert!(out_dir.join("grey.jpg").exists());
     assert!(String::from_utf8_lossy(&output.stderr).contains("developing the RAW data instead"));
 }
+
+#[test]
+fn cli_manifest_lists_the_checksum_of_each_copy() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("a.png");
+    fs::write(&input, b"abc").unwrap();
+    let out_dir = tmp.path().join("archive");
+    let output = run(&[
+        input.as_ref(),
+        "-f".as_ref(),
+        "original".as_ref(),
+        "--manifest".as_ref(),
+        "-o".as_ref(),
+        out_dir.as_ref(),
+    ]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        fs::read_to_string(out_dir.join("SHA256SUMS")).unwrap(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  a.png\n"
+    );
+    let output = run(&[input.as_ref(), "--manifest".as_ref(), "-o".as_ref(), out_dir.as_ref()]);
+    assert!(!output.status.success());
+}
