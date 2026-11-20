@@ -256,33 +256,48 @@ pub fn convert_raw_sizes(
             outputs
                 .iter()
                 .map(|(output, size)| {
-                    let mut img = maybe_resize_8bit(full.clone(), *size);
-                    finish_image(&mut img, opts);
-                    let bytes = encode_jpeg(&img, input, &sized(*size))?;
-                    write_atomically(output, |out| Ok(out.write_all(&bytes)?))
+                    guarded(|| {
+                        let mut img = maybe_resize_8bit(full.clone(), *size);
+                        finish_image(&mut img, opts);
+                        let bytes = encode_jpeg(&img, input, &sized(*size))?;
+                        write_atomically(output, |out| Ok(out.write_all(&bytes)?))
+                    })
                 })
                 .collect()
         }
         OutputFormat::Tiff | OutputFormat::Png => {
-            let full = match source.rgb16(&base) {
+            // Resize each size in linear light, as a single size is.
+            let (full, linear) = match source.rgb16_unencoded(&base) {
                 Ok(img) => img,
                 Err(e) => return all_fail(e),
             };
             outputs
                 .iter()
                 .map(|(output, size)| {
-                    let mut img = maybe_resize_16bit(full.clone(), *size);
-                    finish_image(&mut img, opts);
-                    let opts = sized(*size);
-                    write_atomically(output, |out| match opts.format {
-                        OutputFormat::Tiff => write_tiff(&img, input, out, &opts),
-                        _ => write_png(&img, input, out, &opts),
+                    guarded(|| {
+                        let mut img = maybe_resize_16bit(full.clone(), *size);
+                        if linear {
+                            encode_srgb(&mut img);
+                        }
+                        finish_image(&mut img, opts);
+                        let opts = sized(*size);
+                        write_atomically(output, |out| match opts.format {
+                            OutputFormat::Tiff => write_tiff(&img, input, out, &opts),
+                            _ => write_png(&img, input, out, &opts),
+                        })
                     })
                 })
                 .collect()
         }
         OutputFormat::Original => all_fail(anyhow!("-f original copies files; it has no sizes")),
     }
+}
+
+/// Run the work for one output, turning a panic into an error of that
+/// output alone, so outputs already written are still reported.
+fn guarded(work: impl FnOnce() -> Result<()>) -> Result<()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .unwrap_or_else(|_| Err(anyhow!("encoding panicked")))
 }
 
 /// Output sharpening and the watermark, after the resize.
@@ -360,6 +375,24 @@ impl Source {
                     sharpen(&mut img, amount);
                 }
                 Ok(img)
+            }
+        }
+    }
+
+    /// The 16-bit image before the sRGB curve and sharpening, and whether
+    /// it is linear, so that smaller sizes can be made from it in linear
+    /// light.
+    fn rgb16_unencoded(
+        &mut self,
+        opts: &ConvertOptions,
+    ) -> Result<(Rgb16Image, bool)> {
+        match self {
+            Source::Developed(pipeline) => {
+                render_16bit_linear(pipeline, opts.resize, opts.fast, opts.aspect)
+            }
+            Source::Preview(img) => {
+                let wide = image::DynamicImage::ImageRgb8(std::mem::take(img)).into_rgb16();
+                Ok((maybe_resize_16bit(crop_to_aspect(wide, opts.aspect), opts.resize), false))
             }
         }
     }
@@ -1169,6 +1202,33 @@ fn render_16bit(
     fast: bool,
     aspect: Option<(u32, u32)>,
 ) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
+    // Resize in linear light, then encode.
+    let (mut img, is_linear) = render_16bit_linear(pipeline, resize, fast, aspect)?;
+    if is_linear {
+        encode_srgb(&mut img);
+    }
+    Ok(img)
+}
+
+/// A 16-bit RGB image.
+type Rgb16Image = ImageBuffer<Rgb<u16>, Vec<u16>>;
+
+/// Apply the sRGB transfer curve to linear 16-bit samples.
+fn encode_srgb(img: &mut ImageBuffer<Rgb<u16>, Vec<u16>>) {
+    let lut = srgb_encode_lut();
+    for v in img.iter_mut() {
+        *v = lut[*v as usize];
+    }
+}
+
+/// The 16-bit image, cropped and resized, before the sRGB curve, and
+/// whether its samples are linear (RAW data) or already encoded.
+fn render_16bit_linear(
+    pipeline: &mut Pipeline,
+    resize: Option<u32>,
+    fast: bool,
+    aspect: Option<(u32, u32)>,
+) -> Result<(Rgb16Image, bool)> {
     // imagepipe's full pipeline (always used for RAW files) returns linear
     // 16-bit data, while its raster fast path returns the source file's
     // already-encoded samples. Mirror the fast-path condition in output_16bit.
@@ -1187,16 +1247,8 @@ fn render_16bit(
         ImageBuffer::from_raw(width, height, decoded.data)
             .context("Failed to construct 16-bit image buffer from decoded data")?;
 
-    // Resize in linear light, then encode.
     let trimmed = trim_fast_edge(img, fast_decode_edge(resize, aspect), fast);
-    let mut img = maybe_resize_16bit(crop_to_aspect(trimmed, aspect), resize);
-    if is_linear {
-        let lut = srgb_encode_lut();
-        for v in img.iter_mut() {
-            *v = lut[*v as usize];
-        }
-    }
-    Ok(img)
+    Ok((maybe_resize_16bit(crop_to_aspect(trimmed, aspect), resize), is_linear))
 }
 
 /// A sample type that `sharpen` can process.
