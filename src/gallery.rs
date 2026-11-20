@@ -75,13 +75,14 @@ pub fn render(title: &str, page_dir: &Path, entries: &[Entry]) -> String {
         let _ = writeln!(
             cards,
             "<figure><a href=\"{url}\"><img src=\"{url}\" loading=\"lazy\" alt=\"{name}\"></a>\
-             <figcaption><b>{name}</b><span>{details}</span></figcaption></figure>",
+             <figcaption><label><input type=\"checkbox\" value=\"{name}\"> <b>{name}</b></label>\
+             <span>{details}</span></figcaption></figure>",
             name = escape(&c.name),
             details = details.join(" · "),
         );
     }
     format!(
-        r#"<!doctype html>
+        r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -98,6 +99,12 @@ pub fn render(title: &str, page_dir: &Path, entries: &[Entry]) -> String {
   img {{ display: block; width: 100%; aspect-ratio: 3 / 2; object-fit: contain; background: #000; }}
   figcaption {{ padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }}
   figcaption span {{ color: var(--muted); font-size: 12px; }}
+  figcaption label {{ display: flex; gap: 6px; align-items: center; cursor: pointer; }}
+  figcaption input {{ width: 18px; height: 18px; margin: 0; flex: none; }}
+  figure:has(input:checked) {{ outline: 3px solid #d9822b; }}
+  #picks {{ position: sticky; bottom: 0; margin: 16px -16px -16px; padding: 10px 16px; background: var(--card); border-top: 1px solid var(--muted); display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }}
+  #picks textarea {{ flex: 1 1 240px; min-height: 2.6em; max-height: 8em; font: 12px ui-monospace, monospace; background: var(--bg); color: var(--fg); }}
+  #picks button {{ font: inherit; padding: 6px 12px; }}
 </style>
 </head>
 <body>
@@ -105,9 +112,36 @@ pub fn render(title: &str, page_dir: &Path, entries: &[Entry]) -> String {
 <p class="count">{count} images</p>
 <main>
 {cards}</main>
+<div id="picks"><span id="count">0 picked</span>
+<textarea readonly aria-label="Picked file names" placeholder="Tick the images you want. Their names appear here to copy and send back."></textarea>
+<button type="button">Copy list</button></div>
+<script>
+(() => {{
+  const boxes = [...document.querySelectorAll("figcaption input")];
+  const list = document.querySelector("#picks textarea");
+  const key = "rawdog-picks:" + location.pathname;
+  const update = () => {{
+    const names = boxes.filter(b => b.checked).map(b => b.value);
+    list.value = names.join("\n");
+    document.getElementById("count").textContent = names.length + " picked";
+    try {{ localStorage.setItem(key, JSON.stringify(names)); }} catch (e) {{}}
+  }};
+  try {{
+    const saved = new Set(JSON.parse(localStorage.getItem(key) || "[]"));
+    boxes.forEach(b => {{ b.checked = saved.has(b.value); }});
+  }} catch (e) {{}}
+  boxes.forEach(b => b.addEventListener("change", update));
+  document.querySelector("#picks button").addEventListener("click", () => {{
+    list.select();
+    if (navigator.clipboard) navigator.clipboard.writeText(list.value).catch(() => document.execCommand("copy"));
+    else document.execCommand("copy");
+  }});
+  update();
+}})();
+</script>
 </body>
 </html>
-"#,
+"##,
         title = escape(title),
         count = entries.len(),
     )
@@ -139,6 +173,7 @@ mod tests {
         assert!(page.contains("<title>Shoot &lt;1&gt;</title>"));
         assert!(page.contains(r#"src="2026-11-14/a%20b%26c.jpg""#), "{page}");
         assert!(page.contains("<b>a b&amp;c.ARW</b>"));
+        assert!(page.contains(r#"<input type="checkbox" value="a b&amp;c.ARW">"#), "{page}");
         assert!(page.contains("ILCE-7M4 · ★★★"));
     }
 

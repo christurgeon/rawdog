@@ -103,7 +103,7 @@ Convert one day of a multi-day card, from one of two bodies:
 rawdog -R /Volumes/CARD --since 2026-11-14 --until 2026-11-14 --camera 7M4 -o ./day2
 ```
 
-Convert the frames a client chose from the gallery. Paste the names they sent into a file; names may be separated by lines, commas, or spaces, and may keep their extension:
+Convert the frames a client chose from the gallery. Each image in `gallery.html` has a tick box, and the page lists the names of the ticked images to copy and send back; ticks are kept when the page is opened again in the same browser. Paste the names into a file; names may be separated by lines, commas, or spaces, and may keep their extension:
 
 ```sh
 rawdog -R /Volumes/CARD --picks picks.txt -o ./finals
