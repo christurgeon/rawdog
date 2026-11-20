@@ -1271,8 +1271,10 @@ fn main() -> Result<()> {
 
     // Errors scroll away in a long run, so repeat which files failed.
     let mut failures = failures.into_inner().unwrap();
+    // With several sizes, one input can fail once per size.
+    failures.sort();
+    failures.dedup();
     if failures.len() > 1 {
-        failures.sort();
         eprintln!("Failed files:");
         for path in failures {
             eprintln!("  {}", path.display());
