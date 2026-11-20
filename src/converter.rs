@@ -1140,13 +1140,17 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// With `--keep-rating`, the XMP packet with the file's rating and label.
+/// The XMP packet for `--keep-rating` (the file's rating and label) and
+/// `--keywords`, or `None` without them.
 fn rating_packet(input: &Path, opts: &ConvertOptions) -> Option<String> {
-    if !opts.metadata.keep_rating {
-        return None;
-    }
-    let info = crate::naming::NameInfo::read(input, true);
-    exif_utils::rating_xmp(info.rating, info.labels.first().map(String::as_str))
+    let meta = &opts.metadata;
+    let (rating, label) = if meta.keep_rating {
+        let info = crate::naming::NameInfo::read(input, true);
+        (info.rating, info.labels.into_iter().next())
+    } else {
+        (None, None)
+    };
+    exif_utils::rating_xmp(rating, label.as_deref(), &meta.keywords)
 }
 
 fn write_tiff(

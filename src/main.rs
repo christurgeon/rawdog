@@ -206,6 +206,11 @@ struct Cli {
     #[arg(long)]
     keep_rating: bool,
 
+    /// Keywords for stock sites and catalogs, separated by commas, such as
+    /// "wedding,Smith,2026". Written into every output as XMP dc:subject
+    #[arg(long, value_name = "WORDS", value_delimiter = ',', action = clap::ArgAction::Set)]
+    keywords: Vec<String>,
+
     /// Print resolution in pixels per inch, such as 300, for print labs and
     /// layout software. Without it, the camera's value is copied
     #[arg(long, value_name = "DPI", value_parser = clap::value_parser!(u16).range(1..=10000))]
@@ -803,6 +808,7 @@ fn main() -> Result<()> {
             ("--copyright", cli.copyright.is_some()),
             ("--dpi", cli.dpi.is_some()),
             ("--keep-rating", cli.keep_rating),
+            ("--keywords", !cli.keywords.is_empty()),
             ("--watermark", cli.watermark.is_some()),
         ];
         let used: Vec<&str> = image_options
@@ -1117,6 +1123,12 @@ fn main() -> Result<()> {
             time_shift: cli.time_shift.clone(),
             dpi: cli.dpi,
             keep_rating: cli.keep_rating,
+            keywords: cli
+                .keywords
+                .iter()
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect(),
         },
     };
 
