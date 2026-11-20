@@ -20,6 +20,7 @@ img-parts = "0.4.0"
 rawler = "0.8"
 ctrlc = "3"
 sha2 = "0.10"
+libc = "0.2"
 moxcms = { version = "=0.7.11", default-features = false }
 
 [dev-dependencies]

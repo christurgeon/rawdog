@@ -1128,7 +1128,7 @@ fn fit_jpeg(
 }
 
 /// A file size in the decimal units that `--max-size` accepts.
-fn format_size(bytes: u64) -> String {
+pub fn format_size(bytes: u64) -> String {
     match bytes {
         0..1_000 => format!("{bytes} bytes"),
         1_000..1_000_000 => format!("{:.0} KB", bytes as f64 / 1e3),

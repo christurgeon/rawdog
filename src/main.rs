@@ -347,6 +347,29 @@ fn write_gallery(
     Ok(())
 }
 
+/// Bytes available to new files on the volume of `dir`, or of its nearest
+/// existing parent.
+#[cfg(unix)]
+fn free_space(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let existing = dir.ancestors().find(|p| p.exists())?;
+    let path = if existing.as_os_str().is_empty() { Path::new(".") } else { existing };
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs fills the zeroed struct and reads only the
+    // NUL-terminated path.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast)] // the field types differ between systems
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn free_space(_dir: &Path) -> Option<u64> {
+    None
+}
+
 /// Set for the runs that `--watch` starts.
 const WATCH_ROUND: &str = "RAWDOG_WATCH_ROUND";
 
@@ -975,6 +998,25 @@ fn main() -> Result<()> {
     }
     let infos: HashMap<PathBuf, naming::NameInfo> =
         files.iter().map(|f| f.path.clone()).zip(infos).collect();
+
+    // A card import that fills the disk fails partway; say so before it
+    // starts. Only a warning: the free space that statvfs reports can leave
+    // out space that macOS frees on demand.
+    if let (OutputFormat::Original, Some(dir), false) = (cli.format, cli.output.as_deref(), cli.dry_run) {
+        let needed: u64 = jobs
+            .iter()
+            .filter(|(_, output)| cli.overwrite || !output.exists())
+            .filter_map(|(input, _)| std::fs::metadata(input).ok().map(|m| m.len()))
+            .sum();
+        if let Some(free) = free_space(dir).filter(|free| needed > *free) {
+            eprintln!(
+                "Warning: the copies need {}, but {} has only {} free; the import will stop when the disk is full.",
+                converter::format_size(needed),
+                dir.display(),
+                converter::format_size(free)
+            );
+        }
+    }
 
     // {seq} numbers the files of each run anew, so an existing output may
     // hold another input's image; skipping it would lose a file.
@@ -1905,6 +1947,14 @@ mod tests {
     // -----------------------------------------------------------------------
     // defaults file tests
     // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn free_space_reads_the_volume_of_a_missing_directory() {
+        let tmp = TempDir::new().unwrap();
+        let free = free_space(&tmp.path().join("not/yet/made")).unwrap();
+        assert!(free > 0);
+    }
 
     #[test]
     fn expand_home_replaces_only_a_leading_tilde() {
