@@ -77,7 +77,7 @@ rawdog ./reception --exposure 0.67 --wb 3400
 
 ### Culling and proofs
 
-`--preview` writes the JPEG preview that the camera embedded in each RAW file, with the camera's own colours. It is the fastest way to look through a card. The size depends on the camera: 1616x1080 for Sony bodies, full resolution for many Canon and Nikon bodies.
+`--preview` writes the JPEG preview that the camera embedded in each RAW file, with the camera's own colours. It is the fastest way to look through a card. A file without a preview that rawdog can read (phones, Olympus, some DNG files) is developed instead, with a note. A preview is never enlarged, so `-r` larger than the preview has no effect. The size depends on the camera: 1616x1080 for Sony bodies, full resolution for many Canon and Nikon bodies.
 
 ```sh
 rawdog -R /Volumes/CARD --preview -o ./proofs
