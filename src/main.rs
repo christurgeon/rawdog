@@ -1,6 +1,7 @@
 mod converter;
 mod exif;
 mod gallery;
+mod gpx;
 mod naming;
 mod report;
 mod timeshift;
@@ -215,6 +216,16 @@ struct Cli {
     /// layout software. Without it, the camera's value is copied
     #[arg(long, value_name = "DPI", value_parser = clap::value_parser!(u16).range(1..=10000))]
     dpi: Option<u16>,
+
+    /// Add GPS positions from this GPX track to files without their own,
+    /// for cameras without GPS. Matched by capture time
+    #[arg(long, value_name = "FILE", conflicts_with = "strip_gps")]
+    gpx: Option<PathBuf>,
+
+    /// The camera clock's UTC offset for --gpx, such as +02:00, for files
+    /// that do not record it
+    #[arg(long, value_name = "OFFSET", requires = "gpx", allow_hyphen_values = true)]
+    gpx_tz: Option<gpx::UtcOffset>,
 
     /// Do not copy GPS location to the output
     #[arg(long)]
@@ -809,6 +820,7 @@ fn main() -> Result<()> {
             ("--dpi", cli.dpi.is_some()),
             ("--keep-rating", cli.keep_rating),
             ("--keywords", !cli.keywords.is_empty()),
+            ("--gpx", cli.gpx.is_some()),
             ("--watermark", cli.watermark.is_some()),
         ];
         let used: Vec<&str> = image_options
@@ -849,6 +861,16 @@ fn main() -> Result<()> {
         None => None,
     };
 
+    let gpx_track = match &cli.gpx {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read GPX file {}", path.display()))?;
+            let track = gpx::Track::parse(&text)
+                .map_err(|e| anyhow!("Cannot use GPX file {}: {e}", path.display()))?;
+            Some(std::sync::Arc::new(track))
+        }
+        None => None,
+    };
     let wb_from = match &cli.wb_from {
         Some(path) => Some(std::sync::Arc::new(converter::white_balance_reference(path)?)),
         None => None,
@@ -1123,6 +1145,8 @@ fn main() -> Result<()> {
             time_shift: cli.time_shift.clone(),
             dpi: cli.dpi,
             keep_rating: cli.keep_rating,
+            gpx: gpx_track,
+            gpx_tz: cli.gpx_tz.map(|o| o.0),
             keywords: cli
                 .keywords
                 .iter()

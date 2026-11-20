@@ -21,6 +21,10 @@ pub struct MetadataOptions {
     pub keep_rating: bool,
     /// Keywords written into the output as XMP `dc:subject`.
     pub keywords: Vec<String>,
+    /// A GPS track for files without a position, and the camera clock's UTC
+    /// offset in seconds when the files do not record it.
+    pub gpx: Option<std::sync::Arc<crate::gpx::Track>>,
+    pub gpx_tz: Option<i64>,
     /// Print resolution in pixels per inch. Replaces the source value.
     pub dpi: Option<u16>,
     /// Correction of the camera clock, applied to the capture dates.
@@ -436,6 +440,23 @@ fn fields_for_output<'a>(
             value: exif::Value::Rational(vec![exif::Rational { num: dpi.into(), denom: 1 }]),
         })
     };
+    let position = gpx_position(fields.clone(), meta, shift_seconds);
+    let gps_fields = position.into_iter().flat_map(|(lat, lon)| {
+        let gps = |tag, value| exif::Field { tag, ifd_num: exif::In::PRIMARY, value };
+        let dms = |v: f64| {
+            exif::Value::Rational(
+                crate::gpx::to_dms(v).iter().map(|&(num, denom)| exif::Rational { num, denom }).collect(),
+            )
+        };
+        let reference = |r: &str| exif::Value::Ascii(vec![r.as_bytes().to_vec()]);
+        [
+            gps(Tag::GPSVersionID, exif::Value::Byte(vec![2, 3, 0, 0])),
+            gps(Tag::GPSLatitudeRef, reference(if lat < 0.0 { "S" } else { "N" })),
+            gps(Tag::GPSLatitude, dms(lat)),
+            gps(Tag::GPSLongitudeRef, reference(if lon < 0.0 { "W" } else { "E" })),
+            gps(Tag::GPSLongitude, dms(lon)),
+        ]
+    });
     let added = [
         meta.artist.as_ref().map(|t| text_field(Tag::Artist, t)),
         copyright.as_ref().map(|t| text_field(Tag::Copyright, t)),
@@ -476,7 +497,46 @@ fn fields_for_output<'a>(
             field
         })
         .chain(added.into_iter().flatten())
+        .chain(gps_fields)
         .collect()
+}
+
+/// The position for `--gpx`: from the track at the capture time, for a
+/// file without GPS data of its own and unless GPS is stripped.
+fn gpx_position<'a>(
+    fields: impl Iterator<Item = &'a exif::Field> + Clone,
+    meta: &MetadataOptions,
+    shift_seconds: i64,
+) -> Option<(f64, f64)> {
+    use exif::Tag;
+    let track = meta.gpx.as_ref().filter(|_| !meta.strip_gps)?;
+    if fields.clone().any(|f| f.tag == Tag::GPSLatitude) {
+        return None;
+    }
+    let ascii = |tag| {
+        fields.clone().find(|f| f.tag == tag && f.ifd_num == exif::In::PRIMARY).and_then(|f| {
+            match &f.value {
+                exif::Value::Ascii(v) => v.first().map(|b| String::from_utf8_lossy(b).trim().to_string()),
+                _ => None,
+            }
+        })
+    };
+    let d = exif::DateTime::from_ascii(ascii(Tag::DateTimeOriginal)?.as_bytes()).ok()?;
+    let local = crate::timeshift::to_seconds((d.year, d.month, d.day, d.hour, d.minute, d.second));
+    let offset = meta.gpx_tz.or_else(|| {
+        ascii(Tag::OffsetTimeOriginal).and_then(|o| crate::gpx::parse_offset(&o))
+    });
+    let Some(offset) = offset else {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "Warning: some files do not record their time zone; give the camera clock's \
+                 offset with --gpx-tz, such as --gpx-tz +02:00, to geotag them"
+            );
+        }
+        return None;
+    };
+    track.position(local + shift_seconds - offset)
 }
 
 /// An EXIF date value ("YYYY:MM:DD HH:MM:SS") moved by `seconds`.
@@ -1038,6 +1098,35 @@ mod tests {
         assert_eq!(tags(&out), vec![Tag::XResolution, Tag::YResolution, Tag::ResolutionUnit]);
         assert!(matches!(&out[0].value, Value::Rational(v) if v[0].num == 300 && v[0].denom == 1));
         assert_eq!(out[2].value.get_uint(0), Some(2));
+    }
+
+    #[test]
+    fn gpx_adds_a_position_only_to_files_without_one() {
+        use exif::{In, Tag, Value};
+        let track = crate::gpx::Track::parse(
+            r#"<trkpt lat="-33.5" lon="151.25"><time>2026-11-14T08:00:00Z</time></trkpt>"#,
+        )
+        .unwrap();
+        let date = field(Tag::DateTimeOriginal, In::PRIMARY, Value::Ascii(vec![b"2026:11:14 10:00:00".to_vec()]));
+        let meta = MetadataOptions {
+            gpx: Some(std::sync::Arc::new(track)),
+            gpx_tz: Some(7200),
+            ..Default::default()
+        };
+        let out = fields_for_output([date.clone()].iter(), (300, 200), &meta);
+        let get = |tag| out.iter().find(|f| f.tag == tag).map(|f| f.display_value().to_string());
+        assert_eq!(get(Tag::GPSLatitudeRef).as_deref(), Some("S"));
+        assert_eq!(get(Tag::GPSLongitudeRef).as_deref(), Some("E"));
+        assert!(get(Tag::GPSLatitude).is_some());
+
+        // A file with its own position keeps it; --strip-gps adds nothing.
+        let own = field(Tag::GPSLatitude, In::PRIMARY, Value::Rational(vec![exif::Rational { num: 1, denom: 1 }]));
+        let out = fields_for_output([date.clone(), own].iter(), (300, 200), &meta);
+        assert_eq!(out.iter().filter(|f| f.tag == Tag::GPSLatitude).count(), 1);
+        assert!(out.iter().all(|f| f.tag != Tag::GPSLongitude));
+        let stripped = MetadataOptions { strip_gps: true, ..meta };
+        let out = fields_for_output([date].iter(), (300, 200), &stripped);
+        assert!(out.iter().all(|f| f.tag.context() != exif::Context::Gps));
     }
 
     #[test]

@@ -222,6 +222,12 @@ rawdog ./trip -r 2048 --strip-gps --artist "J. Doe" --copyright "(c) {year} J. D
 
 `{year}` in `--copyright` becomes the year the photo was taken (after `--time-shift`), so a defaults file stays right in a new year and for old shoots. A file without a capture date gets the current year.
 
+For a camera without GPS, `--gpx` adds positions from a track recorded by a phone or GPS logger. Each file gets the position at its capture time, interpolated between track points up to 5 minutes apart, or the nearest point within 1 minute; a file outside the track gets none, and a file with its own position keeps it. GPX times are UTC, so rawdog needs the camera clock's time zone: most cameras record it, and `--gpx-tz` gives it for those that do not. Correct a wrong camera clock with `--time-shift` first.
+
+```sh
+rawdog ./trip -r 2048 --gpx ./trip.gpx --gpx-tz +02:00
+```
+
 For print, `--dpi 300` sets the print resolution that labs and layout software read; without it the camera's value (often 72 or 350) is copied.
 
 `--keep-rating` writes each file's star rating and colour label into the output as XMP, so the culling decisions come along when the images are imported into Lightroom or another catalog. It is off by default, so a client does not see ratings.
