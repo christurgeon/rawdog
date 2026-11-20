@@ -83,7 +83,7 @@ rawdog -R /Volumes/CARD --preview -o ./proofs
 rawdog ./card -r 2048 --fast -o ./proofs
 ```
 
-`--gallery` writes `gallery.html` into the output directory: a page of the output images with file name, capture time, camera, and rating. It works offline and on a phone:
+`--gallery` writes `gallery.html` into the output directory: a page of the output images with file name, capture time, camera, and rating. It works offline and on a phone. Large images are shown as small copies in `gallery-thumbs/`, and each links to the full image, so the page stays fast with full-size output:
 
 ```sh
 rawdog ./wedding -r 1600 --fast -o ./proofs --gallery
