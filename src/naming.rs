@@ -392,7 +392,12 @@ impl NameTemplate {
                         Token::Model => info.model.clone().unwrap_or_else(unknown),
                         Token::Lens => info.lens.clone().unwrap_or_else(unknown),
                         Token::Serial => info.serial.clone().unwrap_or_else(unknown),
-                        Token::Rating => info.rating.unwrap_or(0).to_string(),
+                        // A name that starts with "-1" reads as an option
+                        // in shell commands.
+                        Token::Rating => match info.rating.unwrap_or(0) {
+                            r if r < 0 => "rejected".to_string(),
+                            r => r.to_string(),
+                        },
                         Token::Seq => seq.to_string(),
                     };
                     // A value must not add path components, and must not
@@ -459,6 +464,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(expand("{rating}/{stem}", &unrated), PathBuf::from("0/a"));
+        let rejected = NameInfo { stem: "a".to_string(), rating: Some(-1), ..Default::default() };
+        assert_eq!(expand("{rating}_{stem}", &rejected), PathBuf::from("rejected_a"));
     }
 
     #[test]
