@@ -103,6 +103,12 @@ Convert only your picks. Ratings come from sidecar XMP files written by Lightroo
 rawdog -R /Volumes/CARD --min-rating 3 -o ./picks
 ```
 
+Or convert by colour label, from the same sidecar files. Lightroom and Capture One store the label name (`Red`, or the text set in Lightroom's label set); darktable's five colours are read as red, yellow, green, blue, and purple. A file with any of the listed labels is converted:
+
+```sh
+rawdog -R /Volumes/CARD --label red,green -o ./selects
+```
+
 Convert one day of a multi-day card, from one of two bodies:
 
 ```sh
