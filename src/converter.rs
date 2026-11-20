@@ -764,6 +764,7 @@ fn copy_original(input: &Path, output: &Path, with_jpeg: bool) -> Result<()> {
             return Err(anyhow!("the copy differs from the original; the disk may be failing"));
         }
         std::fs::rename(&tmp, output).with_context(unwritable)?;
+        sync_parent(output);
         manifest::record(output, hash);
         Ok(())
     })();
@@ -843,16 +844,21 @@ fn copy_verified(source: &Path, destination: &Path, keep_time: bool) -> Result<(
     let _guard = TempFileGuard::register(&tmp);
     let result = (|| -> Result<()> {
         std::fs::copy(source, &tmp)?;
+        let copy = std::fs::File::options().write(true).open(&tmp)?;
         if keep_time {
             if let Ok(modified) = std::fs::metadata(source).and_then(|m| m.modified()) {
-                std::fs::File::options().write(true).open(&tmp)?.set_modified(modified)?;
+                copy.set_modified(modified)?;
             }
         }
+        // On disk before it is called verified: the card may be formatted next.
+        copy.sync_all()?;
+        drop(copy);
         let (same, hash) = compare_copy(source, &tmp, manifest::enabled())?;
         if !same {
             return Err(anyhow!("the copy differs from the original"));
         }
         std::fs::rename(&tmp, destination)?;
+        sync_parent(destination);
         manifest::record(destination, hash);
         Ok(())
     })();
@@ -860,6 +866,19 @@ fn copy_verified(source: &Path, destination: &Path, keep_time: bool) -> Result<(
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// Flush the directory entry of a renamed copy, so that the new name is on
+/// disk too, not only the data. Best effort: some file systems refuse it.
+fn sync_parent(path: &Path) {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Ok(dir) = std::fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Copy the XMP sidecars of `input` next to `output`, in the same naming
