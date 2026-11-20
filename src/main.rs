@@ -186,6 +186,11 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["fast", "exposure", "wb"])]
     preview: bool,
 
+    /// With -f original, also copy the JPEG or HEIF that the camera wrote
+    /// next to each RAW file with the same name (RAW+JPEG)
+    #[arg(long)]
+    with_jpeg: bool,
+
     /// Blend this logo (a PNG, which may be transparent) into the
     /// bottom-right corner of every image. Its long side is a fifth of the
     /// image's short edge
@@ -570,6 +575,10 @@ fn main() -> Result<()> {
         bail!("--max-size needs JPEG output; TIFF and PNG files are lossless.");
     }
 
+    if cli.with_jpeg && !matches!(cli.format, OutputFormat::Original) {
+        bail!("--with-jpeg copies the camera's JPEG files, so it needs -f original.");
+    }
+
     if matches!(cli.format, OutputFormat::Original) {
         let image_options = [
             ("--max-size", cli.max_size.is_some()),
@@ -790,6 +799,7 @@ fn main() -> Result<()> {
         white_balance: cli.wb.map(|kelvin| (kelvin, cli.tint)),
         sharpen: cli.sharpen,
         preview: cli.preview,
+        with_jpeg: cli.with_jpeg,
         watermark,
         metadata: exif::MetadataOptions {
             strip_all: cli.strip_metadata,
