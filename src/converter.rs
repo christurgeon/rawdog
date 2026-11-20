@@ -1057,6 +1057,7 @@ fn encode_jpeg(img: &RgbImage, input: &Path, opts: &ConvertOptions) -> Result<Ve
     let mut exif_data = exif_utils::extract_exif(input, img.dimensions(), &opts.metadata)
         .ok()
         .flatten();
+    let xmp = rating_packet(input, opts);
     let mut encode = |quality: u8| -> Result<Vec<u8>> {
         let mut jpeg_buf = Vec::new();
         let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, quality);
@@ -1070,7 +1071,7 @@ fn encode_jpeg(img: &RgbImage, input: &Path, opts: &ConvertOptions) -> Result<Ve
             .context("Failed to encode JPEG")?;
         if let Some(exif) = &exif_data {
             match exif_utils::inject_exif_into_jpeg(&jpeg_buf, exif) {
-                Ok(with_exif) => return Ok(with_exif),
+                Ok(with_exif) => jpeg_buf = with_exif,
                 Err(e) => {
                     eprintln!(
                         "Warning: metadata of {} was not copied: {e}",
@@ -1079,6 +1080,9 @@ fn encode_jpeg(img: &RgbImage, input: &Path, opts: &ConvertOptions) -> Result<Ve
                     exif_data = None;
                 }
             }
+        }
+        if let Some(xmp) = &xmp {
+            jpeg_buf = exif_utils::inject_xmp_into_jpeg(&jpeg_buf, xmp)?;
         }
         Ok(jpeg_buf)
     };
@@ -1136,6 +1140,15 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// With `--keep-rating`, the XMP packet with the file's rating and label.
+fn rating_packet(input: &Path, opts: &ConvertOptions) -> Option<String> {
+    if !opts.metadata.keep_rating {
+        return None;
+    }
+    let info = crate::naming::NameInfo::read(input, true);
+    exif_utils::rating_xmp(info.rating, info.labels.first().map(String::as_str))
+}
+
 fn write_tiff(
     img: &ImageBuffer<Rgb<u16>, Vec<u16>>,
     input: &Path,
@@ -1143,9 +1156,21 @@ fn write_tiff(
     opts: &ConvertOptions,
 ) -> Result<()> {
     // EXIF failures are non-fatal: fall back to a TIFF without metadata.
-    let fields = exif_utils::read_fields_for_output(input, img.dimensions(), &opts.metadata)
+    let mut fields = exif_utils::read_fields_for_output(input, img.dimensions(), &opts.metadata)
         .ok()
         .flatten();
+    if let Some(xmp) = rating_packet(input, opts) {
+        // TIFF keeps XMP in tag 700.
+        let field = exif::Field {
+            tag: exif::Tag(exif::Context::Tiff, 0x2bc),
+            ifd_num: exif::In::PRIMARY,
+            value: exif::Value::Byte(xmp.into_bytes()),
+        };
+        match &mut fields {
+            Some((fields, _)) => fields.push(field),
+            None => fields = Some((vec![field], false)),
+        }
+    }
     match fields {
         Some((fields, _)) => exif_utils::write_tiff_16bit_with_exif(
             out,
@@ -1187,10 +1212,13 @@ fn write_png(
     let exif_data = exif_utils::extract_exif(input, img.dimensions(), &opts.metadata)
         .ok()
         .flatten();
-    let final_bytes = match exif_data {
+    let mut final_bytes = match exif_data {
         Some(exif) => exif_utils::inject_exif_into_png(&buf, &exif).unwrap_or(buf),
         None => buf,
     };
+    if let Some(xmp) = rating_packet(input, opts) {
+        final_bytes = exif_utils::inject_xmp_into_png(&final_bytes, &xmp)?;
+    }
 
     out.write_all(&final_bytes)?;
     Ok(())
