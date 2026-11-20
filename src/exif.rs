@@ -1,4 +1,4 @@
-use std::io::{Cursor, Seek, Write};
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -14,7 +14,23 @@ pub struct MetadataOptions {
     pub artist: Option<String>,
     /// Value for the Copyright tag. Replaces the source value.
     pub copyright: Option<String>,
+    /// The output pixels are sRGB, whatever colour space the camera was set
+    /// to. False for `--preview`, which keeps the camera's own encoding.
+    pub srgb: bool,
+    /// Print resolution in pixels per inch. Replaces the source value.
+    pub dpi: Option<u16>,
+    /// Correction of the camera clock, applied to the capture dates.
+    pub time_shift: Option<crate::timeshift::TimeShift>,
 }
+
+/// An sRGB ICC profile, generated once.
+pub fn srgb_icc_profile() -> &'static [u8] {
+    static PROFILE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    PROFILE.get_or_init(|| moxcms::ColorProfile::new_srgb().encode().unwrap_or_default())
+}
+
+/// TIFF tag that holds an ICC profile.
+const ICC_PROFILE_TAG: exif::Tag = exif::Tag(exif::Context::Tiff, 0x8773);
 
 /// Read the EXIF data of a source file.
 ///
@@ -24,45 +40,92 @@ pub struct MetadataOptions {
 /// - Panasonic RW2 and Olympus ORF, which are TIFF files with their own
 ///   magic number in the header.
 pub fn read_source_exif(path: &Path) -> Result<Option<exif::Exif>> {
-    let mut data = std::fs::read(path)
+    // The metadata of most RAW files is in their first few hundred
+    // kilobytes, and reading whole files is slow from a memory card. Read
+    // the start first; read the whole file only if the start does not hold
+    // complete metadata.
+    let mut file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open {} for EXIF extraction", path.display()))?;
-    let reader = {
-        let mut reader = exif::Reader::new();
-        reader.continue_on_error(true);
-        reader
-    };
+    let mut head = Vec::new();
+    (&mut file)
+        .take(HEAD_BYTES)
+        .read_to_end(&mut head)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let whole_file = (head.len() as u64) < HEAD_BYTES;
 
-    let result = if data.starts_with(b"FUJIFILMCCD-RAW") {
-        // Big-endian offset and length of the JPEG preview at bytes 84 and 88.
-        let u32_at = |i: usize| {
-            data.get(i..i + 4)
-                .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
-        };
-        let jpeg = u32_at(84)
-            .zip(u32_at(88))
-            .and_then(|(offset, len)| data.get(offset..offset.checked_add(len)?));
-        match jpeg {
-            Some(jpeg) => reader.read_from_container(&mut Cursor::new(jpeg)),
-            None => return Ok(None),
+    if head.starts_with(b"FUJIFILMCCD-RAW") {
+        return Ok(read_raf_exif(&mut file, &head));
+    }
+    // Canon CR3 is an ISO media file, which the EXIF reader cannot parse;
+    // its metadata comes from the RAW decoder instead.
+    if head.get(4..12) == Some(b"ftypcrx ") {
+        return Ok(None);
+    }
+    match parse_tiff_exif(head) {
+        Parsed::Complete(exif) => Ok(Some(exif)),
+        Parsed::Partial(exif) if whole_file => Ok(Some(exif)),
+        Parsed::None if whole_file => Ok(None),
+        _ => {
+            let data = std::fs::read(path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            Ok(match parse_tiff_exif(data) {
+                Parsed::Complete(exif) | Parsed::Partial(exif) => Some(exif),
+                Parsed::None => None,
+            })
         }
-    } else {
-        match data.get(..4) {
-            // RW2 ("IIU\0") and ORF ("IIRO", "IIRS").
-            Some([b'I', b'I', 0x55, 0x00] | [b'I', b'I', b'R', b'O' | b'S']) => {
-                data[2..4].copy_from_slice(&[0x2a, 0x00]);
-            }
-            // Big-endian ORF ("MMOR").
-            Some([b'M', b'M', b'O', b'R']) => data[2..4].copy_from_slice(&[0x00, 0x2a]),
-            _ => {}
-        }
-        reader.read_from_container(&mut Cursor::new(&data))
-    };
+    }
+}
 
-    match result {
-        Ok(exif) => Ok(Some(exif)),
-        // Accept partial results -- some fields are better than none.
-        Err(exif::Error::PartialResult(partial)) => Ok(Some(partial.into_inner().0)),
-        Err(_) => Ok(None),
+/// How much of a file `read_source_exif` reads first.
+const HEAD_BYTES: u64 = 1 << 20;
+
+enum Parsed {
+    Complete(exif::Exif),
+    /// Some fields could not be read; in a truncated buffer that can mean
+    /// that they are further on in the file.
+    Partial(exif::Exif),
+    None,
+}
+
+/// Parse the EXIF data of a TIFF-based RAW file.
+fn parse_tiff_exif(mut data: Vec<u8>) -> Parsed {
+    match data.get(..4) {
+        // RW2 ("IIU\0") and ORF ("IIRO", "IIRS").
+        Some([b'I', b'I', 0x55, 0x00] | [b'I', b'I', b'R', b'O' | b'S']) => {
+            data[2..4].copy_from_slice(&[0x2a, 0x00]);
+        }
+        // Big-endian ORF ("MMOR").
+        Some([b'M', b'M', b'O', b'R']) => data[2..4].copy_from_slice(&[0x00, 0x2a]),
+        _ => {}
+    }
+    let mut reader = exif::Reader::new();
+    reader.continue_on_error(true);
+    match reader.read_from_container(&mut Cursor::new(&data)) {
+        Ok(exif) => Parsed::Complete(exif),
+        Err(exif::Error::PartialResult(partial)) => Parsed::Partial(partial.into_inner().0),
+        Err(_) => Parsed::None,
+    }
+}
+
+/// Read the EXIF data of a Fujifilm RAF file, which is in its embedded JPEG
+/// preview. `head` is the start of the file.
+fn read_raf_exif(file: &mut std::fs::File, head: &[u8]) -> Option<exif::Exif> {
+    // Big-endian offset and length of the JPEG preview at bytes 84 and 88.
+    let u32_at = |i: usize| {
+        head.get(i..i + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64)
+    };
+    let (offset, len) = (u32_at(84)?, u32_at(88)?);
+    // The EXIF segment is at the start of the JPEG and at most 64 KB long.
+    let mut jpeg = Vec::new();
+    file.seek(std::io::SeekFrom::Start(offset)).ok()?;
+    file.take(len.min(1 << 17)).read_to_end(&mut jpeg).ok()?;
+    let mut reader = exif::Reader::new();
+    reader.continue_on_error(true);
+    match reader.read_from_container(&mut Cursor::new(&jpeg)) {
+        Ok(exif) => Some(exif),
+        Err(exif::Error::PartialResult(partial)) => Some(partial.into_inner().0),
+        Err(_) => None,
     }
 }
 
@@ -287,24 +350,73 @@ fn value_size(value: &exif::Value) -> usize {
 /// - `meta` can remove GPS fields or all source fields, and can set the
 ///   Artist and Copyright tags.
 fn fields_for_output<'a>(
-    fields: impl Iterator<Item = &'a exif::Field>,
+    fields: impl Iterator<Item = &'a exif::Field> + Clone,
     (width, height): (u32, u32),
     meta: &MetadataOptions,
 ) -> Vec<exif::Field> {
     use exif::{Context, Tag};
 
+    let shift_seconds = meta.time_shift.as_ref().map_or(0, |shift| {
+        let model = fields
+            .clone()
+            .find(|f| f.tag == Tag::Model && f.ifd_num == exif::In::PRIMARY)
+            .map(|f| match &f.value {
+                exif::Value::Ascii(v) => {
+                    String::from_utf8_lossy(v.first().map_or(&[][..], |v| v)).trim().to_string()
+                }
+                _ => String::new(),
+            });
+        shift.seconds_for(model.as_deref())
+    });
+
     let replaced = |tag: Tag| {
         (tag == Tag::Artist && meta.artist.is_some())
             || (tag == Tag::Copyright && meta.copyright.is_some())
+            || (matches!(tag, Tag::XResolution | Tag::YResolution | Tag::ResolutionUnit)
+                && meta.dpi.is_some())
     };
     let text_field = |tag: Tag, text: &String| exif::Field {
         tag,
         ifd_num: exif::In::PRIMARY,
         value: exif::Value::Ascii(vec![text.as_bytes().to_vec()]),
     };
+    // `{year}` in the copyright is the capture year, or the current year
+    // for a file without a capture date.
+    let copyright = meta.copyright.as_ref().map(|text| {
+        if !text.contains("{year}") {
+            return text.clone();
+        }
+        let year = [Tag::DateTimeOriginal, Tag::DateTime]
+            .iter()
+            .find_map(|tag| {
+                let field = fields.clone().find(|f| f.tag == *tag && f.ifd_num == exif::In::PRIMARY)?;
+                let exif::Value::Ascii(texts) = &field.value else {
+                    return None;
+                };
+                let d = exif::DateTime::from_ascii(texts.first()?).ok()?;
+                let taken = (d.year, d.month, d.day, d.hour, d.minute, d.second);
+                Some(crate::timeshift::add_seconds(taken, shift_seconds).0)
+            })
+            .unwrap_or_else(crate::timeshift::current_year);
+        text.replace("{year}", &year.to_string())
+    });
+    let resolution = |tag: Tag| {
+        meta.dpi.map(|dpi| exif::Field {
+            tag,
+            ifd_num: exif::In::PRIMARY,
+            value: exif::Value::Rational(vec![exif::Rational { num: dpi.into(), denom: 1 }]),
+        })
+    };
     let added = [
         meta.artist.as_ref().map(|t| text_field(Tag::Artist, t)),
-        meta.copyright.as_ref().map(|t| text_field(Tag::Copyright, t)),
+        copyright.as_ref().map(|t| text_field(Tag::Copyright, t)),
+        resolution(Tag::XResolution),
+        resolution(Tag::YResolution),
+        meta.dpi.map(|_| exif::Field {
+            tag: Tag::ResolutionUnit,
+            ifd_num: exif::In::PRIMARY,
+            value: exif::Value::Short(vec![2]), // inches
+        }),
     ];
 
     fields
@@ -313,18 +425,43 @@ fn fields_for_output<'a>(
         .filter(|f| value_size(&f.value) <= MAX_FIELD_BYTES)
         .filter(|f| !(meta.strip_gps && f.tag.context() == Context::Gps))
         .filter(|f| !replaced(f.tag))
+        // A camera set to Adobe RGB marks its files with ColorSpace 0xFFFF
+        // and interoperability index "R03". The developed output is sRGB.
+        .filter(|f| !(meta.srgb && f.tag.context() == exif::Context::Interop))
         .map(|field| {
             let mut field = field.clone();
             match field.tag {
                 exif::Tag::Orientation => field.value = exif::Value::Short(vec![1]),
                 exif::Tag::PixelXDimension => field.value = exif::Value::Long(vec![width]),
                 exif::Tag::PixelYDimension => field.value = exif::Value::Long(vec![height]),
+                exif::Tag::ColorSpace if meta.srgb => field.value = exif::Value::Short(vec![1]),
+                Tag::DateTimeOriginal | Tag::DateTimeDigitized | Tag::DateTime
+                    if shift_seconds != 0 =>
+                {
+                    if let Some(shifted) = shift_date_value(&field.value, shift_seconds) {
+                        field.value = shifted;
+                    }
+                }
                 _ => {}
             }
             field
         })
         .chain(added.into_iter().flatten())
         .collect()
+}
+
+/// An EXIF date value ("YYYY:MM:DD HH:MM:SS") moved by `seconds`.
+fn shift_date_value(value: &exif::Value, seconds: i64) -> Option<exif::Value> {
+    let exif::Value::Ascii(texts) = value else {
+        return None;
+    };
+    let d = exif::DateTime::from_ascii(texts.first()?).ok()?;
+    let (y, mo, day, h, mi, s) = crate::timeshift::add_seconds(
+        (d.year, d.month, d.day, d.hour, d.minute, d.second),
+        seconds,
+    );
+    let text = format!("{y:04}:{mo:02}:{day:02} {h:02}:{mi:02}:{s:02}");
+    Some(exif::Value::Ascii(vec![text.into_bytes()]))
 }
 
 /// Write a 16-bit RGB TIFF file that carries the given EXIF fields.
@@ -336,6 +473,7 @@ pub fn write_tiff_16bit_with_exif<W: Write + Seek>(
     (width, height): (u32, u32),
     samples: &[u16],
     fields: &[exif::Field],
+    icc_profile: bool,
 ) -> Result<()> {
     use exif::{Field, In, Tag, Value};
 
@@ -361,7 +499,13 @@ pub fn write_tiff_16bit_with_exif<W: Write + Seek>(
     let strips = [bytes.as_slice()];
 
     let mut writer = exif::experimental::Writer::new();
-    for field in layout.iter().chain(fields) {
+    let icc = Field {
+        tag: ICC_PROFILE_TAG,
+        ifd_num: In::PRIMARY,
+        value: Value::Undefined(srgb_icc_profile().to_vec(), 0),
+    };
+    let profile = icc_profile.then_some(&icc);
+    for field in layout.iter().chain(fields).chain(profile) {
         writer.push_field(field);
     }
     writer.set_strips(&strips, In::PRIMARY);
@@ -663,7 +807,8 @@ mod tests {
     fn write_tiff_16bit_with_exif_roundtrips_pixels_and_fields() {
         let samples: Vec<u16> = (0..4 * 3 * 3).map(|i| i * 1000).collect();
         let mut buf = Cursor::new(Vec::new());
-        write_tiff_16bit_with_exif(&mut buf, (4, 3), &samples, &[description_field()]).unwrap();
+        write_tiff_16bit_with_exif(&mut buf, (4, 3), &samples, &[description_field()], true)
+            .unwrap();
         let bytes = buf.into_inner();
 
         let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Tiff)
@@ -742,6 +887,50 @@ mod tests {
     }
 
     #[test]
+    fn dpi_replaces_the_source_resolution() {
+        use exif::{In, Tag, Value};
+        let r = |v| Value::Rational(vec![exif::Rational { num: v, denom: 1 }]);
+        let source = [
+            field(Tag::XResolution, In::PRIMARY, r(350)),
+            field(Tag::YResolution, In::PRIMARY, r(350)),
+            field(Tag::ResolutionUnit, In::PRIMARY, Value::Short(vec![2])),
+        ];
+        let out = fields_for_output(source.iter(), (300, 200), &MetadataOptions::default());
+        assert_eq!(out.len(), 3);
+        let meta = MetadataOptions { dpi: Some(300), strip_all: true, ..Default::default() };
+        let out = fields_for_output(source.iter(), (300, 200), &meta);
+        assert_eq!(tags(&out), vec![Tag::XResolution, Tag::YResolution, Tag::ResolutionUnit]);
+        assert!(matches!(&out[0].value, Value::Rational(v) if v[0].num == 300 && v[0].denom == 1));
+        assert_eq!(out[2].value.get_uint(0), Some(2));
+    }
+
+    #[test]
+    fn copyright_year_is_the_shifted_capture_year() {
+        use exif::{In, Tag, Value};
+        let source = [field(
+            Tag::DateTimeOriginal,
+            In::PRIMARY,
+            Value::Ascii(vec![b"2025:12:31 23:30:00".to_vec()]),
+        )];
+        let meta = |shift: Option<&str>| MetadataOptions {
+            copyright: Some("(c) {year} J. Doe, {stem}".to_string()),
+            time_shift: shift.map(|s| s.parse().unwrap()),
+            ..Default::default()
+        };
+        let copyright = |out: Vec<exif::Field>| {
+            out.into_iter().find(|f| f.tag == Tag::Copyright).unwrap().display_value().to_string()
+        };
+        let out = fields_for_output(source.iter(), (300, 200), &meta(None));
+        assert_eq!(copyright(out), "\"(c) 2025 J. Doe, {stem}\"");
+        let out = fields_for_output(source.iter(), (300, 200), &meta(Some("+1h")));
+        assert_eq!(copyright(out), "\"(c) 2026 J. Doe, {stem}\"");
+        let none: [exif::Field; 0] = [];
+        let out = fields_for_output(none.iter(), (300, 200), &meta(None));
+        let year = crate::timeshift::current_year();
+        assert_eq!(copyright(out), format!("\"(c) {year} J. Doe, {{stem}}\""));
+    }
+
+    #[test]
     fn extract_exif_adds_copyright_when_source_has_no_exif() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), b"not a raw file").unwrap();
@@ -782,6 +971,67 @@ mod tests {
             tags(&out),
             vec![Tag::ImageDescription, Tag::Model, Tag::ISOSpeed]
         );
+    }
+
+    #[test]
+    fn fields_for_output_shifts_capture_dates_for_the_camera() {
+        use exif::{In, Tag, Value};
+        let date = |tag| field(tag, In::PRIMARY, Value::Ascii(vec![b"2026:11:14 23:30:00".to_vec()]));
+        let source = [
+            field(Tag::Model, In::PRIMARY, Value::Ascii(vec![b"ILCE-7M4".to_vec()])),
+            date(Tag::DateTimeOriginal),
+            date(Tag::DateTimeDigitized),
+            date(Tag::DateTime),
+            field(Tag::OffsetTimeOriginal, In::PRIMARY, Value::Ascii(vec![b"+01:00".to_vec()])),
+        ];
+        let meta = |shift: &str| MetadataOptions {
+            time_shift: Some(shift.parse().unwrap()),
+            ..Default::default()
+        };
+        let text = |out: &[exif::Field], tag| {
+            out.iter().find(|f| f.tag == tag).unwrap().display_value().to_string()
+        };
+        let out = fields_for_output(source.iter(), (300, 200), &meta("7M4=+1h,Z 6=-1h"));
+        for tag in [Tag::DateTimeOriginal, Tag::DateTimeDigitized, Tag::DateTime] {
+            assert_eq!(text(&out, tag), "2026-11-15 00:30:00");
+        }
+        assert_eq!(text(&out, Tag::OffsetTimeOriginal), "\"+01:00\"");
+        let out = fields_for_output(source.iter(), (300, 200), &meta("Z 6=-1h"));
+        assert_eq!(text(&out, Tag::DateTimeOriginal), "2026-11-14 23:30:00");
+    }
+
+    #[test]
+    fn fields_for_output_marks_developed_output_as_srgb() {
+        use exif::{In, Tag, Value};
+        let source = [
+            field(Tag::ColorSpace, In::PRIMARY, Value::Short(vec![0xffff])),
+            field(
+                Tag::InteroperabilityIndex,
+                In::PRIMARY,
+                Value::Ascii(vec![b"R03".to_vec()]),
+            ),
+        ];
+        let srgb = MetadataOptions {
+            srgb: true,
+            ..Default::default()
+        };
+        let out = fields_for_output(source.iter(), (300, 200), &srgb);
+        assert_eq!(tags(&out), vec![Tag::ColorSpace]);
+        assert_eq!(out[0].value.get_uint(0), Some(1));
+
+        // --preview keeps the camera's own colour space.
+        let out = fields_for_output(source.iter(), (300, 200), &MetadataOptions::default());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].value.get_uint(0), Some(0xffff));
+    }
+
+    #[test]
+    fn srgb_icc_profile_is_a_valid_rgb_display_profile() {
+        let icc = srgb_icc_profile();
+        assert!(icc.len() > 128);
+        assert_eq!(&icc[12..16], b"mntr");
+        assert_eq!(&icc[16..20], b"RGB ");
+        assert_eq!(&icc[36..40], b"acsp");
     }
 
     #[test]
@@ -826,6 +1076,41 @@ mod tests {
         let exif = read_source_exif(tmp.path()).unwrap()?;
         let model = exif.get_field(exif::Tag::Model, exif::In::PRIMARY)?;
         Some(model.display_value().to_string())
+    }
+
+    #[test]
+    fn read_source_exif_reads_the_whole_file_when_metadata_continues_past_the_start() {
+        // The writer puts the IFD first and the long value after it, so the
+        // value ends beyond the first read.
+        let long_text = vec![b'x'; HEAD_BYTES as usize + 10];
+        let fields = [
+            field(
+                exif::Tag::Model,
+                exif::In::PRIMARY,
+                exif::Value::Ascii(vec![b"Cam".to_vec()]),
+            ),
+            field(
+                exif::Tag::ImageDescription,
+                exif::In::PRIMARY,
+                exif::Value::Ascii(vec![long_text.clone()]),
+            ),
+        ];
+        let tmp = write_tiff_with_fields(&fields);
+        let exif = read_source_exif(tmp.path()).unwrap().unwrap();
+        let description = exif
+            .get_field(exif::Tag::ImageDescription, exif::In::PRIMARY)
+            .unwrap();
+        match &description.value {
+            exif::Value::Ascii(v) => assert_eq!(v[0].len(), long_text.len()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_source_exif_skips_canon_cr3() {
+        let mut cr3 = vec![0u8; 64];
+        cr3[4..12].copy_from_slice(b"ftypcrx ");
+        assert_eq!(model_of(&cr3), None);
     }
 
     #[test]
@@ -875,8 +1160,12 @@ mod tests {
         raf.extend_from_slice(&jpeg);
         assert_eq!(model_of(&raf).as_deref(), Some("\"Cam\""));
 
-        // A header that points outside the file is not an error.
+        // A length past the end of the file: what exists is read.
         raf[88..92].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(model_of(&raf).as_deref(), Some("\"Cam\""));
+
+        // An offset past the end of the file is not an error.
+        raf[84..88].copy_from_slice(&u32::MAX.to_be_bytes());
         assert_eq!(model_of(&raf), None);
     }
 

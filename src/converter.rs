@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use image::codecs::jpeg::JpegEncoder;
+use image::ImageEncoder;
 use image::codecs::png::PngEncoder;
 use image::codecs::tiff::TiffEncoder;
 use image::{ImageBuffer, Rgb, RgbImage};
@@ -20,8 +21,14 @@ pub struct ConvertOptions {
     pub format: OutputFormat,
     /// JPEG quality, 1-100. Ignored for TIFF and PNG.
     pub quality: u8,
+    /// Largest JPEG file in bytes. The quality is lowered until the file
+    /// fits; `quality` is the highest quality tried.
+    pub max_bytes: Option<u64>,
     /// Maximum length of the long edge in pixels.
     pub resize: Option<u32>,
+    /// Crop to this aspect ratio (long side, short side), centred, in the
+    /// orientation of each image. Applied before `resize`.
+    pub aspect: Option<(u32, u32)>,
     /// Scale during RAW decoding instead of after it. Needs `resize`.
     pub fast: bool,
     /// Exposure change in stops (EV).
@@ -34,11 +41,20 @@ pub struct ConvertOptions {
     /// Use the JPEG preview that the camera embedded in the RAW file
     /// instead of developing the RAW data.
     pub preview: bool,
+    /// With `-f original`, also copy the camera's JPEG or HEIF of each RAW
+    /// file.
+    pub with_jpeg: bool,
+    /// A logo blended into the bottom-right corner of every image.
+    pub watermark: Option<std::sync::Arc<image::RgbaImage>>,
     pub metadata: exif_utils::MetadataOptions,
 }
 
 /// Convert a single ARW file to the specified output format.
 pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<()> {
+    if matches!(opts.format, OutputFormat::Original) {
+        return copy_original(input, output, opts.with_jpeg);
+    }
+
     let ConvertOptions {
         format,
         resize,
@@ -49,7 +65,23 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     } = *opts;
 
     let mut source = if opts.preview {
-        Source::Preview(load_preview(input)?)
+        // A file whose preview cannot be read is developed too; if the
+        // file is broken, developing reports why.
+        let Some(preview) = load_preview(input).ok().flatten() else {
+            // Phones, Olympus, and some DNG files store no preview. Develop
+            // those instead of failing, at --fast speed when resizing.
+            eprintln!(
+                "Note: {} has no embedded preview that rawdog can read; developing the RAW data instead",
+                input.display()
+            );
+            let mut developed = opts.clone();
+            developed.preview = false;
+            developed.fast = resize.is_some();
+            developed.metadata.srgb = true;
+            return convert_raw(input, output, &developed);
+        };
+        warn_if_preview_is_small(&preview, resize);
+        Source::Preview(preview)
     } else {
         let mut pipeline = open_pipeline(input)?;
 
@@ -58,7 +90,7 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
         // full demosaic followed by a Lanczos resize, and slightly softer.
         // Two extra pixels are requested because `trim_fast_edge` removes
         // one pixel from every side. Very small sizes use the normal path.
-        if let (true, Some(max_edge)) = (fast, resize) {
+        if let (true, Some(max_edge)) = (fast, fast_decode_edge(resize, opts.aspect)) {
             if max_edge >= FAST_MIN_EDGE {
                 pipeline.globals.settings.maxwidth = max_edge as usize + 2;
                 pipeline.globals.settings.maxheight = max_edge as usize + 2;
@@ -71,9 +103,18 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
             // other way: above 1 is more magenta.
             pipeline.ops.tolab.set_temp(kelvin, 1.0 / tint);
         }
-        if let Some(ev) = exposure {
-            let curve = &mut pipeline.ops.basecurve;
-            curve.points = exposure_curve(ev, &curve.get_spline());
+        match (exposure, &mut pipeline.globals.image) {
+            // Darkening is exact as a gain on the RAW samples: colour and
+            // lightness scale together. The curve changes lightness only,
+            // which left dark areas too saturated at large negative values.
+            (Some(ev), ImageSource::Raw(raw)) if ev < 0.0 => scale_raw_samples(raw, ev.exp2()),
+            // Brightening uses the curve, which rolls off highlights where a
+            // gain would clip them.
+            (Some(ev), _) => {
+                let curve = &mut pipeline.ops.basecurve;
+                curve.points = exposure_curve(ev, &curve.get_spline());
+            }
+            (None, _) => {}
         }
         Source::Developed(Box::new(pipeline))
     };
@@ -88,6 +129,7 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
     // run never leaves a partial file that a later run would skip. The file
     // is created before decoding, so an unwritable directory fails quickly.
     let tmp = temp_path_for(output);
+    let _guard = TempFileGuard::register(&tmp);
     let unwritable = || format!("Failed to write output file {}", output.display());
     let result = std::fs::File::create(&tmp)
         .with_context(unwritable)
@@ -95,15 +137,26 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
             let mut out = std::io::BufWriter::new(file);
             match format {
                 OutputFormat::Jpeg => {
-                    let img = source.rgb8(input, opts)?;
-                    write_jpeg(&img, input, &mut out, opts).with_context(unwritable)?;
+                    let mut img = source.rgb8(opts)?;
+                    if let Some(mark) = &opts.watermark {
+                        apply_watermark(&mut img, mark);
+                    }
+                    let bytes = encode_jpeg(&img, input, opts)?;
+                    out.write_all(&bytes).with_context(unwritable)?;
                 }
                 OutputFormat::Tiff => {
-                    let img = source.rgb16(input, opts)?;
+                    let mut img = source.rgb16(opts)?;
+                    if let Some(mark) = &opts.watermark {
+                        apply_watermark(&mut img, mark);
+                    }
                     write_tiff(&img, input, &mut out, opts).with_context(unwritable)?;
                 }
+                OutputFormat::Original => unreachable!("handled by copy_original"),
                 OutputFormat::Png => {
-                    let img = source.rgb16(input, opts)?;
+                    let mut img = source.rgb16(opts)?;
+                    if let Some(mark) = &opts.watermark {
+                        apply_watermark(&mut img, mark);
+                    }
                     write_png(&img, input, &mut out, opts).with_context(unwritable)?;
                 }
             }
@@ -128,11 +181,12 @@ enum Source {
 
 impl Source {
     /// The final 8-bit image: resized and sharpened.
-    fn rgb8(&mut self, input: &Path, opts: &ConvertOptions) -> Result<RgbImage> {
+    fn rgb8(&mut self, opts: &ConvertOptions) -> Result<RgbImage> {
         match self {
-            Source::Developed(pipeline) => render_8bit(pipeline, input, opts),
+            Source::Developed(pipeline) => render_8bit(pipeline, opts),
             Source::Preview(img) => {
-                let mut img = maybe_resize_8bit(std::mem::take(img), opts.resize);
+                let img = crop_to_aspect(std::mem::take(img), opts.aspect);
+                let mut img = maybe_resize_8bit(img, opts.resize);
                 if let Some(amount) = opts.sharpen {
                     sharpen(&mut img, amount);
                 }
@@ -142,16 +196,12 @@ impl Source {
     }
 
     /// The final 16-bit image: resized and sharpened.
-    fn rgb16(
-        &mut self,
-        input: &Path,
-        opts: &ConvertOptions,
-    ) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
+    fn rgb16(&mut self, opts: &ConvertOptions) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
         match self {
-            Source::Developed(pipeline) => render_16bit_sharpened(pipeline, input, opts),
+            Source::Developed(pipeline) => render_16bit_sharpened(pipeline, opts),
             Source::Preview(img) => {
                 let wide = image::DynamicImage::ImageRgb8(std::mem::take(img)).into_rgb16();
-                let mut img = maybe_resize_16bit(wide, opts.resize);
+                let mut img = maybe_resize_16bit(crop_to_aspect(wide, opts.aspect), opts.resize);
                 if let Some(amount) = opts.sharpen {
                     sharpen(&mut img, amount);
                 }
@@ -164,7 +214,7 @@ impl Source {
 /// Load the JPEG preview that the camera stored in a RAW file, rotated
 /// upright. Its size depends on the camera: about 1616x1080 for Sony, full
 /// resolution for many Canon and Nikon bodies.
-fn load_preview(input: &Path) -> Result<RgbImage> {
+fn load_preview(input: &Path) -> Result<Option<RgbImage>> {
     use rawler::decoders::RawDecodeParams;
     use rawler::rawsource::RawSource;
 
@@ -179,10 +229,8 @@ fn load_preview(input: &Path) -> Result<RgbImage> {
             return Ok(None);
         };
         // The preview is stored as the sensor recorded it.
-        let orientation = decoder
-            .raw_metadata(&source, &params)
-            .ok()
-            .and_then(|m| m.exif.orientation)
+        let orientation = crate::naming::sidecar_orientation(input)
+            .or_else(|| decoder.raw_metadata(&source, &params).ok()?.exif.orientation)
             .and_then(|n| u8::try_from(n).ok())
             .and_then(image::metadata::Orientation::from_exif);
         if let Some(orientation) = orientation {
@@ -193,18 +241,26 @@ fn load_preview(input: &Path) -> Result<RgbImage> {
 
     // rawler can panic on files that are not RAW files.
     let first_line = |e: String| e.lines().next().unwrap_or_default().to_string();
+    // The caller names the file in its message.
     match std::panic::catch_unwind(load) {
-        Ok(Ok(Some(preview))) => Ok(preview),
-        Ok(Ok(None)) => Err(anyhow!(
-            "{} has no embedded preview; convert it without --preview",
-            input.display()
-        )),
-        Ok(Err(e)) => Err(anyhow!(
-            "Cannot read a preview from {}: {}",
-            input.display(),
-            first_line(e)
-        )),
-        Err(_) => Err(anyhow!("Cannot read a preview from {}", input.display())),
+        Ok(Ok(preview)) => Ok(preview),
+        Ok(Err(e)) => Err(anyhow!("cannot read the embedded preview: {}", first_line(e))),
+        Err(_) => Err(anyhow!("cannot read the embedded preview")),
+    }
+}
+
+/// Warn once per run when `--resize` asks for more pixels than a preview
+/// has, because a preview is never enlarged.
+fn warn_if_preview_is_small(preview: &RgbImage, resize: Option<u32>) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let long_edge = preview.width().max(preview.height());
+    if resize.is_some_and(|r| r > long_edge)
+        && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        eprintln!(
+            "Note: embedded previews are smaller than --resize (for example {long_edge} pixels \
+             on the long edge) and are not enlarged; convert without --preview for larger images"
+        );
     }
 }
 
@@ -220,7 +276,7 @@ fn load_preview(input: &Path) -> Result<RgbImage> {
 /// The RAW decoders come first because most RAW files are TIFF containers,
 /// and a raster loader could open one and return only its preview.
 fn open_pipeline(input: &Path) -> Result<Pipeline> {
-    let raw = match decode_with_rawler(input) {
+    let mut raw = match decode_with_rawler(input) {
         Ok(raw) => raw,
         Err(new_decoder) => match rawloader::decode_file(input) {
             Ok(raw) => raw,
@@ -231,9 +287,7 @@ fn open_pipeline(input: &Path) -> Result<Pipeline> {
                     // Both decoders give long messages; one line is enough.
                     let detail = |e: &str| e.lines().next().unwrap_or_default().to_string();
                     anyhow!(
-                        "Cannot decode {}: the file is corrupt or its format is not supported \
-                         ({}; {})",
-                        input.display(),
+                        "the file is corrupt or its format is not supported ({}; {})",
                         detail(&new_decoder),
                         detail(&old_decoder.to_string())
                     )
@@ -241,15 +295,16 @@ fn open_pipeline(input: &Path) -> Result<Pipeline> {
             }
         },
     };
+    if let Some(orientation) = crate::naming::sidecar_orientation(input) {
+        raw.orientation = rawloader::Orientation::from_u16(orientation);
+    }
     if let Some(problem) = implausible_samples(&raw) {
         return Err(anyhow!(
-            "Cannot decode {}: the decoder returned invalid data ({problem}); \
-             this format variant is not supported",
-            input.display()
+            "the decoder returned invalid data ({problem}); this format variant is not supported"
         ));
     }
     let mut pipeline = Pipeline::new_from_source(ImageSource::Raw(raw))
-        .map_err(|e| anyhow!("Failed to create pipeline for {}: {}", input.display(), e))?;
+        .map_err(|e| anyhow!("cannot set up processing: {e}"))?;
     let tolab = &mut pipeline.ops.tolab;
     tolab.cam_to_xyz_normalized = cam_to_xyz_d65(tolab.xyz_to_cam);
     Ok(pipeline)
@@ -414,6 +469,26 @@ fn decode_with_rawler(input: &Path) -> Result<rawloader::RawImage, String> {
     })
 }
 
+/// Multiply the light in RAW samples by `gain`: the part above the black
+/// level is scaled, and the black level stays.
+fn scale_raw_samples(raw: &mut rawloader::RawImage, gain: f32) {
+    // imagepipe subtracts one black level for every sample (the first).
+    let black = raw.blacklevels[0] as f32;
+    match &mut raw.data {
+        rawloader::RawImageData::Integer(data) => {
+            for v in data.iter_mut() {
+                let light = (*v as f32 - black).max(0.0);
+                *v = (black + light * gain).round() as u16;
+            }
+        }
+        rawloader::RawImageData::Float(data) => {
+            for v in data.iter_mut() {
+                *v = black + (*v - black).max(0.0) * gain;
+            }
+        }
+    }
+}
+
 /// Tone curve points that apply an exposure change of `ev` stops, followed
 /// by the pipeline's own base curve.
 ///
@@ -451,15 +526,208 @@ fn exposure_curve(ev: f32, base: &SplineFunc) -> Vec<(f32, f32)> {
         .collect()
 }
 
+/// Copy `input` to `output` unchanged, with its modification time.
+///
+/// The copy goes to a temporary file, is compared byte for byte with the
+/// source, and only then gets its final name. The source is never changed.
+fn copy_original(input: &Path, output: &Path, with_jpeg: bool) -> Result<()> {
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create output directory {}", parent.display()))?;
+    }
+    let tmp = temp_path_for(output);
+    let _guard = TempFileGuard::register(&tmp);
+    let unwritable = || format!("Failed to write output file {}", output.display());
+
+    let result = (|| -> Result<()> {
+        std::fs::copy(input, &tmp).with_context(unwritable)?;
+        let copy = std::fs::File::options()
+            .write(true)
+            .open(&tmp)
+            .with_context(unwritable)?;
+        copy.sync_all().with_context(unwritable)?;
+        if let Ok(modified) = std::fs::metadata(input).and_then(|m| m.modified()) {
+            copy.set_modified(modified).with_context(unwritable)?;
+        }
+        drop(copy);
+        if !same_contents(input, &tmp)? {
+            return Err(anyhow!("the copy differs from the original; the disk may be failing"));
+        }
+        std::fs::rename(&tmp, output).with_context(unwritable)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+    copy_sidecars(input, output)?;
+    if with_jpeg {
+        // The RAW file was just copied, so a camera JPEG already at the
+        // destination may belong to another image ({seq} renumbers).
+        copy_companions(input, output, true)?;
+    }
+    Ok(())
+}
+
+/// Copy the JPEG or HEIF files that a camera set to RAW+JPEG wrote next to
+/// `input` with the same name, such as `DSC1.JPG` for `DSC1.ARW`. Each copy
+/// keeps its modification time and is compared with the original. With
+/// `replace`, an existing file at the destination is replaced; otherwise
+/// it is kept.
+pub fn copy_companions(input: &Path, output: &Path, replace: bool) -> Result<()> {
+    const EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "hif", "heic"];
+    let (Some(dir), Some(stem)) = (input.parent(), input.file_stem()) else {
+        return Ok(());
+    };
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let source = entry.path();
+        let Some(ext) = source.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if source.file_stem() != Some(stem)
+            || !EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+            || !source.is_file()
+        {
+            continue;
+        }
+        let destination = output.with_extension(ext);
+        if destination.exists() && (!replace || same_contents(&source, &destination)?) {
+            continue;
+        }
+        copy_verified(&source, &destination, true).map_err(|e| {
+            anyhow!("copied the RAW file but not {}: {e:#}", source.display())
+        })?;
+    }
+    Ok(())
+}
+
+/// Copy `source` to `destination` through a temporary file, compare the
+/// bytes, and rename. With `keep_time`, the copy gets the modification time
+/// of the source.
+fn copy_verified(source: &Path, destination: &Path, keep_time: bool) -> Result<()> {
+    let tmp = temp_path_for(destination);
+    let _guard = TempFileGuard::register(&tmp);
+    let result = (|| -> Result<()> {
+        std::fs::copy(source, &tmp)?;
+        if keep_time {
+            if let Ok(modified) = std::fs::metadata(source).and_then(|m| m.modified()) {
+                std::fs::File::options().write(true).open(&tmp)?.set_modified(modified)?;
+            }
+        }
+        if !same_contents(source, &tmp)? {
+            return Err(anyhow!("the copy differs from the original"));
+        }
+        std::fs::rename(&tmp, destination)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Copy the XMP sidecars of `input` next to `output`, in the same naming
+/// style: `NAME.xmp` (Lightroom, Capture One) or `NAME.EXT.xmp` (darktable).
+/// They hold ratings and edits, which an archive must keep. An existing
+/// sidecar at the destination is kept, because it may hold newer edits.
+fn copy_sidecars(input: &Path, output: &Path) -> Result<()> {
+    let mut pairs = Vec::new();
+    for ext in ["xmp", "XMP"] {
+        pairs.push((input.with_extension(ext), output.with_extension(ext)));
+    }
+    let with_suffix = |p: &Path| {
+        let mut name = p.as_os_str().to_owned();
+        name.push(".xmp");
+        PathBuf::from(name)
+    };
+    pairs.push((with_suffix(input), with_suffix(output)));
+
+    for (source, destination) in pairs {
+        if !source.is_file() || destination.exists() {
+            continue;
+        }
+        if let Err(e) = copy_verified(&source, &destination, false) {
+            return Err(anyhow!("copied the RAW file but not its sidecar {}: {e:#}", source.display()));
+        }
+    }
+    Ok(())
+}
+
+/// True if the two files have the same bytes.
+fn same_contents(a: &Path, b: &Path) -> Result<bool> {
+    use std::io::Read;
+    let open = |p: &Path| {
+        std::fs::File::open(p).with_context(|| format!("Failed to read {}", p.display()))
+    };
+    let (mut fa, mut fb) = (open(a)?, open(b)?);
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Temporary files that are being written, so that an interrupt can remove
+/// them. Without this, Ctrl-C leaves hidden `.NAME.rawdog-tmp` files.
+static ACTIVE_TEMP_FILES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Keeps a temporary file in `ACTIVE_TEMP_FILES` while it is in use.
+struct TempFileGuard(PathBuf);
+
+impl TempFileGuard {
+    fn register(path: &Path) -> TempFileGuard {
+        if let Ok(mut active) = ACTIVE_TEMP_FILES.lock() {
+            active.push(path.to_path_buf());
+        }
+        TempFileGuard(path.to_path_buf())
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = ACTIVE_TEMP_FILES.lock() {
+            active.retain(|p| p != &self.0);
+        }
+    }
+}
+
+/// Remove every temporary file that is being written. For use when the
+/// process is interrupted.
+pub fn remove_active_temp_files() {
+    // A conversion thread can hold the lock; do not wait for it.
+    if let Ok(active) = ACTIVE_TEMP_FILES.try_lock() {
+        remove_files(&active);
+    }
+}
+
+fn remove_files(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn temp_path_for(output: &Path) -> PathBuf {
     let name = output.file_name().unwrap_or_default().to_string_lossy();
     output.with_file_name(format!(".{name}.rawdog-tmp"))
 }
 
-fn render_8bit(pipeline: &mut Pipeline, input: &Path, opts: &ConvertOptions) -> Result<RgbImage> {
+fn render_8bit(pipeline: &mut Pipeline, opts: &ConvertOptions) -> Result<RgbImage> {
     let decoded = pipeline
         .output_8bit(None)
-        .map_err(|e| anyhow!("Failed to process {}: {}", input.display(), e))?;
+        .map_err(|e| anyhow!("processing failed: {e}"))?;
 
     let width = decoded.width as u32;
     let height = decoded.height as u32;
@@ -467,59 +735,107 @@ fn render_8bit(pipeline: &mut Pipeline, input: &Path, opts: &ConvertOptions) -> 
     let img: RgbImage = ImageBuffer::from_raw(width, height, decoded.data)
         .context("Failed to construct image buffer from decoded data")?;
 
-    let mut img = maybe_resize_8bit(trim_fast_edge(img, opts.resize, opts.fast), opts.resize);
+    let decode_edge = fast_decode_edge(opts.resize, opts.aspect);
+    let img = crop_to_aspect(trim_fast_edge(img, decode_edge, opts.fast), opts.aspect);
+    let mut img = maybe_resize_8bit(img, opts.resize);
     if let Some(amount) = opts.sharpen {
         sharpen(&mut img, amount);
     }
     Ok(img)
 }
 
-fn render_16bit_sharpened(
-    pipeline: &mut Pipeline,
-    input: &Path,
-    opts: &ConvertOptions,
-) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
-    let mut img = render_16bit(pipeline, input, opts.resize, opts.fast)?;
+fn render_16bit_sharpened(pipeline: &mut Pipeline, opts: &ConvertOptions) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
+    let mut img = render_16bit(pipeline, opts.resize, opts.fast, opts.aspect)?;
     if let Some(amount) = opts.sharpen {
         sharpen(&mut img, amount);
     }
     Ok(img)
 }
 
-fn write_jpeg(
-    img: &RgbImage,
-    input: &Path,
-    out: &mut impl Write,
-    opts: &ConvertOptions,
-) -> Result<()> {
-    // Encode JPEG to an in-memory buffer so we can inject EXIF metadata
-    // before writing to disk.
-    let mut jpeg_buf = Vec::new();
-    let encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, opts.quality);
-    img.write_with_encoder(encoder)
-        .context("Failed to encode JPEG")?;
-
-    // Inject EXIF metadata into the JPEG if available. Failures here are
-    // non-fatal: we still produce the output image.
-    let exif_data = exif_utils::extract_exif(input, img.dimensions(), &opts.metadata)
+/// The complete JPEG file, with metadata, at `opts.quality` or, with
+/// `opts.max_bytes`, at the highest quality that fits.
+fn encode_jpeg(img: &RgbImage, input: &Path, opts: &ConvertOptions) -> Result<Vec<u8>> {
+    // Metadata failures are non-fatal: we still produce the output image.
+    let mut exif_data = exif_utils::extract_exif(input, img.dimensions(), &opts.metadata)
         .ok()
         .flatten();
-    let final_bytes = match exif_data {
-        Some(exif) => match exif_utils::inject_exif_into_jpeg(&jpeg_buf, &exif) {
-            Ok(with_exif) => with_exif,
-            Err(e) => {
-                eprintln!(
-                    "Warning: metadata of {} was not copied: {e}",
-                    input.display()
-                );
-                jpeg_buf
+    let mut encode = |quality: u8| -> Result<Vec<u8>> {
+        let mut jpeg_buf = Vec::new();
+        let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, quality);
+        if let Some(dpi) = opts.metadata.dpi {
+            encoder.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(dpi));
+        }
+        if opts.metadata.srgb {
+            encoder.set_icc_profile(exif_utils::srgb_icc_profile().to_vec())?;
+        }
+        img.write_with_encoder(encoder)
+            .context("Failed to encode JPEG")?;
+        if let Some(exif) = &exif_data {
+            match exif_utils::inject_exif_into_jpeg(&jpeg_buf, exif) {
+                Ok(with_exif) => return Ok(with_exif),
+                Err(e) => {
+                    eprintln!(
+                        "Warning: metadata of {} was not copied: {e}",
+                        input.display()
+                    );
+                    exif_data = None;
+                }
             }
-        },
-        None => jpeg_buf,
+        }
+        Ok(jpeg_buf)
     };
+    match opts.max_bytes {
+        None => encode(opts.quality),
+        Some(limit) => fit_jpeg(limit, opts.quality, &mut encode),
+    }
+}
 
-    out.write_all(&final_bytes)?;
-    Ok(())
+/// The output of `encode` at the highest quality, up to `max_quality`,
+/// whose size is at most `limit` bytes. JPEG size grows with quality, so
+/// a binary search finds it.
+fn fit_jpeg(
+    limit: u64,
+    max_quality: u8,
+    encode: &mut impl FnMut(u8) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let fits = |bytes: &Vec<u8>| bytes.len() as u64 <= limit;
+    let first = encode(max_quality)?;
+    if fits(&first) {
+        return Ok(first);
+    }
+    let mut smallest = first.len();
+    let mut best = None;
+    let (mut low, mut high) = (1, max_quality - 1);
+    while low <= high {
+        let quality = low + (high - low) / 2;
+        let bytes = encode(quality)?;
+        if fits(&bytes) {
+            best = Some(bytes);
+            low = quality + 1;
+        } else {
+            smallest = smallest.min(bytes.len());
+            if quality == 1 {
+                break;
+            }
+            high = quality - 1;
+        }
+    }
+    best.ok_or_else(|| {
+        anyhow!(
+            "the JPEG is {} at the lowest quality, larger than --max-size {}; use --resize for a smaller image",
+            format_size(smallest as u64),
+            format_size(limit)
+        )
+    })
+}
+
+/// A file size in the decimal units that `--max-size` accepts.
+fn format_size(bytes: u64) -> String {
+    match bytes {
+        0..1_000 => format!("{bytes} bytes"),
+        1_000..1_000_000 => format!("{:.0} KB", bytes as f64 / 1e3),
+        _ => format!("{:.1} MB", bytes as f64 / 1e6),
+    }
 }
 
 fn write_tiff(
@@ -533,9 +849,20 @@ fn write_tiff(
         .ok()
         .flatten();
     match fields {
-        Some((fields, _)) => {
-            exif_utils::write_tiff_16bit_with_exif(out, img.dimensions(), img.as_raw(), &fields)
-        }
+        Some((fields, _)) => exif_utils::write_tiff_16bit_with_exif(
+            out,
+            img.dimensions(),
+            img.as_raw(),
+            &fields,
+            opts.metadata.srgb,
+        ),
+        None if opts.metadata.srgb => exif_utils::write_tiff_16bit_with_exif(
+            out,
+            img.dimensions(),
+            img.as_raw(),
+            &[],
+            true,
+        ),
         None => img
             .write_with_encoder(TiffEncoder::new(out))
             .map_err(Into::into),
@@ -551,7 +878,11 @@ fn write_png(
 ) -> Result<()> {
     // Encode PNG to an in-memory buffer so we can inject EXIF metadata.
     let mut buf = Vec::new();
-    img.write_with_encoder(PngEncoder::new(&mut buf))
+    let mut encoder = PngEncoder::new(&mut buf);
+    if opts.metadata.srgb {
+        encoder.set_icc_profile(exif_utils::srgb_icc_profile().to_vec())?;
+    }
+    img.write_with_encoder(encoder)
         .context("Failed to encode PNG")?;
 
     // Inject EXIF metadata into the PNG if available.
@@ -569,9 +900,9 @@ fn write_png(
 
 fn render_16bit(
     pipeline: &mut Pipeline,
-    input: &Path,
     resize: Option<u32>,
     fast: bool,
+    aspect: Option<(u32, u32)>,
 ) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
     // imagepipe's full pipeline (always used for RAW files) returns linear
     // 16-bit data, while its raster fast path returns the source file's
@@ -582,7 +913,7 @@ fn render_16bit(
 
     let decoded = pipeline
         .output_16bit(None)
-        .map_err(|e| anyhow!("Failed to process {}: {}", input.display(), e))?;
+        .map_err(|e| anyhow!("processing failed: {e}"))?;
 
     let width = decoded.width as u32;
     let height = decoded.height as u32;
@@ -592,7 +923,8 @@ fn render_16bit(
             .context("Failed to construct 16-bit image buffer from decoded data")?;
 
     // Resize in linear light, then encode.
-    let mut img = maybe_resize_16bit(trim_fast_edge(img, resize, fast), resize);
+    let trimmed = trim_fast_edge(img, fast_decode_edge(resize, aspect), fast);
+    let mut img = maybe_resize_16bit(crop_to_aspect(trimmed, aspect), resize);
     if is_linear {
         let lut = srgb_encode_lut();
         for v in img.iter_mut() {
@@ -641,6 +973,59 @@ where
     }
 }
 
+/// Blend `mark` into the bottom-right corner of `img`. The long side of the
+/// mark is a fifth of the image's short edge, so the mark has the same size
+/// on landscape and portrait images; the margin is 3% of the short edge.
+fn apply_watermark<S>(img: &mut ImageBuffer<Rgb<S>, Vec<S>>, mark: &image::RgbaImage)
+where
+    S: Sample,
+    Rgb<S>: image::Pixel<Subpixel = S> + 'static,
+{
+    let (width, height) = img.dimensions();
+    let short = width.min(height) as f32;
+    let (mark_w, mark_h) = mark.dimensions();
+    let scale = short * 0.2 / mark_w.max(mark_h) as f32;
+    let new_w = ((mark_w as f32 * scale).round() as u32).max(1);
+    let new_h = ((mark_h as f32 * scale).round() as u32).max(1);
+    let margin = (short * 0.03).round() as u32;
+    if new_w + margin > width || new_h + margin > height {
+        return;
+    }
+
+    // Scale with premultiplied alpha, so the colour of transparent pixels
+    // does not leave a dark or light fringe around the mark.
+    let premultiplied = image::Rgba32FImage::from_fn(mark_w, mark_h, |x, y| {
+        let p = mark.get_pixel(x, y);
+        let a = p[3] as f32 / 255.0;
+        image::Rgba([
+            p[0] as f32 / 255.0 * a,
+            p[1] as f32 / 255.0 * a,
+            p[2] as f32 / 255.0 * a,
+            a,
+        ])
+    });
+    let scaled = image::imageops::resize(
+        &premultiplied,
+        new_w,
+        new_h,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    let max = S::DEFAULT_MAX_VALUE.as_f32();
+    let (left, top) = (width - margin - new_w, height - margin - new_h);
+    for (x, y, p) in scaled.enumerate_pixels() {
+        let a = p[3].clamp(0.0, 1.0);
+        if a == 0.0 {
+            continue;
+        }
+        let dst = img.get_pixel_mut(left + x, top + y);
+        for c in 0..3 {
+            let fg = p[c].clamp(0.0, a) * max;
+            dst[c] = S::from_f32(dst[c].as_f32() * (1.0 - a) + fg);
+        }
+    }
+}
+
 /// Lookup table that maps linear 16-bit samples to sRGB-encoded 16-bit samples.
 fn srgb_encode_lut() -> Vec<u16> {
     (0..=u16::MAX)
@@ -682,6 +1067,47 @@ where
         }
         _ => img,
     }
+}
+
+/// The long edge that `fast` asks the decoder for. A crop to another aspect
+/// ratio removes up to half of the long edge of a 2:1 image, so the decoder
+/// gives twice the size and the crop still fills `resize`.
+fn fast_decode_edge(resize: Option<u32>, aspect: Option<(u32, u32)>) -> Option<u32> {
+    resize.map(|edge| if aspect.is_some() { edge.saturating_mul(2) } else { edge })
+}
+
+/// Crop the centre of `img` to `aspect` (long side, short side), in the
+/// image's own orientation: 4:5 makes a portrait 4:5 and a landscape 5:4.
+fn crop_to_aspect<P>(
+    img: ImageBuffer<P, Vec<P::Subpixel>>,
+    aspect: Option<(u32, u32)>,
+) -> ImageBuffer<P, Vec<P::Subpixel>>
+where
+    P: image::Pixel + 'static,
+{
+    let Some((long_ratio, short_ratio)) = aspect else {
+        return img;
+    };
+    let (width, height) = img.dimensions();
+    let (long, short) = (width.max(height) as u64, width.min(height) as u64);
+    let (long_ratio, short_ratio) = (long_ratio as u64, short_ratio as u64);
+    // Keep the short side and shorten the long side, or the other way round.
+    let (new_long, new_short) = if long * short_ratio > short * long_ratio {
+        ((short * long_ratio + short_ratio / 2) / short_ratio, short)
+    } else {
+        (long, (long * short_ratio + long_ratio / 2) / long_ratio)
+    };
+    let (new_long, new_short) = (new_long.max(1) as u32, new_short.max(1) as u32);
+    let (new_w, new_h) = if width >= height {
+        (new_long, new_short)
+    } else {
+        (new_short, new_long)
+    };
+    if (new_w, new_h) == (width, height) {
+        return img;
+    }
+    let (x, y) = ((width - new_w) / 2, (height - new_h) / 2);
+    image::imageops::crop_imm(&img, x, y, new_w, new_h).to_image()
 }
 
 fn maybe_resize_8bit(
@@ -731,6 +1157,99 @@ mod tests {
     // Helper to create a solid-color 16-bit test image
     fn make_16bit_image(width: u32, height: u32) -> ImageBuffer<Rgb<u16>, Vec<u16>> {
         ImageBuffer::from_fn(width, height, |_x, _y| Rgb([32768u16, 16384, 8192]))
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_watermark tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn watermark_goes_into_the_bottom_right_corner() {
+        // An opaque white mark, 10x5, on a black 600x400 image: the mark
+        // becomes 80x40 (a fifth of 400) with a margin of 12.
+        let mark = image::RgbaImage::from_pixel(10, 5, image::Rgba([255, 255, 255, 255]));
+        let mut img = RgbImage::new(600, 400);
+        apply_watermark(&mut img, &mark);
+        assert_eq!(img.get_pixel(600 - 12 - 40, 400 - 12 - 20)[0], 255);
+        assert_eq!(img.get_pixel(600 - 12 - 79, 400 - 12 - 39)[1], 255);
+        assert_eq!(img.get_pixel(600 - 12 - 82, 400 - 12 - 20)[0], 0);
+        assert_eq!(img.get_pixel(600 - 5, 400 - 5)[0], 0);
+        assert_eq!(img.get_pixel(10, 10)[0], 0);
+    }
+
+    #[test]
+    fn watermark_blends_with_alpha_in_16_bit() {
+        let mark = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 128]));
+        let mut img: ImageBuffer<Rgb<u16>, Vec<u16>> = ImageBuffer::new(500, 500);
+        apply_watermark(&mut img, &mark);
+        let v = img.get_pixel(500 - 15 - 50, 500 - 15 - 50)[0];
+        assert!((32_000..=33_500).contains(&v), "{v}");
+    }
+
+    #[test]
+    fn crop_to_aspect_follows_the_orientation() {
+        let landscape = RgbImage::new(6000, 4000);
+        assert_eq!(crop_to_aspect(landscape.clone(), Some((5, 4))).dimensions(), (5000, 4000));
+        assert_eq!(crop_to_aspect(landscape.clone(), Some((16, 9))).dimensions(), (6000, 3375));
+        assert_eq!(crop_to_aspect(landscape.clone(), Some((1, 1))).dimensions(), (4000, 4000));
+        assert_eq!(crop_to_aspect(landscape.clone(), Some((3, 2))).dimensions(), (6000, 4000));
+        assert_eq!(crop_to_aspect(landscape, None).dimensions(), (6000, 4000));
+        let portrait = RgbImage::new(4000, 6000);
+        assert_eq!(crop_to_aspect(portrait, Some((5, 4))).dimensions(), (4000, 5000));
+    }
+
+    #[test]
+    fn crop_to_aspect_keeps_the_centre() {
+        let img = RgbImage::from_fn(30, 10, |x, _| image::Rgb([x as u8, 0, 0]));
+        let out = crop_to_aspect(img, Some((1, 1)));
+        assert_eq!(out.dimensions(), (10, 10));
+        assert_eq!(out.get_pixel(0, 0)[0], 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // fit_jpeg tests
+    // -----------------------------------------------------------------------
+
+    /// An encoder whose output has `10 * quality` bytes, which counts calls.
+    fn fake_encoder(calls: &mut u32) -> impl FnMut(u8) -> Result<Vec<u8>> + '_ {
+        move |quality| {
+            *calls += 1;
+            Ok(vec![0; 10 * quality as usize])
+        }
+    }
+
+    #[test]
+    fn fit_jpeg_keeps_max_quality_when_it_fits() {
+        let mut calls = 0;
+        let bytes = fit_jpeg(2000, 92, &mut fake_encoder(&mut calls)).unwrap();
+        assert_eq!(bytes.len(), 920);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn fit_jpeg_finds_highest_quality_that_fits() {
+        for limit in [10, 11, 455, 500, 919] {
+            let mut calls = 0;
+            let bytes = fit_jpeg(limit, 92, &mut fake_encoder(&mut calls)).unwrap();
+            assert_eq!(bytes.len() as u64, limit / 10 * 10, "limit {limit}");
+            assert!(calls <= 8, "{calls} encodes for limit {limit}");
+        }
+    }
+
+    #[test]
+    fn fit_jpeg_reports_size_at_lowest_quality() {
+        let mut calls = 0;
+        let err = fit_jpeg(9, 92, &mut fake_encoder(&mut calls)).unwrap_err();
+        assert!(err.to_string().contains("10 bytes at the lowest quality"), "{err}");
+        let err = fit_jpeg(9, 1, &mut fake_encoder(&mut calls)).unwrap_err();
+        assert!(err.to_string().contains("10 bytes"), "{err}");
+    }
+
+    #[test]
+    fn format_size_uses_decimal_units() {
+        assert_eq!(format_size(999), "999 bytes");
+        assert_eq!(format_size(512_000), "512 KB");
+        assert_eq!(format_size(2_340_000), "2.3 MB");
     }
 
     // -----------------------------------------------------------------------
@@ -888,7 +1407,7 @@ mod tests {
 
         let mut p16 = Pipeline::new_from_file(&png).unwrap();
         p16.globals.settings.use_fastpath = false;
-        let out16 = render_16bit(&mut p16, &png, None, false).unwrap();
+        let out16 = render_16bit(&mut p16, None, false, None).unwrap();
 
         let (m8, m16) = (mean_u8(&out8.data), mean_u16_as_u8(out16.as_raw()));
         assert!(
@@ -905,7 +1424,7 @@ mod tests {
         let png = write_gradient_png(tmp.path());
 
         let mut p16 = Pipeline::new_from_file(&png).unwrap();
-        let out16 = render_16bit(&mut p16, &png, None, false).unwrap();
+        let out16 = render_16bit(&mut p16, None, false, None).unwrap();
         let expected = image::open(&png).unwrap().to_rgb16();
         assert_eq!(out16.as_raw(), expected.as_raw());
     }
@@ -942,6 +1461,124 @@ mod tests {
         assert_eq!(trim_fast_edge(make_8bit_image(10, 6), Some(8), true).dimensions(), (10, 6));
     }
 
+    #[test]
+    fn temp_file_guard_registers_only_files_in_use() {
+        // Other tests run in parallel and register their own files, so this
+        // test checks its own paths only and never removes the whole list.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let in_use = tmp.path().join(".a.jpg.rawdog-tmp");
+        let finished = tmp.path().join(".b.jpg.rawdog-tmp");
+        let active = || ACTIVE_TEMP_FILES.lock().unwrap().clone();
+
+        let _guard = TempFileGuard::register(&in_use);
+        drop(TempFileGuard::register(&finished));
+        assert!(active().contains(&in_use));
+        assert!(!active().contains(&finished));
+
+        std::fs::write(&in_use, b"x").unwrap();
+        remove_files(std::slice::from_ref(&in_use));
+        assert!(!in_use.exists());
+    }
+
+    #[test]
+    fn copy_original_copies_bytes_and_modification_time() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let input = tmp.path().join("DSC1.ARW");
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&input, &data).unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options().write(true).open(&input).unwrap().set_modified(old).unwrap();
+
+        let output = tmp.path().join("2023/11/DSC1.ARW");
+        copy_original(&input, &output, false).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), data);
+        assert_eq!(std::fs::metadata(&output).unwrap().modified().unwrap(), old);
+        assert_eq!(std::fs::read(&input).unwrap(), data, "source changed");
+        assert!(!temp_path_for(&output).exists());
+    }
+
+    #[test]
+    fn copy_original_copies_sidecars_in_both_naming_styles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let input = tmp.path().join("DSC1.ARW");
+        std::fs::write(&input, b"raw").unwrap();
+        std::fs::write(tmp.path().join("DSC1.xmp"), b"lightroom").unwrap();
+        std::fs::write(tmp.path().join("DSC1.ARW.xmp"), b"darktable").unwrap();
+
+        let out_dir = tmp.path().join("archive");
+        let output = out_dir.join("2024-01-01_DSC1.ARW");
+        // A sidecar that already exists at the destination is kept.
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("2024-01-01_DSC1.ARW.xmp"), b"newer edits").unwrap();
+
+        copy_original(&input, &output, false).unwrap();
+        assert_eq!(std::fs::read(out_dir.join("2024-01-01_DSC1.xmp")).unwrap(), b"lightroom");
+        assert_eq!(
+            std::fs::read(out_dir.join("2024-01-01_DSC1.ARW.xmp")).unwrap(),
+            b"newer edits"
+        );
+    }
+
+    #[test]
+    fn copy_original_copies_camera_jpegs_only_when_asked() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let input = tmp.path().join("DSC1.ARW");
+        std::fs::write(&input, b"raw").unwrap();
+        std::fs::write(tmp.path().join("DSC1.JPG"), b"jpeg").unwrap();
+        std::fs::write(tmp.path().join("DSC1.HIF"), b"heif").unwrap();
+        std::fs::write(tmp.path().join("DSC10.JPG"), b"other frame").unwrap();
+        std::fs::write(tmp.path().join("DSC1.txt"), b"not an image").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(tmp.path().join("DSC1.JPG"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let out = tmp.path().join("plain");
+        copy_original(&input, &out.join("x.ARW"), false).unwrap();
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
+
+        let out = tmp.path().join("archive");
+        // A JPEG of another image at the destination is replaced.
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("2024_DSC1.JPG"), b"another image").unwrap();
+        copy_original(&input, &out.join("2024_DSC1.ARW"), true).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["2024_DSC1.ARW", "2024_DSC1.HIF", "2024_DSC1.JPG"]);
+        let copied = out.join("2024_DSC1.JPG");
+        assert_eq!(std::fs::read(&copied).unwrap(), b"jpeg");
+        assert_eq!(std::fs::metadata(&copied).unwrap().modified().unwrap(), old);
+
+        // Without `replace`, a missing companion is added and an existing
+        // one is kept.
+        std::fs::remove_file(out.join("2024_DSC1.HIF")).unwrap();
+        std::fs::write(&copied, b"kept").unwrap();
+        copy_companions(&input, &out.join("2024_DSC1.ARW"), false).unwrap();
+        assert_eq!(std::fs::read(out.join("2024_DSC1.HIF")).unwrap(), b"heif");
+        assert_eq!(std::fs::read(&copied).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn same_contents_detects_a_difference() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (a, b, c) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("c"));
+        std::fs::write(&a, vec![7u8; 2_500_000]).unwrap();
+        std::fs::write(&b, vec![7u8; 2_500_000]).unwrap();
+        let mut changed = vec![7u8; 2_500_000];
+        changed[2_400_000] = 8;
+        std::fs::write(&c, changed).unwrap();
+        assert!(same_contents(&a, &b).unwrap());
+        assert!(!same_contents(&a, &c).unwrap());
+        std::fs::write(&c, vec![7u8; 10]).unwrap();
+        assert!(!same_contents(&a, &c).unwrap());
+    }
+
     // -----------------------------------------------------------------------
     // decoder result checks
     // -----------------------------------------------------------------------
@@ -965,6 +1602,18 @@ mod tests {
             orientation: rawloader::Orientation::Normal,
             data: rawloader::RawImageData::Integer(data),
         }
+    }
+
+    #[test]
+    fn scale_raw_samples_scales_the_light_above_the_black_level() {
+        let mut raw = raw_image(vec![512, 1512, 4512, 100], 15360);
+        raw.blacklevels = [512; 4];
+        scale_raw_samples(&mut raw, 0.25);
+        let rawloader::RawImageData::Integer(data) = raw.data else {
+            unreachable!()
+        };
+        // Black stays black; light is quartered; below black stays at black.
+        assert_eq!(data, vec![512, 762, 1512, 512]);
     }
 
     #[test]
@@ -1002,12 +1651,16 @@ mod tests {
         ConvertOptions {
             format: crate::OutputFormat::Jpeg,
             quality: 92,
+            max_bytes: None,
             resize,
+            aspect: None,
             fast: false,
             exposure: None,
             white_balance: None,
             sharpen: None,
             preview: true,
+            watermark: None,
+            with_jpeg: false,
             metadata: Default::default(),
         }
     }
@@ -1015,14 +1668,14 @@ mod tests {
     #[test]
     fn preview_source_is_resized_for_8_bit_output() {
         let mut source = Source::Preview(make_8bit_image(400, 200));
-        let img = source.rgb8(Path::new("x.arw"), &preview_opts(Some(100))).unwrap();
+        let img = source.rgb8(&preview_opts(Some(100))).unwrap();
         assert_eq!(img.dimensions(), (100, 50));
     }
 
     #[test]
     fn preview_source_is_widened_for_16_bit_output() {
         let mut source = Source::Preview(ImageBuffer::from_pixel(8, 4, Rgb([0u8, 128, 255])));
-        let img = source.rgb16(Path::new("x.arw"), &preview_opts(None)).unwrap();
+        let img = source.rgb16(&preview_opts(None)).unwrap();
         assert_eq!(img.dimensions(), (8, 4));
         assert_eq!(img.get_pixel(0, 0), &Rgb([0u16, 128 * 257, 65535]));
     }
@@ -1128,12 +1781,16 @@ mod tests {
             &ConvertOptions {
                 format: crate::OutputFormat::Jpeg,
                 quality: 92,
+                max_bytes: None,
                 resize: None,
+                aspect: None,
                 fast: false,
                 exposure: None,
                 white_balance: None,
                 sharpen: None,
                 preview: false,
+                watermark: None,
+                with_jpeg: false,
                 metadata: Default::default(),
             },
         );
@@ -1152,12 +1809,16 @@ mod tests {
             &ConvertOptions {
                 format: crate::OutputFormat::Jpeg,
                 quality: 92,
+                max_bytes: None,
                 resize: None,
+                aspect: None,
                 fast: false,
                 exposure: None,
                 white_balance: None,
                 sharpen: None,
                 preview: false,
+                watermark: None,
+                with_jpeg: false,
                 metadata: Default::default(),
             },
         );

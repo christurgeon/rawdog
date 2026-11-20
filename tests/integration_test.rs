@@ -684,13 +684,443 @@ fn cli_preview_conflicts_with_development_options() {
 }
 
 #[test]
-fn cli_preview_fails_cleanly_for_a_file_without_a_preview() {
+fn cli_output_carries_an_srgb_icc_profile_in_every_format() {
     let tmp = TempDir::new().unwrap();
     let input = tmp.path().join("in.png");
     write_png(&input, [1, 2, 3]);
-    let output = run(&[input.as_ref(), "--preview".as_ref()]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("preview"), "got: {stderr}");
-    assert!(!output.status.success());
+    let out = tmp.path().join("out");
+    for format in ["jpeg", "png", "tiff"] {
+        let output = run(&[input.as_ref(), "-o".as_ref(), out.as_ref(), "-f".as_ref(), format.as_ref()]);
+        assert!(output.status.success(), "{format}");
+    }
+    for name in ["in.jpg", "in.png", "in.tiff"] {
+        let bytes = fs::read(out.join(name)).unwrap();
+        // Every ICC profile carries the signature "acsp" in its header. PNG
+        // stores the profile compressed, in an iCCP chunk.
+        let marker: &[u8] = if name.ends_with(".png") { b"iCCP" } else { b"acsp" };
+        assert!(bytes.windows(4).any(|w| w == marker), "{name}: no ICC profile");
+    }
+}
+
+#[test]
+fn cli_min_rating_uses_sidecar_files_and_lists_exclusions_in_dry_run() {
+    let tmp = TempDir::new().unwrap();
+    for (name, rating) in [("keep", Some(4)), ("drop", Some(1)), ("none", None)] {
+        write_png(&tmp.path().join(format!("{name}.png")), [1, 2, 3]);
+        if let Some(r) = rating {
+            let xmp = format!("<x:xmpmeta><rdf:Description xmp:Rating=\"{r}\"/></x:xmpmeta>");
+            fs::write(tmp.path().join(format!("{name}.xmp")), xmp).unwrap();
+        }
+    }
+    let inputs: Vec<std::path::PathBuf> = ["keep", "drop", "none"]
+        .iter()
+        .map(|n| tmp.path().join(format!("{n}.png")))
+        .collect();
+    let out = tmp.path().join("out");
+    let mut args: Vec<&std::ffi::OsStr> = inputs.iter().map(|p| p.as_os_str()).collect();
+    args.extend(["--min-rating", "3", "-o"].iter().map(|a| a.as_ref() as &std::ffi::OsStr));
+    args.push(out.as_os_str());
+
+    let mut dry = args.clone();
+    dry.push("-n".as_ref());
+    let stdout = String::from_utf8_lossy(&run(&dry).stdout).to_string();
+    assert!(stdout.contains("exclude") && stdout.contains("drop.png (rating 1)"), "{stdout}");
+    assert!(stdout.contains("none.png (no rating)"), "{stdout}");
+
+    let output = run(&args);
+    assert!(output.status.success());
+    assert!(out.join("keep.jpg").is_file());
+    assert!(!out.join("drop.jpg").exists());
+    assert!(!out.join("none.jpg").exists());
+}
+
+#[test]
+fn cli_selection_that_matches_nothing_is_not_an_error() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [1, 2, 3]);
+    let output = run(&[input.as_ref(), "--camera".as_ref(), "Z 9".as_ref()]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No RAW files match"), "{stdout}");
     assert!(!tmp.path().join("in.jpg").exists());
+}
+
+#[test]
+fn cli_since_rejects_a_bad_date() {
+    let output = run(&["--since".as_ref(), "14/11/2026".as_ref(), "/tmp/fake.arw".as_ref()]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn cli_report_lists_every_file_with_its_result() {
+    let tmp = TempDir::new().unwrap();
+    let good = tmp.path().join("good.png");
+    write_png(&good, [1, 2, 3]);
+    let bad = tmp.path().join("bad.arw");
+    fs::write(&bad, b"not a raw file").unwrap();
+    let csv = tmp.path().join("run.csv");
+    let json = tmp.path().join("run.json");
+
+    run(&[good.as_ref(), bad.as_ref(), "--report".as_ref(), csv.as_ref()]);
+    let text = fs::read_to_string(&csv).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "input,output,status,message,seconds");
+    assert!(lines.iter().any(|l| l.contains("bad.arw") && l.contains(",failed,")), "{text}");
+    assert!(lines.iter().any(|l| l.contains("good.png") && l.contains(",converted,")), "{text}");
+
+    // Second run: the good file is skipped because its output exists.
+    run(&[good.as_ref(), "--report".as_ref(), json.as_ref()]);
+    let text = fs::read_to_string(&json).unwrap();
+    assert!(text.contains(r#""status": "skipped""#), "{text}");
+}
+
+#[test]
+fn cli_original_copies_files_into_the_name_layout() {
+    let tmp = TempDir::new().unwrap();
+    let card = tmp.path().join("card");
+    fs::create_dir(&card).unwrap();
+    fs::write(card.join("DSC1.ARW"), b"raw bytes one").unwrap();
+    fs::write(card.join("DSC2.arw"), b"raw bytes two").unwrap();
+    let archive = tmp.path().join("archive");
+
+    let output = run(&[
+        card.as_ref(),
+        "-f".as_ref(),
+        "original".as_ref(),
+        "-o".as_ref(),
+        archive.as_ref(),
+        "--name".as_ref(),
+        "{date}/{stem}".as_ref(),
+    ]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fs::read(archive.join("unknown/DSC1.ARW")).unwrap(), b"raw bytes one");
+    assert_eq!(fs::read(archive.join("unknown/DSC2.arw")).unwrap(), b"raw bytes two");
+    // The card is unchanged.
+    assert_eq!(fs::read(card.join("DSC1.ARW")).unwrap(), b"raw bytes one");
+
+    // Running again skips the existing copies.
+    let output = run(&[card.as_ref(), "-f".as_ref(), "original".as_ref(), "-o".as_ref(), archive.as_ref(), "--name".as_ref(), "{date}/{stem}".as_ref()]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("0 succeeded, 0 failed, 2 skipped"));
+}
+
+#[test]
+fn cli_original_rejects_image_options() {
+    let output = run(&["-f".as_ref(), "original".as_ref(), "-r".as_ref(), "100".as_ref(), "/tmp/fake.arw".as_ref()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--resize"), "{stderr}");
+    assert!(!output.status.success());
+}
+
+#[test]
+fn cli_original_without_output_dir_refuses_to_copy_onto_itself() {
+    let tmp = TempDir::new().unwrap();
+    let raw = tmp.path().join("DSC1.ARW");
+    fs::write(&raw, b"raw").unwrap();
+    let output = run(&[raw.as_ref(), "-f".as_ref(), "original".as_ref(), "--overwrite".as_ref()]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("same file"));
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&raw).unwrap(), b"raw");
+}
+
+#[test]
+fn cli_gallery_lists_the_output_images() {
+    let tmp = TempDir::new().unwrap();
+    let card = tmp.path().join("card");
+    write_png(&card.join("one.png"), [1, 2, 3]);
+    write_png(&card.join("sub/two.png"), [4, 5, 6]);
+    let out = tmp.path().join("proofs");
+
+    // A directory scan picks up RAW files only, so the PNGs are given as
+    // files; the template puts them in subdirectories.
+    let output = run(&[
+        card.join("one.png").as_ref(),
+        card.join("sub/two.png").as_ref(),
+        "-o".as_ref(),
+        out.as_ref(),
+        "--name".as_ref(),
+        "day 1/{stem}".as_ref(),
+        "--gallery".as_ref(),
+    ]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let page = fs::read_to_string(out.join("gallery.html")).unwrap();
+    assert!(page.contains(r#"src="day%201/one.jpg""#), "{page}");
+    assert!(page.contains(r#"src="day%201/two.jpg""#), "{page}");
+    assert!(page.contains("2 images"));
+}
+
+#[test]
+fn cli_gallery_needs_an_output_directory_and_a_web_format() {
+    let output = run(&["--gallery".as_ref(), "/tmp/fake.arw".as_ref()]);
+    assert_eq!(output.status.code(), Some(2));
+    let output = run(&["--gallery".as_ref(), "-o".as_ref(), "/tmp/x".as_ref(), "-f".as_ref(), "tiff".as_ref(), "/tmp/fake.arw".as_ref()]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("JPEG or PNG"));
+}
+
+#[test]
+fn cli_selection_rejects_contradictory_or_empty_options() {
+    let output = run(&[
+        "--since".as_ref(),
+        "2026-01-02".as_ref(),
+        "--until".as_ref(),
+        "2026-01-01".as_ref(),
+        "/tmp/fake.arw".as_ref(),
+    ]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--since"));
+    assert!(!output.status.success());
+
+    let output = run(&["--camera".as_ref(), "".as_ref(), "/tmp/fake.arw".as_ref()]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn cli_defaults_file_applies_and_can_be_overridden_or_skipped() {
+    let tmp = TempDir::new().unwrap();
+    let defaults = tmp.path().join("defaults");
+    fs::write(&defaults, "# test\n--artist Default Name\n--format png\n").unwrap();
+    let input = tmp.path().join("in.png");
+    write_png(&input, [1, 2, 3]);
+    let out = tmp.path().join("out");
+    let rawdog = |extra: &[&str]| {
+        Command::new(rawdog_bin())
+            .env("RAWDOG_DEFAULTS", &defaults)
+            .arg(&input)
+            .arg("-o")
+            .arg(&out)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+
+    // The default format applies: PNG output.
+    assert!(rawdog(&[]).status.success());
+    assert!(out.join("in.png").is_file());
+
+    // The command line wins over the defaults file.
+    assert!(rawdog(&["--format", "jpeg"]).status.success());
+    let file = fs::File::open(out.join("in.jpg")).unwrap();
+    let exif = exif::Reader::new()
+        .read_from_container(&mut std::io::BufReader::new(file))
+        .unwrap();
+    let artist = exif.get_field(exif::Tag::Artist, exif::In::PRIMARY).unwrap();
+    assert_eq!(artist.display_value().to_string(), "\"Default Name\"");
+
+    // --no-defaults ignores the file: JPEG, no artist.
+    fs::remove_file(out.join("in.jpg")).unwrap();
+    assert!(rawdog(&["--no-defaults"]).status.success());
+    let file = fs::File::open(out.join("in.jpg")).unwrap();
+    let exif = exif::Reader::new().read_from_container(&mut std::io::BufReader::new(file));
+    assert!(exif.map_or(true, |e| e.get_field(exif::Tag::Artist, exif::In::PRIMARY).is_none()));
+}
+
+#[test]
+fn cli_reports_a_bad_line_in_the_defaults_file() {
+    let tmp = TempDir::new().unwrap();
+    let defaults = tmp.path().join("defaults");
+    fs::write(&defaults, "--quality 90\nphoto.ARW\n").unwrap();
+    let output = Command::new(rawdog_bin())
+        .env("RAWDOG_DEFAULTS", &defaults)
+        .arg("/tmp/fake.arw")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("line 2"), "{stderr}");
+    assert!(!output.status.success());
+}
+
+/// A 256x256 image of noise, whose JPEG size depends strongly on quality.
+fn write_noise_png(path: &std::path::Path) {
+    let mut state = 12345u32;
+    let img = image::RgbImage::from_fn(256, 256, |_, _| {
+        state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        let v = (state >> 16) as u8;
+        image::Rgb([v, v.wrapping_mul(3), v.wrapping_add(90)])
+    });
+    img.save(path).unwrap();
+}
+
+#[test]
+fn cli_max_size_lowers_quality_until_the_file_fits() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("noise.png");
+    write_noise_png(&input);
+    let out_dir = tmp.path().join("out");
+
+    let output = run(&[input.as_ref(), "-o".as_ref(), out_dir.as_ref()]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let full = fs::metadata(out_dir.join("noise.jpg")).unwrap().len();
+
+    let limit = full / 3;
+    let output = run(&[
+        input.as_ref(),
+        "-o".as_ref(),
+        out_dir.as_ref(),
+        "--overwrite".as_ref(),
+        "--max-size".as_ref(),
+        limit.to_string().as_ref(),
+    ]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let fitted = fs::metadata(out_dir.join("noise.jpg")).unwrap().len();
+    assert!(fitted <= limit, "{fitted} > {limit}");
+    assert!(fitted > limit / 2, "quality lowered too far: {fitted} for {limit}");
+}
+
+#[test]
+fn cli_max_size_fails_when_lowest_quality_is_too_large() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("noise.png");
+    write_noise_png(&input);
+    let out_dir = tmp.path().join("out");
+    let output = run(&[
+        input.as_ref(),
+        "-o".as_ref(),
+        out_dir.as_ref(),
+        "--max-size".as_ref(),
+        "1KB".as_ref(),
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("larger than --max-size 1 KB"), "{stderr}");
+    assert!(files_under(&out_dir).is_empty(), "{:?}", files_under(&out_dir));
+}
+
+#[test]
+fn cli_max_size_needs_jpeg_output() {
+    let output = run(&["x.arw".as_ref(), "-f".as_ref(), "png".as_ref(), "--max-size".as_ref(), "2MB".as_ref()]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--max-size needs JPEG output"), "{stderr}");
+}
+
+#[test]
+fn cli_picks_converts_only_listed_files_and_warns_about_others() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("card");
+    fs::create_dir_all(&dir).unwrap();
+    for name in ["a", "b", "c"] {
+        image::RgbImage::from_pixel(64, 64, image::Rgb([100, 100, 100]))
+            .save(dir.join(format!("{name}.png")))
+            .unwrap();
+    }
+    let list = tmp.path().join("picks.txt");
+    fs::write(&list, "A.jpg, c.JPG\nmissing.jpg\n").unwrap();
+    let out_dir = tmp.path().join("out");
+    let inputs: Vec<_> = ["a", "b", "c"].iter().map(|n| dir.join(format!("{n}.png"))).collect();
+    let mut args: Vec<&std::ffi::OsStr> = inputs.iter().map(|p| p.as_os_str()).collect();
+    args.extend(["-o".as_ref(), out_dir.as_os_str(), "--picks".as_ref(), list.as_os_str()]);
+    let output = run(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let mut names: Vec<String> = files_under(&out_dir)
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["a.jpg", "c.jpg"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("1 name(s) in") && stderr.contains("match no RAW file: missing.jpg"), "{stderr}");
+}
+
+#[test]
+fn cli_picks_rejects_an_empty_list() {
+    let tmp = TempDir::new().unwrap();
+    let list = tmp.path().join("picks.txt");
+    fs::write(&list, " \n, \n").unwrap();
+    let output = run(&["x.arw".as_ref(), "--picks".as_ref(), list.as_ref()]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("names no files"));
+}
+
+#[test]
+fn cli_watermark_marks_the_bottom_right_corner() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("grey.png");
+    image::RgbImage::from_pixel(200, 100, image::Rgb([100, 100, 100]))
+        .save(&input)
+        .unwrap();
+    let mark = tmp.path().join("logo.png");
+    image::RgbaImage::from_pixel(20, 20, image::Rgba([255, 255, 255, 255]))
+        .save(&mark)
+        .unwrap();
+    let out_dir = tmp.path().join("out");
+    let output = run(&[
+        input.as_ref(),
+        "-o".as_ref(),
+        out_dir.as_ref(),
+        "--watermark".as_ref(),
+        mark.as_ref(),
+    ]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // The mark is 20x20 (a fifth of 100) with a margin of 3.
+    let img = image::open(out_dir.join("grey.jpg")).unwrap().into_rgb8();
+    assert!(img.get_pixel(200 - 3 - 10, 100 - 3 - 10)[0] > 240);
+    assert!(img.get_pixel(100, 50)[0] < 200);
+}
+
+#[test]
+fn cli_seq_refuses_to_skip_existing_outputs() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("a.png");
+    image::RgbImage::from_pixel(64, 64, image::Rgb([100, 100, 100]))
+        .save(&input)
+        .unwrap();
+    let out_dir = tmp.path().join("out");
+    let args = |extra: &[&str]| {
+        let mut all: Vec<std::ffi::OsString> =
+            vec![input.clone().into(), "-o".into(), out_dir.clone().into(), "--name".into(), "{seq}".into()];
+        all.extend(extra.iter().map(Into::into));
+        all
+    };
+    let run_with = |extra: &[&str]| {
+        let a = args(extra);
+        run(&a.iter().map(|s| s.as_os_str()).collect::<Vec<_>>())
+    };
+    assert!(run_with(&[]).status.success());
+    assert!(out_dir.join("0001.jpg").exists());
+
+    let again = run_with(&[]);
+    assert!(!again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("1 output file(s) already exist"));
+    assert!(run_with(&["--overwrite"]).status.success());
+}
+
+#[test]
+fn cli_files_from_standard_input_forms_one_run() {
+    use std::io::Write as _;
+    let tmp = TempDir::new().unwrap();
+    let mut list = String::new();
+    for name in ["a one.png", "b.png"] {
+        let path = tmp.path().join(name);
+        image::RgbImage::from_pixel(64, 64, image::Rgb([90, 90, 90])).save(&path).unwrap();
+        list.push_str(&format!("{}\n", path.display()));
+    }
+    let out_dir = tmp.path().join("out");
+    let mut child = Command::new(rawdog_bin())
+        .args(["--files-from", "-", "--name", "{seq}", "-o"])
+        .arg(&out_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(list.as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let mut names: Vec<String> = files_under(&out_dir)
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["0001.jpg", "0002.jpg"]);
+}
+
+#[test]
+fn cli_preview_develops_a_file_without_a_preview() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("grey.png");
+    image::RgbImage::from_pixel(64, 64, image::Rgb([100, 100, 100])).save(&input).unwrap();
+    let out_dir = tmp.path().join("out");
+    let output = run(&[input.as_ref(), "--preview".as_ref(), "-o".as_ref(), out_dir.as_ref()]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(out_dir.join("grey.jpg").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("developing the RAW data instead"));
 }
