@@ -168,8 +168,10 @@ Each copy is compared byte for byte with the original and keeps its modification
 Camera, lens, exposure, and date metadata are copied to JPEG, PNG, and TIFF output. For the web, remove the location and add your name:
 
 ```sh
-rawdog ./trip -r 2048 --strip-gps --artist "J. Doe" --copyright "(c) 2026 J. Doe"
+rawdog ./trip -r 2048 --strip-gps --artist "J. Doe" --copyright "(c) {year} J. Doe"
 ```
+
+`{year}` in `--copyright` becomes the year the photo was taken (after `--time-shift`), so a defaults file stays right in a new year and for old shoots. A file without a capture date gets the current year.
 
 `--strip-metadata` copies no metadata at all.
 
@@ -193,7 +195,7 @@ Options you use every time can go in `~/.config/rawdog/defaults`, one per line. 
 
 ```
 # ~/.config/rawdog/defaults
---copyright (c) 2026 J. Doe
+--copyright (c) {year} J. Doe
 --artist J. Doe
 --strip-gps
 --sharpen 0.5

@@ -170,7 +170,8 @@ struct Cli {
     #[arg(long, value_name = "NAME")]
     artist: Option<String>,
 
-    /// Set the EXIF Copyright tag in every output file
+    /// Set the EXIF Copyright tag in every output file. {year} becomes the
+    /// capture year, as in "(c) {year} J. Doe"
     #[arg(long, value_name = "TEXT")]
     copyright: Option<String>,
 
