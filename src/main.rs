@@ -77,10 +77,10 @@ struct Cli {
     seq_start: u32,
 
     /// Largest gap in seconds between two frames of one {burst} or of one
-    /// group for --burst-pick
-    #[arg(long, value_name = "SECONDS", default_value_t = 2,
-          value_parser = clap::value_parser!(u32).range(0..=3600))]
-    burst_gap: u32,
+    /// group for --burst-pick, such as 0.3 for a 20 fps burst
+    #[arg(long, value_name = "SECONDS", default_value_t = 2.0,
+          value_parser = float_in_range::<0, 3600>)]
+    burst_gap: f32,
 
     /// Keep one frame of each burst or exposure bracket. "ev0" keeps the
     /// frame with the exposure compensation closest to 0, the normal
@@ -571,11 +571,11 @@ enum BurstPick {
 
 /// For `--burst-pick ev0`: the index of the frame to keep in each burst,
 /// as a flag per file. Ties go to the earlier frame, then the path.
-fn burst_keepers(files: &[InputFile], infos: &[naming::NameInfo], gap: u32) -> Vec<bool> {
+fn burst_keepers(files: &[InputFile], infos: &[naming::NameInfo], gap: f64) -> Vec<bool> {
     let bursts = burst_numbers(files, infos, gap);
     let score = |i: usize| {
         let bias = infos[i].exposure.bias.map_or(f64::INFINITY, f64::abs);
-        (bias, infos[i].taken, &files[i].path)
+        (bias, infos[i].time_ms(), &files[i].path)
     };
     let mut best: HashMap<&str, usize> = HashMap::new();
     for (i, burst) in bursts.iter().enumerate() {
@@ -1019,7 +1019,7 @@ fn main() -> Result<()> {
     }
     let template = cli.name.clone().map(|mut t| {
         t.seq_start = cli.seq_start;
-        t.burst_gap = cli.burst_gap;
+        t.burst_gap = f64::from(cli.burst_gap);
         t
     });
 
@@ -1088,8 +1088,9 @@ fn main() -> Result<()> {
 
     // --burst-pick: one frame of each burst or bracket.
     let files = if cli.burst_pick.is_some() {
-        let keep = burst_keepers(&files, &infos, cli.burst_gap);
-        let bursts = burst_numbers(&files, &infos, cli.burst_gap);
+        let gap = f64::from(cli.burst_gap);
+        let keep = burst_keepers(&files, &infos, gap);
+        let bursts = burst_numbers(&files, &infos, gap);
         let kept_name: HashMap<&str, String> = (0..files.len())
             .filter(|&i| keep[i])
             .map(|i| {
@@ -1763,7 +1764,7 @@ fn input_list(text: &str) -> Vec<PathBuf> {
 /// by path, and files without one come last.
 fn sequence_numbers(files: &[InputFile], infos: &[naming::NameInfo], start: u32) -> Vec<String> {
     let mut order: Vec<usize> = (0..files.len()).collect();
-    order.sort_by_key(|&i| (infos[i].taken.is_none(), infos[i].taken, &files[i].path));
+    order.sort_by_key(|&i| (infos[i].taken.is_none(), infos[i].time_ms(), &files[i].path));
     let last = u64::from(start) + files.len() as u64 - 1;
     let width = last.to_string().len().max(4);
     let mut seqs = vec![String::new(); files.len()];
@@ -1776,15 +1777,16 @@ fn sequence_numbers(files: &[InputFile], infos: &[naming::NameInfo], start: u32)
 /// The `{burst}` value of each file: bursts are numbered from 1 in capture
 /// order, and a frame taken more than `gap` seconds after the one before
 /// starts a new burst. A file without a capture time is a burst of its own.
-fn burst_numbers(files: &[InputFile], infos: &[naming::NameInfo], gap: u32) -> Vec<String> {
+fn burst_numbers(files: &[InputFile], infos: &[naming::NameInfo], gap: f64) -> Vec<String> {
+    let gap_ms = (gap * 1000.0).round() as i64;
     let mut order: Vec<usize> = (0..files.len()).collect();
-    order.sort_by_key(|&i| (infos[i].taken.is_none(), infos[i].taken, &files[i].path));
+    order.sort_by_key(|&i| (infos[i].taken.is_none(), infos[i].time_ms(), &files[i].path));
     let mut numbers = vec![0usize; files.len()];
     let mut burst = 0;
     let mut previous: Option<i64> = None;
     for &i in &order {
-        let time = infos[i].taken.map(timeshift::to_seconds);
-        let joins = matches!((previous, time), (Some(p), Some(t)) if t - p <= i64::from(gap));
+        let time = infos[i].time_ms();
+        let joins = matches!((previous, time), (Some(p), Some(t)) if t - p <= gap_ms);
         if !joins {
             burst += 1;
         }
@@ -2283,9 +2285,9 @@ mod tests {
             naming::NameInfo::default(),
         ];
         // 0, 1, 3 are one burst (gaps of 1 and 2 s); 10 and 30 stand alone.
-        assert_eq!(burst_numbers(&files, &infos, 2), ["0003", "0001", "0001", "0001", "0002", "0004"]);
+        assert_eq!(burst_numbers(&files, &infos, 2.0), ["0003", "0001", "0001", "0001", "0002", "0004"]);
         // With no gap allowed, every frame in a different second stands alone.
-        assert_eq!(burst_numbers(&files, &infos, 0), ["0005", "0001", "0002", "0003", "0004", "0006"]);
+        assert_eq!(burst_numbers(&files, &infos, 0.0), ["0005", "0001", "0002", "0003", "0004", "0006"]);
     }
 
     #[test]
@@ -2306,7 +2308,22 @@ mod tests {
             frame(30, None),
             frame(31, None),
         ];
-        assert_eq!(burst_keepers(&files, &infos, 2), [false, true, false, true, false]);
+        assert_eq!(burst_keepers(&files, &infos, 2.0), [false, true, false, true, false]);
+    }
+
+    #[test]
+    fn bursts_split_within_a_second_with_subsecond_times() {
+        let file = |p: &str| InputFile { path: PathBuf::from(p), rel_dir: PathBuf::new() };
+        let at = |ms: u16| naming::NameInfo {
+            taken: Some((2026, 11, 14, 10, 0, 5)),
+            subsec_ms: Some(ms),
+            ..Default::default()
+        };
+        // 20 fps frames 50 ms apart, then a pause of 600 ms.
+        let files = [file("d"), file("a"), file("b"), file("c")];
+        let infos = [at(750), at(0), at(50), at(100)];
+        assert_eq!(burst_numbers(&files, &infos, 0.3), ["0002", "0001", "0001", "0001"]);
+        assert_eq!(sequence_numbers(&files, &infos, 1), ["0004", "0001", "0002", "0003"]);
     }
 
     #[test]
