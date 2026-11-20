@@ -149,7 +149,7 @@ rawdog -R /Volumes/CARD_A /Volumes/CARD_B -o ./wedding --name "{date}/{seq}_{ste
 
 Offsets use `d`, `h`, `m`, and `s`, such as `-1d`, `+30m`, or `+1h2m5s`. A camera model matches like `--camera`; a camera that no rule names is not shifted, unless one offset is given without a model. The corrected time is used by the template, `--since`, `--until`, and the gallery, and replaces the capture dates in the output metadata. With `-f original` the RAW files are copied unchanged; only their names use the corrected time.
 
-The numbers depend on which files the run converts: the same selection gives the same numbers, but adding files to a later run renumbers the files taken after them.
+The numbers depend on which files the run converts, so adding files to a later run renumbers the files taken after them. For that reason a `{seq}` run refuses to start when any of its output files exists; use `--overwrite` to replace them, or write to an empty directory.
 
 The template path is below the `-o` directory. Without `-o` it is below the directory of each input file. With a template, `-R` does not mirror the input tree, so include `{date}` or another field that keeps equal file names apart.
 

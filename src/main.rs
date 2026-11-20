@@ -91,7 +91,7 @@ struct Cli {
     /// Correct a camera clock that was set wrong: "+1h", "-30m", "+3m12s",
     /// or per camera model "7M4=+3m12s,Z 6=-1h". Changes the capture time
     /// used by --name, --since, --until, and --gallery, and the dates in the
-    /// output metadata
+    /// metadata of converted images (-f original copies files unchanged)
     #[arg(long, value_name = "OFFSET", allow_hyphen_values = true)]
     time_shift: Option<timeshift::TimeShift>,
 
@@ -435,31 +435,47 @@ struct Picks {
 }
 
 impl Picks {
-    fn parse(text: &str) -> Picks {
-        let names = text
-            .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
-            .filter(|n| !n.is_empty())
-            // A name copied from a path or a URL keeps only its last part.
-            .map(|n| n.rsplit(['/', '\\']).next().unwrap_or(n))
-            .filter(|n| !n.is_empty())
-            .map(|n| {
-                let lower = n.to_lowercase();
-                // Only a short extension with a letter is removed, so that
-                // "IMG.0001" stays whole.
-                let bare = match lower.rsplit_once('.') {
-                    Some((stem, ext))
-                        if !stem.is_empty()
-                            && ext.len() <= 4
-                            && ext.chars().any(|c| c.is_ascii_alphabetic()) =>
-                    {
-                        stem.to_string()
-                    }
-                    _ => lower.clone(),
-                };
-                (n.to_string(), lower, bare)
-            })
-            .collect();
+    /// The parts of a list separated by lines, commas, or semicolons.
+    fn pieces(text: &str) -> impl Iterator<Item = &str> {
+        text.split(['\n', '\r', ',', ';']).map(str::trim).filter(|p| !p.is_empty())
+    }
+
+    /// Parse a list. A piece that names one of `stems` as a whole is one
+    /// name, so a file name with spaces (as the gallery lists it) works;
+    /// any other piece is split at spaces, as in "DSC1 DSC2 DSC3".
+    fn parse(text: &str, stems: &[String]) -> Picks {
+        let stems: HashSet<String> = stems.iter().map(|s| s.to_lowercase()).collect();
+        let mut names = Vec::new();
+        for piece in Self::pieces(text) {
+            let whole = Self::name(piece);
+            if stems.contains(&whole.1) || stems.contains(&whole.2) {
+                names.push(whole);
+            } else {
+                names.extend(piece.split_whitespace().map(Self::name));
+            }
+        }
         Picks { names }
+    }
+
+    /// A listed name as written, in lower case, and in lower case without
+    /// its extension.
+    fn name(n: &str) -> (String, String, String) {
+        // A name copied from a path or a URL keeps only its last part.
+        let n = n.rsplit(['/', '\\']).next().unwrap_or(n);
+        let lower = n.to_lowercase();
+        // Only a short extension with a letter is removed, so that
+        // "IMG.0001" stays whole.
+        let bare = match lower.rsplit_once('.') {
+            Some((stem, ext))
+                if !stem.is_empty()
+                    && ext.len() <= 4
+                    && ext.chars().any(|c| c.is_ascii_alphabetic()) =>
+            {
+                stem.to_string()
+            }
+            _ => lower.clone(),
+        };
+        (n.to_string(), lower, bare)
     }
 
     fn contains(&self, stem: &str) -> bool {
@@ -578,15 +594,14 @@ fn main() -> Result<()> {
         bail!("Output path {} exists and is not a directory.", dir.display());
     }
 
-    let picks = match &cli.picks {
+    let picks_text = match &cli.picks {
         Some(path) => {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read picks list {}", path.display()))?;
-            let picks = Picks::parse(&text);
-            if picks.names.is_empty() {
+            if Picks::pieces(&text).next().is_none() {
                 bail!("The picks list {} names no files.", path.display());
             }
-            Some(picks)
+            Some(text)
         }
         None => None,
     };
@@ -612,19 +627,19 @@ fn main() -> Result<()> {
         bail!("No RAW files found in the provided inputs.");
     }
 
+    let stems: Vec<String> = files
+        .iter()
+        .map(|f| f.path.file_stem().unwrap_or_default().to_string_lossy().into_owned())
+        .collect();
     let selection = Selection {
         min_rating: cli.min_rating,
         since: cli.since,
         until: cli.until,
         camera: cli.camera.clone(),
         labels: cli.label.iter().map(|l| l.trim().to_lowercase()).collect(),
-        picks,
+        picks: picks_text.as_deref().map(|text| Picks::parse(text, &stems)),
     };
     if let (Some(picks), Some(path)) = (&selection.picks, &cli.picks) {
-        let stems: Vec<String> = files
-            .iter()
-            .map(|f| f.path.file_stem().unwrap_or_default().to_string_lossy().into_owned())
-            .collect();
         let unmatched = picks.unmatched(&stems);
         if !unmatched.is_empty() {
             eprintln!(
@@ -688,6 +703,19 @@ fn main() -> Result<()> {
         cli.name.as_ref(),
         cli.time_shift.as_ref(),
     )?;
+
+    // {seq} numbers the files of each run anew, so an existing output may
+    // hold another input's image; skipping it would lose a file.
+    if cli.name.as_ref().is_some_and(|t| t.uses_seq()) && !cli.overwrite {
+        let existing = jobs.iter().filter(|(_, output)| output.exists()).count();
+        if existing > 0 {
+            bail!(
+                "{existing} output file(s) already exist. {{seq}} numbers the files of each run \
+                 anew, so an existing file may hold another image. Use --overwrite to replace \
+                 them, or write to an empty directory."
+            );
+        }
+    }
 
     let dir_names = DirNames::default();
 
@@ -1541,7 +1569,7 @@ mod tests {
 
     #[test]
     fn picks_parse_names_in_any_list_form() {
-        let picks = Picks::parse("DSC01234.jpg, dsc01300\r\nproofs/DSC01400.JPG;  IMG.0001\n\n");
+        let picks = Picks::parse("DSC01234.jpg, dsc01300\r\nproofs/DSC01400.JPG;  IMG.0001\n\n", &[]);
         for stem in ["DSC01234", "DSC01300", "dsc01400", "IMG.0001"] {
             assert!(picks.contains(stem), "{stem}");
         }
@@ -1550,8 +1578,17 @@ mod tests {
     }
 
     #[test]
+    fn picks_keep_a_file_name_with_spaces_whole() {
+        let stems = ["IMG 1".to_string(), "DSC2".to_string(), "DSC3".to_string()];
+        let picks = Picks::parse("IMG 1.CR3\nDSC2 DSC3\nIMG 9.CR3", &stems);
+        assert!(picks.contains("IMG 1") && picks.contains("DSC2") && picks.contains("DSC3"));
+        assert!(!picks.contains("IMG 9"));
+        assert_eq!(picks.unmatched(&stems), vec!["IMG", "9.CR3"]);
+    }
+
+    #[test]
     fn picks_report_unmatched_names_once() {
-        let picks = Picks::parse("DSC1.jpg DSC2 dsc2.JPG DSC3");
+        let picks = Picks::parse("DSC1.jpg DSC2 dsc2.JPG DSC3", &[]);
         let stems = ["dsc1".to_string(), "DSC9".to_string()];
         assert_eq!(picks.unmatched(&stems), vec!["DSC2", "DSC3"]);
     }
@@ -1559,7 +1596,7 @@ mod tests {
     #[test]
     fn selection_by_picks() {
         let sel = Selection {
-            picks: Some(Picks::parse("x.jpg")),
+            picks: Some(Picks::parse("x.jpg", &[])),
             ..selection()
         };
         assert!(sel.exclusion(&info(None, None, None)).is_none());
