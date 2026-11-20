@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use image::codecs::jpeg::JpegEncoder;
 use image::ImageEncoder;
 use image::codecs::png::PngEncoder;
@@ -36,6 +36,8 @@ pub struct ConvertOptions {
     /// White balance as (colour temperature in kelvin, tint). Replaces the
     /// as-shot white balance.
     pub white_balance: Option<(f32, f32)>,
+    /// White balance multipliers taken from a reference file.
+    pub wb_from: Option<std::sync::Arc<WhiteBalanceReference>>,
     /// Strength of output sharpening, applied after the resize.
     pub sharpen: Option<f32>,
     /// Use the JPEG preview that the camera embedded in the RAW file
@@ -59,6 +61,26 @@ pub enum Look {
     /// imagepipe's base curve alone: darker and flatter, with more room for
     /// editing afterwards.
     Flat,
+}
+
+/// The as-shot white balance of one RAW file, applied to other files of the
+/// same camera model so that a sequence does not flicker.
+pub struct WhiteBalanceReference {
+    coeffs: [f32; 4],
+    model: String,
+}
+
+/// Read the white balance of `path`. This decodes the file once.
+pub fn white_balance_reference(path: &Path) -> Result<WhiteBalanceReference> {
+    let pipeline = open_pipeline(path)
+        .with_context(|| format!("Failed to read --wb-from file {}", path.display()))?;
+    let ImageSource::Raw(raw) = &pipeline.globals.image else {
+        bail!("--wb-from file {} is not a RAW file", path.display());
+    };
+    Ok(WhiteBalanceReference {
+        coeffs: pipeline.ops.tolab.wb_coeffs,
+        model: raw.clean_model.clone(),
+    })
 }
 
 /// Convert a single ARW file to the specified output format.
@@ -121,6 +143,22 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
             let curve = &mut pipeline.ops.basecurve;
             curve.points = camera_look_curve(&curve.get_spline());
         }
+        if let Some(reference) = &opts.wb_from {
+            // Multipliers are specific to a sensor.
+            let model = match &pipeline.globals.image {
+                ImageSource::Raw(raw) => raw.clean_model.as_str(),
+                ImageSource::Other(_) => "",
+            };
+            if model != reference.model {
+                bail!(
+                    "taken with {}, but the --wb-from file with {}; white balance multipliers \
+                     differ between camera models",
+                    if model.is_empty() { "no known camera" } else { model },
+                    reference.model
+                );
+            }
+            pipeline.ops.tolab.wb_coeffs = reference.coeffs;
+        }
         match (exposure, &mut pipeline.globals.image) {
             // Darkening is exact as a gain on the RAW samples: colour and
             // lightness scale together. The curve changes lightness only,
@@ -155,7 +193,7 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
             let mut out = std::io::BufWriter::new(file);
             match format {
                 OutputFormat::Jpeg => {
-                    let mut img = source.rgb8(input, opts)?;
+                    let mut img = source.rgb8(opts)?;
                     if let Some(mark) = &opts.watermark {
                         apply_watermark(&mut img, mark);
                     }
@@ -163,7 +201,7 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
                     out.write_all(&bytes).with_context(unwritable)?;
                 }
                 OutputFormat::Tiff => {
-                    let mut img = source.rgb16(input, opts)?;
+                    let mut img = source.rgb16(opts)?;
                     if let Some(mark) = &opts.watermark {
                         apply_watermark(&mut img, mark);
                     }
@@ -171,7 +209,7 @@ pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result
                 }
                 OutputFormat::Original => unreachable!("handled by copy_original"),
                 OutputFormat::Png => {
-                    let mut img = source.rgb16(input, opts)?;
+                    let mut img = source.rgb16(opts)?;
                     if let Some(mark) = &opts.watermark {
                         apply_watermark(&mut img, mark);
                     }
@@ -199,9 +237,9 @@ enum Source {
 
 impl Source {
     /// The final 8-bit image: resized and sharpened.
-    fn rgb8(&mut self, input: &Path, opts: &ConvertOptions) -> Result<RgbImage> {
+    fn rgb8(&mut self, opts: &ConvertOptions) -> Result<RgbImage> {
         match self {
-            Source::Developed(pipeline) => render_8bit(pipeline, input, opts),
+            Source::Developed(pipeline) => render_8bit(pipeline, opts),
             Source::Preview(img) => {
                 let img = crop_to_aspect(std::mem::take(img), opts.aspect);
                 let mut img = maybe_resize_8bit(img, opts.resize);
@@ -214,13 +252,9 @@ impl Source {
     }
 
     /// The final 16-bit image: resized and sharpened.
-    fn rgb16(
-        &mut self,
-        input: &Path,
-        opts: &ConvertOptions,
-    ) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
+    fn rgb16(&mut self, opts: &ConvertOptions) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
         match self {
-            Source::Developed(pipeline) => render_16bit_sharpened(pipeline, input, opts),
+            Source::Developed(pipeline) => render_16bit_sharpened(pipeline, opts),
             Source::Preview(img) => {
                 let wide = image::DynamicImage::ImageRgb8(std::mem::take(img)).into_rgb16();
                 let mut img = maybe_resize_16bit(crop_to_aspect(wide, opts.aspect), opts.resize);
@@ -309,9 +343,7 @@ fn open_pipeline(input: &Path) -> Result<Pipeline> {
                     // Both decoders give long messages; one line is enough.
                     let detail = |e: &str| e.lines().next().unwrap_or_default().to_string();
                     anyhow!(
-                        "Cannot decode {}: the file is corrupt or its format is not supported \
-                         ({}; {})",
-                        input.display(),
+                        "the file is corrupt or its format is not supported ({}; {})",
                         detail(&new_decoder),
                         detail(&old_decoder.to_string())
                     )
@@ -324,13 +356,11 @@ fn open_pipeline(input: &Path) -> Result<Pipeline> {
     }
     if let Some(problem) = implausible_samples(&raw) {
         return Err(anyhow!(
-            "Cannot decode {}: the decoder returned invalid data ({problem}); \
-             this format variant is not supported",
-            input.display()
+            "the decoder returned invalid data ({problem}); this format variant is not supported"
         ));
     }
     Pipeline::new_from_source(ImageSource::Raw(raw))
-        .map_err(|e| anyhow!("Failed to create pipeline for {}: {}", input.display(), e))
+        .map_err(|e| anyhow!("cannot set up processing: {e}"))
 }
 
 /// A reason to reject the decoded samples, if many of them are far above the
@@ -589,10 +619,7 @@ fn copy_original(input: &Path, output: &Path, with_jpeg: bool) -> Result<()> {
         }
         drop(copy);
         if !same_contents(input, &tmp)? {
-            return Err(anyhow!(
-                "The copy of {} differs from the original; the disk may be failing",
-                input.display()
-            ));
+            return Err(anyhow!("the copy differs from the original; the disk may be failing"));
         }
         std::fs::rename(&tmp, output).with_context(unwritable)
     })();
@@ -640,7 +667,7 @@ pub fn copy_companions(input: &Path, output: &Path, replace: bool) -> Result<()>
             continue;
         }
         copy_verified(&source, &destination, true).map_err(|e| {
-            anyhow!("Copied {} but not {}: {e:#}", input.display(), source.display())
+            anyhow!("copied the RAW file but not {}: {e:#}", source.display())
         })?;
     }
     Ok(())
@@ -692,11 +719,7 @@ fn copy_sidecars(input: &Path, output: &Path) -> Result<()> {
             continue;
         }
         if let Err(e) = copy_verified(&source, &destination, false) {
-            return Err(anyhow!(
-                "Copied {} but not its sidecar {}: {e:#}",
-                input.display(),
-                source.display()
-            ));
+            return Err(anyhow!("copied the RAW file but not its sidecar {}: {e:#}", source.display()));
         }
     }
     Ok(())
@@ -769,10 +792,10 @@ fn temp_path_for(output: &Path) -> PathBuf {
     output.with_file_name(format!(".{name}.rawdog-tmp"))
 }
 
-fn render_8bit(pipeline: &mut Pipeline, input: &Path, opts: &ConvertOptions) -> Result<RgbImage> {
+fn render_8bit(pipeline: &mut Pipeline, opts: &ConvertOptions) -> Result<RgbImage> {
     let decoded = pipeline
         .output_8bit(None)
-        .map_err(|e| anyhow!("Failed to process {}: {}", input.display(), e))?;
+        .map_err(|e| anyhow!("processing failed: {e}"))?;
 
     let width = decoded.width as u32;
     let height = decoded.height as u32;
@@ -789,12 +812,8 @@ fn render_8bit(pipeline: &mut Pipeline, input: &Path, opts: &ConvertOptions) -> 
     Ok(img)
 }
 
-fn render_16bit_sharpened(
-    pipeline: &mut Pipeline,
-    input: &Path,
-    opts: &ConvertOptions,
-) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
-    let mut img = render_16bit(pipeline, input, opts.resize, opts.fast, opts.aspect)?;
+fn render_16bit_sharpened(pipeline: &mut Pipeline, opts: &ConvertOptions) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>> {
+    let mut img = render_16bit(pipeline, opts.resize, opts.fast, opts.aspect)?;
     if let Some(amount) = opts.sharpen {
         sharpen(&mut img, amount);
     }
@@ -811,6 +830,9 @@ fn encode_jpeg(img: &RgbImage, input: &Path, opts: &ConvertOptions) -> Result<Ve
     let mut encode = |quality: u8| -> Result<Vec<u8>> {
         let mut jpeg_buf = Vec::new();
         let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, quality);
+        if let Some(dpi) = opts.metadata.dpi {
+            encoder.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(dpi));
+        }
         if opts.metadata.srgb {
             encoder.set_icc_profile(exif_utils::srgb_icc_profile().to_vec())?;
         }
@@ -946,7 +968,6 @@ fn write_png(
 
 fn render_16bit(
     pipeline: &mut Pipeline,
-    input: &Path,
     resize: Option<u32>,
     fast: bool,
     aspect: Option<(u32, u32)>,
@@ -960,7 +981,7 @@ fn render_16bit(
 
     let decoded = pipeline
         .output_16bit(None)
-        .map_err(|e| anyhow!("Failed to process {}: {}", input.display(), e))?;
+        .map_err(|e| anyhow!("processing failed: {e}"))?;
 
     let width = decoded.width as u32;
     let height = decoded.height as u32;
@@ -1454,7 +1475,7 @@ mod tests {
 
         let mut p16 = Pipeline::new_from_file(&png).unwrap();
         p16.globals.settings.use_fastpath = false;
-        let out16 = render_16bit(&mut p16, &png, None, false, None).unwrap();
+        let out16 = render_16bit(&mut p16, None, false, None).unwrap();
 
         let (m8, m16) = (mean_u8(&out8.data), mean_u16_as_u8(out16.as_raw()));
         assert!(
@@ -1471,7 +1492,7 @@ mod tests {
         let png = write_gradient_png(tmp.path());
 
         let mut p16 = Pipeline::new_from_file(&png).unwrap();
-        let out16 = render_16bit(&mut p16, &png, None, false, None).unwrap();
+        let out16 = render_16bit(&mut p16, None, false, None).unwrap();
         let expected = image::open(&png).unwrap().to_rgb16();
         assert_eq!(out16.as_raw(), expected.as_raw());
     }
@@ -1688,6 +1709,7 @@ mod tests {
             fast: false,
             exposure: None,
             white_balance: None,
+            wb_from: None,
             sharpen: None,
             preview: true,
             look: Look::Flat,
@@ -1700,14 +1722,14 @@ mod tests {
     #[test]
     fn preview_source_is_resized_for_8_bit_output() {
         let mut source = Source::Preview(make_8bit_image(400, 200));
-        let img = source.rgb8(Path::new("x.arw"), &preview_opts(Some(100))).unwrap();
+        let img = source.rgb8(&preview_opts(Some(100))).unwrap();
         assert_eq!(img.dimensions(), (100, 50));
     }
 
     #[test]
     fn preview_source_is_widened_for_16_bit_output() {
         let mut source = Source::Preview(ImageBuffer::from_pixel(8, 4, Rgb([0u8, 128, 255])));
-        let img = source.rgb16(Path::new("x.arw"), &preview_opts(None)).unwrap();
+        let img = source.rgb16(&preview_opts(None)).unwrap();
         assert_eq!(img.dimensions(), (8, 4));
         assert_eq!(img.get_pixel(0, 0), &Rgb([0u16, 128 * 257, 65535]));
     }
@@ -1835,6 +1857,7 @@ mod tests {
                 fast: false,
                 exposure: None,
                 white_balance: None,
+                wb_from: None,
                 sharpen: None,
                 preview: false,
                 look: Look::Flat,
@@ -1864,6 +1887,7 @@ mod tests {
                 fast: false,
                 exposure: None,
                 white_balance: None,
+                wb_from: None,
                 sharpen: None,
                 preview: false,
                 look: Look::Flat,

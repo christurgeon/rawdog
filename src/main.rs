@@ -166,6 +166,12 @@ struct Cli {
     #[arg(long, value_name = "KELVIN", value_parser = float_in_range::<1500, 15000>)]
     wb: Option<f32>,
 
+    /// Use the as-shot white balance of this RAW file for every file, so a
+    /// time-lapse or a set shot under one light does not change colour from
+    /// frame to frame. Files must come from the same camera model
+    #[arg(long, value_name = "RAW", conflicts_with_all = ["wb", "preview"])]
+    wb_from: Option<PathBuf>,
+
     /// White balance tint for --wb. Above 1 is more magenta, below 1 is
     /// more green
     #[arg(long, requires = "wb", default_value_t = 1.0, value_parser = tint_value)]
@@ -176,6 +182,11 @@ struct Cli {
     #[arg(long, value_name = "AMOUNT", num_args = 0..=1, default_missing_value = "0.5",
           value_parser = float_in_range::<0, 3>)]
     sharpen: Option<f32>,
+
+    /// Print resolution in pixels per inch, such as 300, for print labs and
+    /// layout software. Without it, the camera's value is copied
+    #[arg(long, value_name = "DPI", value_parser = clap::value_parser!(u16).range(1..=10000))]
+    dpi: Option<u16>,
 
     /// Do not copy GPS location to the output
     #[arg(long)]
@@ -255,7 +266,7 @@ fn float_in_range<const MIN: i32, const MAX: i32>(s: &str) -> Result<f32, String
 fn write_gallery(
     dir: &Path,
     records: &[report::Record],
-    shift: Option<&timeshift::TimeShift>,
+    infos: &HashMap<PathBuf, naming::NameInfo>,
     quiet: bool,
 ) -> Result<()> {
     let mut shown: Vec<&report::Record> = records
@@ -267,7 +278,14 @@ fn write_gallery(
     let entries: Vec<gallery::Entry> = shown
         .par_iter()
         .map(|r| {
-            let info = naming::NameInfo::read(&r.input, true).shifted(shift);
+            let read;
+            let info = match infos.get(&r.input) {
+                Some(info) => info,
+                None => {
+                    read = naming::NameInfo::read(&r.input, true);
+                    &read
+                }
+            };
             let image = r.output.clone().unwrap_or_default();
             gallery::Entry {
                 thumbnail: gallery::thumbnail(dir, &image),
@@ -282,7 +300,7 @@ fn write_gallery(
                     taken: info.taken.map(|(y, mo, d, h, mi, _)| {
                         format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
                     }),
-                    model: info.model,
+                    model: info.model.clone(),
                     rating: info.rating,
                 },
             }
@@ -617,11 +635,13 @@ fn main() -> Result<()> {
             ("--preview", cli.preview),
             ("--exposure", cli.exposure.is_some()),
             ("--wb", cli.wb.is_some()),
+            ("--wb-from", cli.wb_from.is_some()),
             ("--sharpen", cli.sharpen.is_some()),
             ("--strip-gps", cli.strip_gps),
             ("--strip-metadata", cli.strip_metadata),
             ("--artist", cli.artist.is_some()),
             ("--copyright", cli.copyright.is_some()),
+            ("--dpi", cli.dpi.is_some()),
             ("--watermark", cli.watermark.is_some()),
         ];
         let used: Vec<&str> = image_options
@@ -659,6 +679,11 @@ fn main() -> Result<()> {
                 .with_context(|| format!("Failed to read watermark {}", path.display()))?
                 .into_rgba8(),
         )),
+        None => None,
+    };
+
+    let wb_from = match &cli.wb_from {
+        Some(path) => Some(std::sync::Arc::new(converter::white_balance_reference(path)?)),
         None => None,
     };
 
@@ -721,21 +746,40 @@ fn main() -> Result<()> {
             );
         }
     }
+    let template = cli.name.clone().map(|mut t| {
+        t.seq_start = cli.seq_start;
+        t
+    });
+
+    // Read the metadata of every file once, for selection, naming, and the
+    // gallery. A CR3 or RAF file is read whole, which is slow on a card.
+    let needs_exif = selection.needs_exif()
+        || template.as_ref().is_some_and(|t| t.needs_exif())
+        || cli.gallery;
+    let mut infos: Vec<naming::NameInfo> =
+        if selection.is_active() || template.is_some() || cli.gallery {
+            files
+                .par_iter()
+                .map(|f| {
+                    naming::NameInfo::read(&f.path, needs_exif).shifted(cli.time_shift.as_ref())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
     let mut excluded_records = Vec::new();
     let files = if selection.is_active() {
-        let needs_exif = selection.needs_exif();
-        let excluded: Vec<Option<String>> = files
-            .par_iter()
-            .map(|f| {
-                let info = naming::NameInfo::read(&f.path, needs_exif);
-                selection.exclusion(&info.shifted(cli.time_shift.as_ref()))
-            })
-            .collect();
-        let (kept, dropped): (Vec<_>, Vec<_>) =
-            files.into_iter().zip(excluded).partition(|(_, reason)| reason.is_none());
+        let excluded: Vec<Option<String>> =
+            infos.iter().map(|info| selection.exclusion(info)).collect();
+        let (kept, dropped): (Vec<_>, Vec<_>) = files
+            .into_iter()
+            .zip(std::mem::take(&mut infos))
+            .zip(excluded)
+            .partition(|(_, reason)| reason.is_none());
         excluded_records = dropped
             .iter()
-            .map(|(f, reason)| report::Record {
+            .map(|((f, _), reason)| report::Record {
                 input: f.path.clone(),
                 output: None,
                 status: report::Status::Excluded,
@@ -744,7 +788,7 @@ fn main() -> Result<()> {
             })
             .collect();
         if cli.dry_run {
-            for (f, reason) in &dropped {
+            for ((f, _), reason) in &dropped {
                 println!("exclude {} ({})", f.path.display(), reason.as_deref().unwrap_or(""));
             }
         } else if !cli.quiet && !dropped.is_empty() {
@@ -762,22 +806,22 @@ fn main() -> Result<()> {
             }
             return Ok(());
         }
-        kept.into_iter().map(|(f, _)| f).collect()
+        let (kept, kept_infos): (Vec<_>, Vec<_>) = kept.into_iter().map(|(pair, _)| pair).unzip();
+        infos = kept_infos;
+        kept
     } else {
         files
     };
 
-    let template = cli.name.clone().map(|mut t| {
-        t.seq_start = cli.seq_start;
-        t
-    });
     let jobs = plan_outputs(
         &files,
         cli.output.as_deref(),
         cli.format,
         template.as_ref(),
-        cli.time_shift.as_ref(),
+        (!infos.is_empty()).then_some(infos.as_slice()),
     )?;
+    let infos: HashMap<PathBuf, naming::NameInfo> =
+        files.iter().map(|f| f.path.clone()).zip(infos).collect();
 
     // {seq} numbers the files of each run anew, so an existing output may
     // hold another input's image; skipping it would lose a file.
@@ -848,6 +892,7 @@ fn main() -> Result<()> {
         fast: cli.fast,
         exposure: cli.exposure,
         white_balance: cli.wb.map(|kelvin| (kelvin, cli.tint)),
+        wb_from,
         sharpen: cli.sharpen,
         preview: cli.preview,
         look: cli.look,
@@ -860,6 +905,7 @@ fn main() -> Result<()> {
             copyright: cli.copyright.clone(),
             srgb: !cli.preview,
             time_shift: cli.time_shift.clone(),
+            dpi: cli.dpi,
         },
     };
 
@@ -1006,7 +1052,7 @@ fn main() -> Result<()> {
         write_report(path, &mut records)?;
     }
     if let (true, Some(dir)) = (cli.gallery, cli.output.as_deref()) {
-        write_gallery(dir, &records, cli.time_shift.as_ref(), cli.quiet)?;
+        write_gallery(dir, &records, &infos, cli.quiet)?;
     }
 
     // Errors scroll away in a long run, so repeat which files failed.
@@ -1262,17 +1308,24 @@ fn plan_outputs(
     output_dir: Option<&Path>,
     format: OutputFormat,
     template: Option<&naming::NameTemplate>,
-    shift: Option<&timeshift::TimeShift>,
+    infos: Option<&[naming::NameInfo]>,
 ) -> Result<Vec<(PathBuf, PathBuf)>> {
     // Reading EXIF for the template opens every file, so do it in parallel.
     let named: Option<Vec<PathBuf>> = template.map(|t| {
-        let needs_exif = t.needs_exif();
-        let infos: Vec<naming::NameInfo> = files
-            .par_iter()
-            .map(|f| naming::NameInfo::read(&f.path, needs_exif).shifted(shift))
-            .collect();
+        let read;
+        let infos = match infos {
+            Some(infos) => infos,
+            None => {
+                let needs_exif = t.needs_exif();
+                read = files
+                    .par_iter()
+                    .map(|f| naming::NameInfo::read(&f.path, needs_exif))
+                    .collect::<Vec<_>>();
+                &read
+            }
+        };
         let seqs = if t.uses_seq() {
-            sequence_numbers(files, &infos, t.seq_start)
+            sequence_numbers(files, infos, t.seq_start)
         } else {
             vec![String::new(); files.len()]
         };
