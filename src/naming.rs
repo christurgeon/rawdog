@@ -13,6 +13,7 @@ enum Token {
     Time,
     Model,
     Rating,
+    Seq,
 }
 
 const TOKENS: &[(&str, Token)] = &[
@@ -24,6 +25,7 @@ const TOKENS: &[(&str, Token)] = &[
     ("time", Token::Time),
     ("model", Token::Model),
     ("rating", Token::Rating),
+    ("seq", Token::Seq),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -241,15 +243,22 @@ fn xmp_text(xmp: &[u8]) -> String {
 
 impl NameTemplate {
     /// True if the template uses a value that comes from EXIF data.
+    /// `{seq}` counts in capture order, so it needs the capture time.
     pub fn needs_exif(&self) -> bool {
         self.0
             .iter()
             .any(|p| matches!(p, Part::Token(t) if *t != Token::Stem))
     }
 
+    /// True if the template uses `{seq}`.
+    pub fn uses_seq(&self) -> bool {
+        self.0.contains(&Part::Token(Token::Seq))
+    }
+
     /// Build the output path, without extension, relative to the output
     /// directory. Values that the file does not have become `unknown`.
-    pub fn expand(&self, info: &NameInfo) -> PathBuf {
+    /// `seq` is the value of `{seq}`.
+    pub fn expand(&self, info: &NameInfo, seq: &str) -> PathBuf {
         let unknown = || "unknown".to_string();
         let taken = |f: fn(Taken) -> String| info.taken.map(f).unwrap_or_else(unknown);
         let mut out = String::new();
@@ -266,6 +275,7 @@ impl NameTemplate {
                         Token::Time => taken(|(_, _, _, h, m, s)| format!("{h:02}{m:02}{s:02}")),
                         Token::Model => info.model.clone().unwrap_or_else(unknown),
                         Token::Rating => info.rating.unwrap_or(0).to_string(),
+                        Token::Seq => seq.to_string(),
                     };
                     // A value must not add path components, and must not
                     // be the name of the current or the parent directory.
@@ -296,7 +306,18 @@ mod tests {
     }
 
     fn expand(template: &str, info: &NameInfo) -> PathBuf {
-        template.parse::<NameTemplate>().unwrap().expand(info)
+        template.parse::<NameTemplate>().unwrap().expand(info, "0007")
+    }
+
+    #[test]
+    fn expand_seq() {
+        let template: NameTemplate = "{date}/{seq}_{stem}".parse().unwrap();
+        assert!(template.uses_seq() && template.needs_exif());
+        assert_eq!(
+            template.expand(&info(), "0042"),
+            PathBuf::from("2024-03-09/0042_DSC0001")
+        );
+        assert!(!"{stem}".parse::<NameTemplate>().unwrap().uses_seq());
     }
 
     #[test]
