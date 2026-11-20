@@ -226,6 +226,8 @@ For print, `--dpi 300` sets the print resolution that labs and layout software r
 
 `--keep-rating` writes each file's star rating and colour label into the output as XMP, so the culling decisions come along when the images are imported into Lightroom or another catalog. It is off by default, so a client does not see ratings.
 
+`--keywords "wedding,Smith,2026"` writes keywords into every output (XMP `dc:subject`), for stock sites and catalogs; it is useful in the defaults file too.
+
 `--strip-metadata` copies no metadata at all.
 
 ### Watching a folder

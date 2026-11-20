@@ -19,6 +19,8 @@ pub struct MetadataOptions {
     pub srgb: bool,
     /// Write the rating and colour label into the output as XMP.
     pub keep_rating: bool,
+    /// Keywords written into the output as XMP `dc:subject`.
+    pub keywords: Vec<String>,
     /// Print resolution in pixels per inch. Replaces the source value.
     pub dpi: Option<u16>,
     /// Correction of the camera clock, applied to the capture dates.
@@ -572,10 +574,11 @@ pub fn inject_exif_into_jpeg(jpeg_bytes: &[u8], exif_data: &[u8]) -> Result<Vec<
     Ok(output)
 }
 
-/// An XMP packet with `xmp:Rating` and `xmp:Label`, which Lightroom and
-/// other catalogs read on import. `None` when there is neither.
-pub fn rating_xmp(rating: Option<i8>, label: Option<&str>) -> Option<String> {
-    if rating.is_none() && label.is_none() {
+/// An XMP packet with `xmp:Rating`, `xmp:Label`, and keywords
+/// (`dc:subject`), which Lightroom and other catalogs and stock sites read
+/// on import. `None` when there is none of them.
+pub fn rating_xmp(rating: Option<i8>, label: Option<&str>, keywords: &[String]) -> Option<String> {
+    if rating.is_none() && label.is_none() && keywords.is_empty() {
         return None;
     }
     let escape = |s: &str| {
@@ -591,11 +594,21 @@ pub fn rating_xmp(rating: Option<i8>, label: Option<&str>) -> Option<String> {
         let label: String = chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default();
         attributes.push_str(&format!(" xmp:Label=\"{}\"", escape(&label)));
     }
+    let description = if keywords.is_empty() {
+        format!("<rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"{attributes}/>")
+    } else {
+        let items: String =
+            keywords.iter().map(|k| format!("<rdf:li>{}</rdf:li>", escape(k))).collect();
+        format!(
+            "<rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" \
+             xmlns:dc=\"http://purl.org/dc/elements/1.1/\"{attributes}>\
+             <dc:subject><rdf:Bag>{items}</rdf:Bag></dc:subject></rdf:Description>"
+        )
+    };
     Some(format!(
         "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\
          <x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
-         <rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"{attributes}/>\
-         </rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>"
+         {description}</rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>"
     ))
 }
 
@@ -678,10 +691,15 @@ mod tests {
 
     #[test]
     fn rating_xmp_is_read_back_by_the_rating_parser() {
-        let xmp = rating_xmp(Some(4), Some("red")).unwrap();
+        let xmp = rating_xmp(Some(4), Some("red"), &[]).unwrap();
         assert!(xmp.contains(r#"xmp:Rating="4""#) && xmp.contains(r#"xmp:Label="Red""#), "{xmp}");
-        assert_eq!(rating_xmp(None, None), None);
-        assert!(rating_xmp(None, Some("a<b")).unwrap().contains("A&lt;b"));
+        assert_eq!(rating_xmp(None, None, &[]), None);
+        assert!(rating_xmp(None, Some("a<b"), &[]).unwrap().contains("A&lt;b"));
+        let tagged = rating_xmp(None, None, &["wedding".to_string(), "Smith & Co".to_string()]).unwrap();
+        assert!(
+            tagged.contains("<dc:subject><rdf:Bag><rdf:li>wedding</rdf:li><rdf:li>Smith &amp; Co</rdf:li></rdf:Bag></dc:subject>"),
+            "{tagged}"
+        );
 
         let img: image::RgbImage = image::ImageBuffer::from_pixel(2, 2, image::Rgb([1u8, 2, 3]));
         let mut jpeg = Vec::new();
