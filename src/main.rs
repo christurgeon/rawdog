@@ -65,6 +65,13 @@ struct Cli {
     #[arg(long, value_name = "STARS", value_parser = clap::value_parser!(i8).range(1..=5))]
     min_rating: Option<i8>,
 
+    /// Convert only files with one of these colour labels, such as "red"
+    /// or "red,green" (not case-sensitive). Labels come from sidecar XMP
+    /// files (Lightroom, Capture One, darktable)
+    #[arg(long, value_name = "LABELS", value_delimiter = ',', action = clap::ArgAction::Set,
+          value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    label: Vec<String>,
+
     /// Convert only files taken on or after this date (YYYY-MM-DD, camera
     /// clock)
     #[arg(long, value_name = "DATE", value_parser = parse_date)]
@@ -344,6 +351,8 @@ struct Selection {
     since: Option<(u16, u8, u8)>,
     until: Option<(u16, u8, u8)>,
     camera: Option<String>,
+    /// Wanted colour labels in lower case; empty for any.
+    labels: Vec<String>,
     picks: Option<Picks>,
 }
 
@@ -357,6 +366,7 @@ impl Selection {
             || self.since.is_some()
             || self.until.is_some()
             || self.camera.is_some()
+            || !self.labels.is_empty()
     }
 
     /// Why a file is excluded, if it is. A file without the metadata that a
@@ -383,6 +393,12 @@ impl Selection {
             {
                 return Some(shown);
             }
+        }
+        if !self.labels.is_empty() && !info.labels.iter().any(|l| self.labels.contains(l)) {
+            return Some(match info.labels.first() {
+                Some(label) => format!("label {label}"),
+                None => "no label".to_string(),
+            });
         }
         if let Some(wanted) = &self.camera {
             let model = info.model.as_deref().unwrap_or_default();
@@ -588,6 +604,7 @@ fn main() -> Result<()> {
         since: cli.since,
         until: cli.until,
         camera: cli.camera.clone(),
+        labels: cli.label.iter().map(|l| l.trim().to_lowercase()).collect(),
         picks,
     };
     if let (Some(picks), Some(path)) = (&selection.picks, &cli.picks) {
@@ -1430,6 +1447,7 @@ mod tests {
             taken: date.map(|(y, m, d)| (y, m, d, 12, 0, 0)),
             model: model.map(str::to_string),
             rating,
+            labels: Vec::new(),
         }
     }
 
@@ -1439,8 +1457,33 @@ mod tests {
             since: None,
             until: None,
             camera: None,
+            labels: Vec::new(),
             picks: None,
         }
+    }
+
+    #[test]
+    fn label_option_splits_on_commas_and_a_later_one_wins() {
+        let cli = Cli::try_parse_from(["rawdog", "--label", "red,Green", "x.arw"]).unwrap();
+        assert_eq!(cli.label, ["red", "Green"]);
+        let cli = Cli::try_parse_from(["rawdog", "--label", "red", "--label", "blue", "x.arw"]).unwrap();
+        assert_eq!(cli.label, ["blue"]);
+    }
+
+    #[test]
+    fn selection_by_label() {
+        let sel = Selection {
+            labels: vec!["red".to_string(), "green".to_string()],
+            ..selection()
+        };
+        let labelled = |labels: &[&str]| naming::NameInfo {
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            ..Default::default()
+        };
+        assert!(sel.exclusion(&labelled(&["green"])).is_none());
+        assert!(sel.exclusion(&labelled(&["blue", "red"])).is_none());
+        assert_eq!(sel.exclusion(&labelled(&["blue"])).unwrap(), "label blue");
+        assert_eq!(sel.exclusion(&labelled(&[])).unwrap(), "no label");
     }
 
     #[test]

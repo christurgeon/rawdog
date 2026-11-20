@@ -98,6 +98,8 @@ pub struct NameInfo {
     pub model: Option<String>,
     /// Star rating: 1 to 5, 0 for unrated, -1 for rejected (Lightroom).
     pub rating: Option<i8>,
+    /// Colour labels in lower case, such as "red". Empty when unlabelled.
+    pub labels: Vec<String>,
 }
 
 impl NameInfo {
@@ -116,6 +118,7 @@ impl NameInfo {
         }
         let Ok(Some((fields, _))) = crate::exif::read_source_fields(path) else {
             info.rating = read_rating(path, &[]);
+            info.labels = read_labels(path, &[]);
             return info;
         };
 
@@ -136,8 +139,86 @@ impl NameInfo {
             .map(|raw| String::from_utf8_lossy(&raw).trim().to_string())
             .filter(|m| !m.is_empty());
         info.rating = read_rating(path, &fields);
+        info.labels = read_labels(path, &fields);
         info
     }
+}
+
+/// The sidecar XMP files that may belong to `path`: `NAME.xmp` (Lightroom,
+/// Capture One) and `NAME.EXT.xmp` (darktable).
+fn sidecar_paths(path: &Path) -> Vec<PathBuf> {
+    let mut sidecars = vec![path.with_extension("xmp"), path.with_extension("XMP")];
+    let mut darktable = path.as_os_str().to_owned();
+    darktable.push(".xmp");
+    sidecars.push(PathBuf::from(darktable));
+    sidecars
+}
+
+/// The colour labels of a RAW file, from a sidecar XMP file or else from
+/// the XMP packet in the file. Cameras do not write labels.
+fn read_labels(path: &Path, fields: &[exif::Field]) -> Vec<String> {
+    const XMP_TAG: exif::Tag = exif::Tag(exif::Context::Tiff, 0x02bc);
+    let in_file = fields.iter().filter(|f| f.tag == XMP_TAG).filter_map(|f| match &f.value {
+        exif::Value::Byte(xmp) | exif::Value::Undefined(xmp, _) => Some(xmp.clone()),
+        _ => None,
+    });
+    sidecar_paths(path)
+        .iter()
+        .filter_map(|p| std::fs::read(p).ok())
+        .chain(in_file)
+        .map(|xmp| xmp_labels(&xmp))
+        .find(|labels| !labels.is_empty())
+        .unwrap_or_default()
+}
+
+/// The colour labels of an XMP packet: `xmp:Label` (Lightroom, Capture
+/// One), and `darktable:colorlabels`, a list of numbers from 0 (red) to 4
+/// (purple).
+fn xmp_labels(xmp: &[u8]) -> Vec<String> {
+    const DARKTABLE: [&str; 5] = ["red", "yellow", "green", "blue", "purple"];
+    let text = xmp_text(xmp);
+    let mut labels = Vec::new();
+    if let Some(label) = xmp_property(&text, "xmp:Label") {
+        let label = label.trim().to_lowercase();
+        if !label.is_empty() {
+            labels.push(label);
+        }
+    }
+    if let Some(start) = text.find("<darktable:colorlabels>") {
+        let rest = &text[start..];
+        let list = &rest[..rest.find("</darktable:colorlabels>").unwrap_or(rest.len())];
+        for item in list.split("<rdf:li>").skip(1) {
+            let number = item.split('<').next().unwrap_or("").trim();
+            if let Some(name) = number.parse::<usize>().ok().and_then(|n| DARKTABLE.get(n)) {
+                if !labels.iter().any(|l| l == name) {
+                    labels.push(name.to_string());
+                }
+            }
+        }
+    }
+    labels
+}
+
+/// The text value of an XMP property in attribute form (`name="value"`)
+/// or element form (`<name>value</name>`).
+fn xmp_property<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(found) = text[from..].find(name) {
+        let rest = &text[from + found + name.len()..];
+        from += found + name.len();
+        if let Some(element) = rest.strip_prefix('>') {
+            return Some(&element[..element.find('<')?]);
+        }
+        let Some(attribute) = rest.trim_start().strip_prefix('=') else {
+            // A longer name that starts with the same text.
+            continue;
+        };
+        let attribute = attribute.trim_start();
+        let quote = attribute.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let value = &attribute[1..];
+        return Some(&value[..value.find(quote)?]);
+    }
+    None
 }
 
 /// The rating of a RAW file. Sources, in order:
@@ -150,11 +231,7 @@ fn read_rating(path: &Path, fields: &[exif::Field]) -> Option<i8> {
     const XMP_TAG: exif::Tag = exif::Tag(exif::Context::Tiff, 0x02bc);
     const RATING_TAG: exif::Tag = exif::Tag(exif::Context::Tiff, 0x4746);
 
-    let mut sidecars = vec![path.with_extension("xmp"), path.with_extension("XMP")];
-    let mut darktable = path.as_os_str().to_owned();
-    darktable.push(".xmp");
-    sidecars.push(PathBuf::from(darktable));
-    if let Some(rating) = sidecars
+    if let Some(rating) = sidecar_paths(path)
         .iter()
         .filter_map(|p| std::fs::read(p).ok())
         .find_map(|xmp| xmp_rating(&xmp))
@@ -302,6 +379,7 @@ mod tests {
             taken: Some((2024, 3, 9, 7, 5, 42)),
             model: Some("ILCE-7M3".to_string()),
             rating: Some(4),
+            labels: Vec::new(),
         }
     }
 
@@ -363,6 +441,35 @@ mod tests {
     }
 
     #[test]
+    fn xmp_labels_reads_lightroom_and_darktable_forms() {
+        assert_eq!(xmp_labels(b"<d xmp:Label=\"Red\" xmp:Rating=\"3\"/>"), ["red"]);
+        assert_eq!(xmp_labels(b"<xmp:Label>Green</xmp:Label>"), ["green"]);
+        assert_eq!(xmp_labels(b"<d xmp:Label='To Print'/>"), ["to print"]);
+        assert!(xmp_labels(b"<d xmp:Label=\"\"/>").is_empty());
+        assert!(xmp_labels(b"<d xmp:LabelColor=\"x\"/>").is_empty());
+        let darktable = b"<darktable:colorlabels><rdf:Seq><rdf:li>0</rdf:li>\
+            <rdf:li>3</rdf:li><rdf:li>9</rdf:li></rdf:Seq></darktable:colorlabels>";
+        assert_eq!(xmp_labels(darktable), ["red", "blue"]);
+        assert!(xmp_labels(b"<rdf:li>2</rdf:li>").is_empty());
+    }
+
+    #[test]
+    fn sidecar_labels_win_over_the_labels_in_the_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let raw = tmp.path().join("DSC1.DNG");
+        std::fs::write(&raw, b"not a raw file").unwrap();
+        let in_file = [exif::Field {
+            tag: exif::Tag(exif::Context::Tiff, 0x02bc),
+            ifd_num: exif::In::PRIMARY,
+            value: exif::Value::Byte(b"xmp:Label=\"Yellow\"".to_vec()),
+        }];
+        assert_eq!(read_labels(&raw, &in_file), ["yellow"]);
+        std::fs::write(tmp.path().join("DSC1.xmp"), b"xmp:Label=\"Purple\"").unwrap();
+        assert_eq!(read_labels(&raw, &in_file), ["purple"]);
+        assert!(read_labels(&tmp.path().join("DSC2.DNG"), &[]).is_empty());
+    }
+
+    #[test]
     fn sidecar_rating_wins_over_the_rating_in_the_file() {
         let tmp = tempfile::TempDir::new().unwrap();
         let raw = tmp.path().join("DSC1.ARW");
@@ -405,7 +512,7 @@ mod tests {
             stem: "a".to_string(),
             taken: None,
             model: Some("../Evil/Cam".to_string()),
-            rating: None,
+            ..Default::default()
         };
         assert_eq!(expand("{model}_{stem}", &info), PathBuf::from(".._Evil_Cam_a"));
     }
@@ -416,7 +523,7 @@ mod tests {
             stem: "a".to_string(),
             taken: None,
             model: Some("..".to_string()),
-            rating: None,
+            ..Default::default()
         };
         assert_eq!(expand("{model}/{stem}", &info), PathBuf::from("__/a"));
     }
