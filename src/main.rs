@@ -64,7 +64,8 @@ struct Cli {
 
     /// Name template for output files, relative to the output directory
     /// and without extension. Fields: {stem} {date} {year} {month} {day}
-    /// {time} {model} {lens} {serial} {rating} {label} {seq} {burst}. {seq} numbers the files of the run
+    /// {time} {model} {lens} {serial} {iso} {focal} {aperture} {shutter}
+    /// {rating} {label} {seq} {burst}. {seq} numbers the files of the run
     /// in capture order: 0001, 0002, ... Example: "{date}/{model}_{stem}"
     #[arg(long, value_name = "TEMPLATE")]
     name: Option<naming::NameTemplate>,
@@ -324,6 +325,7 @@ fn write_gallery(
                         format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
                     }),
                     model: info.model.clone(),
+                    exposure: Some(info.exposure.caption()).filter(|c| !c.is_empty()),
                     rating: info.rating,
                 },
             }
