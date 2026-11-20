@@ -144,6 +144,12 @@ struct Cli {
     #[arg(short, long, value_parser = clap::value_parser!(u32).range(1..))]
     resize: Option<u32>,
 
+    /// Crop the centre to this aspect ratio, such as 4:5, 16:9, or 1:1. The
+    /// ratio follows each image's orientation (4:5 makes a landscape 5:4).
+    /// --resize applies to the cropped image
+    #[arg(long, value_name = "W:H", value_parser = aspect_ratio)]
+    aspect: Option<(u32, u32)>,
+
     /// Scale during RAW decoding when --resize is set. Several times
     /// faster and slightly softer; intended for proofs and culling
     #[arg(long, requires = "resize")]
@@ -539,6 +545,15 @@ fn byte_size(s: &str) -> Result<u64, String> {
     }
 }
 
+/// An aspect ratio such as "4:5" or "16x9", as (long side, short side).
+fn aspect_ratio(s: &str) -> Result<(u32, u32), String> {
+    let error = || "must be a ratio such as 4:5, 16:9, or 1:1".to_string();
+    let (a, b) = s.split_once([':', 'x', 'X']).ok_or_else(error)?;
+    let parse = |v: &str| v.trim().parse::<u32>().ok().filter(|v| (1..=100).contains(v));
+    let (a, b) = (parse(a).ok_or_else(error)?, parse(b).ok_or_else(error)?);
+    Ok((a.max(b), a.min(b)))
+}
+
 fn tint_value(s: &str) -> Result<f32, String> {
     match s.parse::<f32>() {
         Ok(v) if (0.5..=2.0).contains(&v) => Ok(v),
@@ -591,6 +606,7 @@ fn main() -> Result<()> {
         let image_options = [
             ("--max-size", cli.max_size.is_some()),
             ("--resize", cli.resize.is_some()),
+            ("--aspect", cli.aspect.is_some()),
             ("--fast", cli.fast),
             ("--preview", cli.preview),
             ("--exposure", cli.exposure.is_some()),
@@ -821,6 +837,7 @@ fn main() -> Result<()> {
         quality: cli.quality,
         max_bytes: cli.max_size,
         resize: cli.resize,
+        aspect: cli.aspect,
         fast: cli.fast,
         exposure: cli.exposure,
         white_balance: cli.wb.map(|kelvin| (kelvin, cli.tint)),
@@ -1513,6 +1530,16 @@ mod tests {
         let explicit_first =
             collect_raw_files(&[sub.join("x.arw"), tmp.path().to_path_buf()], true).unwrap();
         assert_eq!(explicit_first[0].rel_dir, PathBuf::new());
+    }
+
+    #[test]
+    fn aspect_ratio_parses_both_orders() {
+        assert_eq!(aspect_ratio("4:5"), Ok((5, 4)));
+        assert_eq!(aspect_ratio("16x9"), Ok((16, 9)));
+        assert_eq!(aspect_ratio("1:1"), Ok((1, 1)));
+        for bad in ["", "4", "4:", "0:1", "4:5:6", "a:b", "101:1"] {
+            assert!(aspect_ratio(bad).is_err(), "{bad} was accepted");
+        }
     }
 
     #[test]
