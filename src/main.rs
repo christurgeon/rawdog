@@ -165,6 +165,12 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["fast", "exposure", "wb"])]
     preview: bool,
 
+    /// Blend this logo (a PNG, which may be transparent) into the
+    /// bottom-right corner of every image. Its long side is a fifth of the
+    /// image's short edge
+    #[arg(long, value_name = "PNG")]
+    watermark: Option<PathBuf>,
+
     /// Overwrite existing output files (default: skip if exists)
     #[arg(long)]
     overwrite: bool,
@@ -524,6 +530,7 @@ fn main() -> Result<()> {
             ("--strip-metadata", cli.strip_metadata),
             ("--artist", cli.artist.is_some()),
             ("--copyright", cli.copyright.is_some()),
+            ("--watermark", cli.watermark.is_some()),
         ];
         let used: Vec<&str> = image_options
             .iter()
@@ -552,6 +559,15 @@ fn main() -> Result<()> {
             }
             Some(picks)
         }
+        None => None,
+    };
+
+    let watermark = match &cli.watermark {
+        Some(path) => Some(std::sync::Arc::new(
+            image::open(path)
+                .with_context(|| format!("Failed to read watermark {}", path.display()))?
+                .into_rgba8(),
+        )),
         None => None,
     };
 
@@ -700,6 +716,7 @@ fn main() -> Result<()> {
         white_balance: cli.wb.map(|kelvin| (kelvin, cli.tint)),
         sharpen: cli.sharpen,
         preview: cli.preview,
+        watermark,
         metadata: exif::MetadataOptions {
             strip_all: cli.strip_metadata,
             strip_gps: cli.strip_gps,

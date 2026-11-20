@@ -89,6 +89,12 @@ rawdog ./card -r 2048 --fast -o ./proofs
 rawdog ./wedding -r 1600 --fast -o ./proofs --gallery
 ```
 
+`--watermark` blends a logo into the bottom-right corner of every image, for proofs and web exports. Use a PNG with a transparent background. The long side of the logo is a fifth of the image's short edge, so it has the same size on landscape and portrait images:
+
+```sh
+rawdog ./wedding -r 2048 --watermark ~/logo.png -o ./web
+```
+
 ### Selecting files
 
 Convert only your picks. Ratings come from sidecar XMP files written by Lightroom, Capture One, or darktable, or from the rating set in the camera:
