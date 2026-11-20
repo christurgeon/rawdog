@@ -26,7 +26,13 @@ impl Track {
             let end = chunk.find("</trkpt>").unwrap_or(chunk.len());
             let point = &chunk[..end];
             let attribute = |name: &str| -> Option<f64> {
-                let start = point.find(&format!("{name}="))? + name.len() + 1;
+                // The name must start a word: not the "lat" of "flat=".
+                let pattern = format!("{name}=");
+                let start = point
+                    .match_indices(&pattern)
+                    .find(|(i, _)| point[..*i].ends_with(|c: char| c.is_whitespace()))?
+                    .0
+                    + pattern.len();
                 let quote = point[start..].chars().next()?;
                 let value = &point[start + 1..];
                 value[..value.find(quote)?].trim().parse().ok()
@@ -125,11 +131,11 @@ fn parse_utc(s: &str) -> Option<i64> {
 
 /// Degrees as EXIF degrees, minutes, and seconds (hundredths).
 pub fn to_dms(value: f64) -> [(u32, u32); 3] {
-    let value = value.abs();
-    let degrees = value.trunc();
-    let minutes = ((value - degrees) * 60.0).trunc();
-    let seconds = ((value - degrees) * 60.0 - minutes) * 60.0;
-    [(degrees as u32, 1), (minutes as u32, 1), ((seconds * 100.0).round() as u32, 100)]
+    // Round once, in hundredths of a second, so that no part reaches 60.
+    let hundredths = (value.abs() * 360_000.0).round() as u64;
+    let (degrees, rest) = (hundredths / 360_000, hundredths % 360_000);
+    let (minutes, seconds) = (rest / 6_000, rest % 6_000);
+    [(degrees as u32, 1), (minutes as u32, 1), (seconds as u32, 100)]
 }
 
 #[cfg(test)]
@@ -141,6 +147,7 @@ mod tests {
         <trkpt lon='2.3000' lat='48.8600'><time>2026-11-14T10:02:00.500Z</time></trkpt>
         <trkpt lat="48.9000" lon="2.4000"><time>2026-11-14T11:00:00+01:00</time></trkpt>
         <trkpt lat="1" lon="1"></trkpt>
+        <trkpt flat="9" lat="10" lon="11"><time>2026-11-14T12:00:00Z</time></trkpt>
         </trkseg></trk></gpx>"#;
 
     fn utc(h: u8, m: u8, s: u8) -> i64 {
@@ -151,7 +158,8 @@ mod tests {
     fn parse_reads_points_in_either_attribute_order() {
         let track = Track::parse(GPX).unwrap();
         // The point at 11:00+01:00 is 10:00 UTC; it sorts first (stable).
-        assert_eq!(track.points.len(), 3);
+        assert_eq!(track.points.len(), 4);
+        assert_eq!(track.position(utc(12, 0, 0)), Some((10.0, 11.0)));
         assert!(Track::parse("<gpx></gpx>").is_err());
     }
 
@@ -185,5 +193,10 @@ mod tests {
     fn dms_rationals() {
         assert_eq!(to_dms(48.8584), [(48, 1), (51, 1), (3024, 100)]);
         assert_eq!(to_dms(-2.5), [(2, 1), (30, 1), (0, 100)]);
+        assert_eq!(to_dms(2.3), [(2, 1), (18, 1), (0, 100)]);
+        for v in [0.1, 2.3, 48.85, 179.99999, 33.75] {
+            let [_, (m, _), (s, _)] = to_dms(v);
+            assert!(m < 60 && s < 6_000, "{v}");
+        }
     }
 }

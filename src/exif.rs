@@ -402,6 +402,7 @@ fn fields_for_output<'a>(
         shift.seconds_for(model.as_deref())
     });
 
+    let position = gpx_position(fields.clone(), meta, shift_seconds);
     let replaced = |tag: Tag| {
         (tag == Tag::Artist && meta.artist.is_some())
             || (tag == Tag::Copyright && meta.copyright.is_some())
@@ -440,7 +441,6 @@ fn fields_for_output<'a>(
             value: exif::Value::Rational(vec![exif::Rational { num: dpi.into(), denom: 1 }]),
         })
     };
-    let position = gpx_position(fields.clone(), meta, shift_seconds);
     let gps_fields = position.into_iter().flat_map(|(lat, lon)| {
         let gps = |tag, value| exif::Field { tag, ifd_num: exif::In::PRIMARY, value };
         let dms = |v: f64| {
@@ -474,6 +474,9 @@ fn fields_for_output<'a>(
         .filter(|f| f.ifd_num == exif::In::PRIMARY && !describes_source_layout(f.tag))
         .filter(|f| value_size(&f.value) <= MAX_FIELD_BYTES)
         .filter(|f| !(meta.strip_gps && f.tag.context() == Context::Gps))
+        // A track position replaces a partial GPS directory of the source
+        // (many cameras write only GPSVersionID), so no tag appears twice.
+        .filter(|f| !(position.is_some() && f.tag.context() == Context::Gps))
         .filter(|f| !replaced(f.tag))
         // A camera set to Adobe RGB marks its files with ColorSpace 0xFFFF
         // and interoperability index "R03". The developed output is sRGB.
@@ -523,9 +526,10 @@ fn gpx_position<'a>(
     };
     let d = exif::DateTime::from_ascii(ascii(Tag::DateTimeOriginal)?.as_bytes()).ok()?;
     let local = crate::timeshift::to_seconds((d.year, d.month, d.day, d.hour, d.minute, d.second));
-    let offset = meta.gpx_tz.or_else(|| {
-        ascii(Tag::OffsetTimeOriginal).and_then(|o| crate::gpx::parse_offset(&o))
-    });
+    // The file's own time zone wins; --gpx-tz is for files without one.
+    let offset = ascii(Tag::OffsetTimeOriginal)
+        .and_then(|o| crate::gpx::parse_offset(&o))
+        .or(meta.gpx_tz);
     let Some(offset) = offset else {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1118,6 +1122,18 @@ mod tests {
         assert_eq!(get(Tag::GPSLatitudeRef).as_deref(), Some("S"));
         assert_eq!(get(Tag::GPSLongitudeRef).as_deref(), Some("E"));
         assert!(get(Tag::GPSLatitude).is_some());
+
+        // A partial GPS directory of the source is replaced, so no tag
+        // appears twice.
+        let version = field(Tag::GPSVersionID, In::PRIMARY, Value::Byte(vec![2, 2, 0, 0]));
+        let out = fields_for_output([date.clone(), version].iter(), (300, 200), &meta);
+        assert_eq!(out.iter().filter(|f| f.tag == Tag::GPSVersionID).count(), 1);
+
+        // The file's own time zone wins over --gpx-tz.
+        let zone = field(Tag::OffsetTimeOriginal, In::PRIMARY, Value::Ascii(vec![b"+02:00".to_vec()]));
+        let wrong_tz = MetadataOptions { gpx_tz: Some(5 * 3600), ..meta.clone() };
+        let out = fields_for_output([date.clone(), zone].iter(), (300, 200), &wrong_tz);
+        assert!(out.iter().any(|f| f.tag == Tag::GPSLatitude));
 
         // A file with its own position keeps it; --strip-gps adds nothing.
         let own = field(Tag::GPSLatitude, In::PRIMARY, Value::Rational(vec![exif::Rational { num: 1, denom: 1 }]));
