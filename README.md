@@ -111,6 +111,8 @@ rawdog ./card -r 2048 --fast -o ./proofs
 rawdog ./wedding -r 1600 --fast -o ./proofs --gallery
 ```
 
+With `--gallery-per-folder`, each output folder also gets its own page, for example one album per day with `--name "{date}/{stem}"`.
+
 `--watermark` blends a logo into the bottom-right corner of every image, for proofs and web exports. Use a PNG with a transparent background. The long side of the logo is a fifth of the image's short edge, so it has the same size on landscape and portrait images:
 
 ```sh
