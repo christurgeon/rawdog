@@ -844,10 +844,12 @@ fn main() -> Result<()> {
         }
     };
 
-    if cli.watch.is_some() && cli.name.as_ref().is_some_and(|t| t.uses_seq() || t.uses_burst()) {
+    if cli.watch.is_some()
+        && (cli.burst_pick.is_some() || cli.name.as_ref().is_some_and(|t| t.uses_seq() || t.uses_burst()))
+    {
         bail!(
-            "--watch cannot be used with {{seq}} or {{burst}}: their numbers are counted per run, \
-             and each round is a new run."
+            "--watch cannot be used with {{seq}}, {{burst}}, or --burst-pick: they look at all \
+             files of a run, and each round is a new run that sees only part of a burst."
         );
     }
     if let Some(interval) = cli.watch.filter(|_| std::env::var_os(WATCH_ROUND).is_none()) {
@@ -868,6 +870,9 @@ fn main() -> Result<()> {
         }
     }
 
+    if let Some(missing) = cli.watermark_sizes.iter().find(|s| !cli.resize.contains(s)) {
+        bail!("--watermark-sizes {missing} is not one of the --resize sizes, so no output would get the watermark.");
+    }
     let distinct_sizes = cli.resize.iter().collect::<HashSet<_>>().len();
     if distinct_sizes > 1 && cli.output.is_none() {
         bail!("Several --resize sizes need -o: each size is written into its own folder there.");
@@ -1835,15 +1840,22 @@ fn burst_numbers(files: &[InputFile], infos: &[naming::NameInfo], gap: f64) -> V
     order.sort_by_key(|&i| (infos[i].taken.is_none(), infos[i].time_ms(), &files[i].path));
     let mut numbers = vec![0usize; files.len()];
     let mut burst = 0;
-    let mut previous: Option<i64> = None;
+    // Each camera body has its own bursts: two bodies firing at the same
+    // moment shoot different photos. (last frame time, burst) per body.
+    type Body<'a> = (Option<&'a str>, Option<&'a str>);
+    let mut current: HashMap<Body, (Option<i64>, usize)> = HashMap::new();
     for &i in &order {
         let time = infos[i].time_ms();
-        let joins = matches!((previous, time), (Some(p), Some(t)) if t - p <= gap_ms);
-        if !joins {
+        let body = (infos[i].model.as_deref(), infos[i].serial.as_deref());
+        let joins = current.get(&body).and_then(|&(previous, number)| {
+            matches!((previous, time), (Some(p), Some(t)) if t - p <= gap_ms).then_some(number)
+        });
+        let number = joins.unwrap_or_else(|| {
             burst += 1;
-        }
-        numbers[i] = burst;
-        previous = time;
+            burst
+        });
+        numbers[i] = number;
+        current.insert(body, (time, number));
     }
     let width = burst.to_string().len().max(4);
     numbers.iter().map(|n| format!("{n:0width$}")).collect()
@@ -2348,6 +2360,19 @@ mod tests {
         assert_eq!(burst_numbers(&files, &infos, 2.0), ["0003", "0001", "0001", "0001", "0002", "0004"]);
         // With no gap allowed, every frame in a different second stands alone.
         assert_eq!(burst_numbers(&files, &infos, 0.0), ["0005", "0001", "0002", "0003", "0004", "0006"]);
+    }
+
+    #[test]
+    fn bursts_are_per_camera_body() {
+        let file = |p: &str| InputFile { path: PathBuf::from(p), rel_dir: PathBuf::new() };
+        let shot = |s: u8, model: &str| naming::NameInfo {
+            taken: Some((2026, 11, 14, 10, 0, s)),
+            model: Some(model.to_string()),
+            ..Default::default()
+        };
+        let files = [file("a1"), file("b1"), file("a2"), file("b2")];
+        let infos = [shot(0, "A"), shot(0, "B"), shot(1, "A"), shot(1, "B")];
+        assert_eq!(burst_numbers(&files, &infos, 2.0), ["0001", "0002", "0001", "0002"]);
     }
 
     #[test]
