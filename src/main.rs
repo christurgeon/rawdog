@@ -107,6 +107,11 @@ struct Cli {
     #[arg(long, value_name = "MODEL", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     camera: Option<String>,
 
+    /// Convert only files taken with a lens whose name contains this text
+    /// (not case-sensitive), for example "70-200" or "GM"
+    #[arg(long, value_name = "LENS", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    lens: Option<String>,
+
     /// Correct a camera clock that was set wrong: "+1h", "-30m", "+3m12s",
     /// or per camera model "7M4=+3m12s,Z 6=-1h". Changes the capture time
     /// used by --name, --since, --until, and --gallery, and the dates in the
@@ -428,7 +433,7 @@ fn parse_defaults(text: &str) -> Result<Vec<String>, String> {
         match line.split_once(char::is_whitespace) {
             Some((option, value)) => {
                 args.push(option.to_string());
-                args.push(value.trim().to_string());
+                args.push(expand_home(value.trim(), std::env::var_os("HOME").as_deref()));
             }
             None if value_is_optional(line) => {
                 return Err(format!(
@@ -440,6 +445,16 @@ fn parse_defaults(text: &str) -> Result<Vec<String>, String> {
         }
     }
     Ok(args)
+}
+
+/// A value that starts with `~/` with the home directory in place of `~`,
+/// as a shell would do on the command line. The defaults file is not read
+/// by a shell. A `~` elsewhere, as in copyright text, is kept.
+fn expand_home(value: &str, home: Option<&std::ffi::OsStr>) -> String {
+    match (value.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => Path::new(home).join(rest).to_string_lossy().into_owned(),
+        _ => value.to_string(),
+    }
 }
 
 /// True if `option` takes a value that may be left out, like `--sharpen`.
@@ -490,6 +505,7 @@ struct Selection {
     since: Option<(u16, u8, u8)>,
     until: Option<(u16, u8, u8)>,
     camera: Option<String>,
+    lens: Option<String>,
     /// Wanted colour labels in lower case; empty for any.
     labels: Vec<String>,
     picks: Option<Picks>,
@@ -505,6 +521,7 @@ impl Selection {
             || self.since.is_some()
             || self.until.is_some()
             || self.camera.is_some()
+            || self.lens.is_some()
             || !self.labels.is_empty()
     }
 
@@ -538,6 +555,16 @@ impl Selection {
                 Some(label) => format!("label {label}"),
                 None => "no label".to_string(),
             });
+        }
+        if let Some(wanted) = &self.lens {
+            let lens = info.lens.as_deref().unwrap_or_default();
+            if !lens.to_lowercase().contains(&wanted.to_lowercase()) {
+                return Some(if lens.is_empty() {
+                    "no lens recorded".to_string()
+                } else {
+                    format!("lens {lens}")
+                });
+            }
         }
         if let Some(wanted) = &self.camera {
             let model = info.model.as_deref().unwrap_or_default();
@@ -836,6 +863,7 @@ fn main() -> Result<()> {
         since: cli.since,
         until: cli.until,
         camera: cli.camera.clone(),
+        lens: cli.lens.clone(),
         labels: cli.label.iter().map(|l| l.trim().to_lowercase()).collect(),
         picks: picks_text.as_deref().map(|text| Picks::parse(text, &stems)),
     };
@@ -1877,6 +1905,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn expand_home_replaces_only_a_leading_tilde() {
+        let home = Some(std::ffi::OsStr::new("/Users/jd"));
+        assert_eq!(expand_home("~/logo.png", home), "/Users/jd/logo.png");
+        assert_eq!(expand_home("(c) ~ J. Doe", home), "(c) ~ J. Doe");
+        assert_eq!(expand_home("~other/x", home), "~other/x");
+        assert_eq!(expand_home("~/logo.png", None), "~/logo.png");
+    }
+
+    #[test]
     fn parse_defaults_reads_one_option_per_line() {
         let text = "# my defaults\n\n--copyright (c) 2026 J. Doe\n  --strip-gps  \n--quality 90\n";
         assert_eq!(
@@ -1917,9 +1954,22 @@ mod tests {
             since: None,
             until: None,
             camera: None,
+            lens: None,
             labels: Vec::new(),
             picks: None,
         }
+    }
+
+    #[test]
+    fn selection_by_lens() {
+        let sel = Selection { lens: Some("70-200".to_string()), ..selection() };
+        let with = |lens: Option<&str>| naming::NameInfo {
+            lens: lens.map(str::to_string),
+            ..Default::default()
+        };
+        assert!(sel.exclusion(&with(Some("FE 70-200mm F2.8 GM OSS II"))).is_none());
+        assert_eq!(sel.exclusion(&with(Some("FE 24-70mm F2.8 GM"))).unwrap(), "lens FE 24-70mm F2.8 GM");
+        assert_eq!(sel.exclusion(&with(None)).unwrap(), "no lens recorded");
     }
 
     #[test]
