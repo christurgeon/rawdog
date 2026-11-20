@@ -37,7 +37,8 @@ pub enum OutputFormat {
     // Options from the defaults file come first; a later value wins.
     args_override_self = true,
     after_help = "Default options can be set in ~/.config/rawdog/defaults (or the file named by \
-                  RAWDOG_DEFAULTS): one option per line, for example `--copyright (c) {year} J. Doe`."
+                  RAWDOG_DEFAULTS): one option per line, for example `--copyright (c) {year} J. Doe`. \
+                  --no-defaults ignores the file for one run."
 )]
 struct Cli {
     /// One or more RAW files, or directories that contain RAW files.
@@ -127,7 +128,8 @@ struct Cli {
 
     /// Write gallery.html into the output directory: a proof page of the
     /// output images with file name, capture time, camera, and rating.
-    /// Needs -o and JPEG or PNG output; replaces an earlier gallery.html
+    /// Needs -o and JPEG or PNG output; replaces an earlier gallery.html.
+    /// With several --resize sizes, it shows the smallest, in its folder
     #[arg(long, requires = "output")]
     gallery: bool,
 
@@ -215,7 +217,8 @@ struct Cli {
 
     /// Use the JPEG preview that the camera embedded in each RAW file,
     /// without developing the RAW data. Very fast, with the camera's own
-    /// colours; the size depends on the camera (1616x1080 for Sony)
+    /// colours; the size depends on the camera (1616x1080 for most Sony
+    /// bodies)
     #[arg(long, conflicts_with_all = ["fast", "exposure", "wb"])]
     preview: bool,
 
