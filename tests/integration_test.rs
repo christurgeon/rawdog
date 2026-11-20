@@ -939,3 +939,67 @@ fn cli_reports_a_bad_line_in_the_defaults_file() {
     assert!(stderr.contains("line 2"), "{stderr}");
     assert!(!output.status.success());
 }
+
+/// A 256x256 image of noise, whose JPEG size depends strongly on quality.
+fn write_noise_png(path: &std::path::Path) {
+    let mut state = 12345u32;
+    let img = image::RgbImage::from_fn(256, 256, |_, _| {
+        state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        let v = (state >> 16) as u8;
+        image::Rgb([v, v.wrapping_mul(3), v.wrapping_add(90)])
+    });
+    img.save(path).unwrap();
+}
+
+#[test]
+fn cli_max_size_lowers_quality_until_the_file_fits() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("noise.png");
+    write_noise_png(&input);
+    let out_dir = tmp.path().join("out");
+
+    let output = run(&[input.as_ref(), "-o".as_ref(), out_dir.as_ref()]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let full = fs::metadata(out_dir.join("noise.jpg")).unwrap().len();
+
+    let limit = full / 3;
+    let output = run(&[
+        input.as_ref(),
+        "-o".as_ref(),
+        out_dir.as_ref(),
+        "--overwrite".as_ref(),
+        "--max-size".as_ref(),
+        limit.to_string().as_ref(),
+    ]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let fitted = fs::metadata(out_dir.join("noise.jpg")).unwrap().len();
+    assert!(fitted <= limit, "{fitted} > {limit}");
+    assert!(fitted > limit / 2, "quality lowered too far: {fitted} for {limit}");
+}
+
+#[test]
+fn cli_max_size_fails_when_lowest_quality_is_too_large() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("noise.png");
+    write_noise_png(&input);
+    let out_dir = tmp.path().join("out");
+    let output = run(&[
+        input.as_ref(),
+        "-o".as_ref(),
+        out_dir.as_ref(),
+        "--max-size".as_ref(),
+        "1KB".as_ref(),
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("larger than --max-size 1 KB"), "{stderr}");
+    assert!(files_under(&out_dir).is_empty(), "{:?}", files_under(&out_dir));
+}
+
+#[test]
+fn cli_max_size_needs_jpeg_output() {
+    let output = run(&["x.arw".as_ref(), "-f".as_ref(), "png".as_ref(), "--max-size".as_ref(), "2MB".as_ref()]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--max-size needs JPEG output"), "{stderr}");
+}
