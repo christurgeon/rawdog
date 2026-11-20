@@ -139,7 +139,7 @@ rawdog -R /Volumes/CARD -o ./jpegs --report run.csv
 rawdog ./photos/ --quiet                     # print errors only
 ```
 
-By default rawdog chooses how many files to convert at the same time from the installed RAM and the size of the largest input, because too many large files at once make the system swap.
+By default rawdog chooses how many files to convert at the same time from the installed RAM and the size of the largest input, because too many large files at once make the system swap. The choice does not know how much memory other apps use. If a browser or editor already holds most of it, full-size runs can stall while the system swaps; use `-j 1`, or `--fast` for proofs, which needs about a third of the memory.
 
 `--report` lists each file with its output, its status (converted, skipped, failed, or excluded), the error message, and the time taken. It is JSON if the name ends in `.json`, otherwise CSV.
 
