@@ -128,7 +128,7 @@ Or convert by colour label, from the same sidecar files. Lightroom and Capture O
 rawdog -R /Volumes/CARD --label red,green -o ./selects
 ```
 
-Convert one day of a multi-day card, from one of two bodies:
+Convert one day of a multi-day card, from one of two bodies (`--lens 70-200` selects by lens in the same way):
 
 ```sh
 rawdog -R /Volumes/CARD --since 2026-11-14 --until 2026-11-14 --camera 7M4 -o ./day2
@@ -258,7 +258,7 @@ find /Volumes/CARD -name "*.ARW" -newer last-import | rawdog --files-from - -o .
 
 ### Default options
 
-Options you use every time can go in `~/.config/rawdog/defaults`, one per line. The value follows the option after a space and needs no quotes:
+Options you use every time can go in `~/.config/rawdog/defaults`, one per line. The value follows the option after a space and needs no quotes; a path may start with `~/`:
 
 ```
 # ~/.config/rawdog/defaults
@@ -266,6 +266,7 @@ Options you use every time can go in `~/.config/rawdog/defaults`, one per line. 
 --artist J. Doe
 --strip-gps
 --sharpen 0.5
+--watermark ~/logo.png
 ```
 
 `--sharpen` needs its amount in the file. An option on the command line overrides the same option in the file. `--no-defaults` ignores the file for one run, and `RAWDOG_DEFAULTS` names a different file.
