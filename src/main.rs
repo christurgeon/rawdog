@@ -79,6 +79,12 @@ struct Cli {
     #[arg(long, value_name = "MODEL", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     camera: Option<String>,
 
+    /// Convert only the files named in this file, such as a list a client
+    /// sent back from the gallery. Names are separated by lines, commas,
+    /// or spaces, and may include an extension (DSC01234 or DSC01234.jpg)
+    #[arg(long, value_name = "FILE")]
+    picks: Option<PathBuf>,
+
     /// Write what happened to each file to this file: JSON if the name ends
     /// in .json, otherwise CSV. Columns: input, output, status (converted,
     /// skipped, failed, excluded), message, seconds
@@ -331,10 +337,15 @@ struct Selection {
     since: Option<(u16, u8, u8)>,
     until: Option<(u16, u8, u8)>,
     camera: Option<String>,
+    picks: Option<Picks>,
 }
 
 impl Selection {
     fn is_active(&self) -> bool {
+        self.needs_exif() || self.picks.is_some()
+    }
+
+    fn needs_exif(&self) -> bool {
         self.min_rating.is_some()
             || self.since.is_some()
             || self.until.is_some()
@@ -344,6 +355,9 @@ impl Selection {
     /// Why a file is excluded, if it is. A file without the metadata that a
     /// filter needs is excluded.
     fn exclusion(&self, info: &naming::NameInfo) -> Option<String> {
+        if self.picks.as_ref().is_some_and(|p| !p.contains(&info.stem)) {
+            return Some("not in the picks list".to_string());
+        }
         if let Some(min) = self.min_rating {
             match info.rating {
                 Some(r) if r >= min => {}
@@ -374,6 +388,59 @@ impl Selection {
             }
         }
         None
+    }
+}
+
+/// The file names of a `--picks` list, compared without letter case.
+struct Picks {
+    /// Each name as written, in lower case, and in lower case without its
+    /// extension. A name is kept whole too, because a stem can contain a dot.
+    names: Vec<(String, String, String)>,
+}
+
+impl Picks {
+    fn parse(text: &str) -> Picks {
+        let names = text
+            .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+            .filter(|n| !n.is_empty())
+            // A name copied from a path or a URL keeps only its last part.
+            .map(|n| n.rsplit(['/', '\\']).next().unwrap_or(n))
+            .filter(|n| !n.is_empty())
+            .map(|n| {
+                let lower = n.to_lowercase();
+                // Only a short extension with a letter is removed, so that
+                // "IMG.0001" stays whole.
+                let bare = match lower.rsplit_once('.') {
+                    Some((stem, ext))
+                        if !stem.is_empty()
+                            && ext.len() <= 4
+                            && ext.chars().any(|c| c.is_ascii_alphabetic()) =>
+                    {
+                        stem.to_string()
+                    }
+                    _ => lower.clone(),
+                };
+                (n.to_string(), lower, bare)
+            })
+            .collect();
+        Picks { names }
+    }
+
+    fn contains(&self, stem: &str) -> bool {
+        let stem = stem.to_lowercase();
+        self.names.iter().any(|n| n.1 == stem || n.2 == stem)
+    }
+
+    /// The listed names that match none of `stems`, in list order.
+    fn unmatched(&self, stems: &[String]) -> Vec<&str> {
+        let stems: HashSet<String> = stems.iter().map(|s| s.to_lowercase()).collect();
+        let mut seen = HashSet::new();
+        self.names
+            .iter()
+            .filter(|n| !stems.contains(&n.1) && !stems.contains(&n.2))
+            .filter(|n| seen.insert(&n.2))
+            .map(|n| n.0.as_str())
+            .collect()
     }
 }
 
@@ -474,6 +541,19 @@ fn main() -> Result<()> {
         bail!("Output path {} exists and is not a directory.", dir.display());
     }
 
+    let picks = match &cli.picks {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read picks list {}", path.display()))?;
+            let picks = Picks::parse(&text);
+            if picks.names.is_empty() {
+                bail!("The picks list {} names no files.", path.display());
+            }
+            Some(picks)
+        }
+        None => None,
+    };
+
     // Collect all RAW files from inputs
     let files = collect_raw_files(&cli.input, cli.recursive)?;
     // Same condition under which collect_raw_files warns "does not exist".
@@ -491,12 +571,29 @@ fn main() -> Result<()> {
         since: cli.since,
         until: cli.until,
         camera: cli.camera.clone(),
+        picks,
     };
+    if let (Some(picks), Some(path)) = (&selection.picks, &cli.picks) {
+        let stems: Vec<String> = files
+            .iter()
+            .map(|f| f.path.file_stem().unwrap_or_default().to_string_lossy().into_owned())
+            .collect();
+        let unmatched = picks.unmatched(&stems);
+        if !unmatched.is_empty() {
+            eprintln!(
+                "Warning: {} name(s) in {} match no RAW file: {}",
+                unmatched.len(),
+                path.display(),
+                unmatched.join(", ")
+            );
+        }
+    }
     let mut excluded_records = Vec::new();
     let files = if selection.is_active() {
+        let needs_exif = selection.needs_exif();
         let excluded: Vec<Option<String>> = files
             .par_iter()
-            .map(|f| selection.exclusion(&naming::NameInfo::read(&f.path, true)))
+            .map(|f| selection.exclusion(&naming::NameInfo::read(&f.path, needs_exif)))
             .collect();
         let (kept, dropped): (Vec<_>, Vec<_>) =
             files.into_iter().zip(excluded).partition(|(_, reason)| reason.is_none());
@@ -1304,7 +1401,36 @@ mod tests {
             since: None,
             until: None,
             camera: None,
+            picks: None,
         }
+    }
+
+    #[test]
+    fn picks_parse_names_in_any_list_form() {
+        let picks = Picks::parse("DSC01234.jpg, dsc01300\r\nproofs/DSC01400.JPG;  IMG.0001\n\n");
+        for stem in ["DSC01234", "DSC01300", "dsc01400", "IMG.0001"] {
+            assert!(picks.contains(stem), "{stem}");
+        }
+        assert!(!picks.contains("DSC01235"));
+        assert!(!picks.contains("IMG"));
+    }
+
+    #[test]
+    fn picks_report_unmatched_names_once() {
+        let picks = Picks::parse("DSC1.jpg DSC2 dsc2.JPG DSC3");
+        let stems = ["dsc1".to_string(), "DSC9".to_string()];
+        assert_eq!(picks.unmatched(&stems), vec!["DSC2", "DSC3"]);
+    }
+
+    #[test]
+    fn selection_by_picks() {
+        let sel = Selection {
+            picks: Some(Picks::parse("x.jpg")),
+            ..selection()
+        };
+        assert!(sel.exclusion(&info(None, None, None)).is_none());
+        let other = naming::NameInfo { stem: "y".to_string(), ..Default::default() };
+        assert_eq!(sel.exclusion(&other).unwrap(), "not in the picks list");
     }
 
     #[test]

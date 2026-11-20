@@ -103,6 +103,14 @@ Convert one day of a multi-day card, from one of two bodies:
 rawdog -R /Volumes/CARD --since 2026-11-14 --until 2026-11-14 --camera 7M4 -o ./day2
 ```
 
+Convert the frames a client chose from the gallery. Paste the names they sent into a file; names may be separated by lines, commas, or spaces, and may keep their extension:
+
+```sh
+rawdog -R /Volumes/CARD --picks picks.txt -o ./finals
+```
+
+Names are compared with the RAW file names, without letter case, so proofs made with `--name` need their `{stem}` in the name. rawdog warns about each listed name that matches no RAW file, so a typing error is not missed.
+
 Dates are the camera clock's local date. A file without the metadata that a filter needs is excluded; `--dry-run` lists each excluded file with the reason.
 
 ### Naming and importing
