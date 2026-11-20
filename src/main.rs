@@ -230,9 +230,10 @@ struct Cli {
     gpx: Option<PathBuf>,
 
     /// The camera clock's UTC offset for --gpx, such as +02:00, for files
-    /// that do not record it
-    #[arg(long, value_name = "OFFSET", requires = "gpx", allow_hyphen_values = true)]
-    gpx_tz: Option<gpx::UtcOffset>,
+    /// that do not record it. For a trip across time zones, add changes at
+    /// camera-clock times: "+01:00,2026-11-17T14:00=+05:30"
+    #[arg(long, value_name = "OFFSETS", requires = "gpx", allow_hyphen_values = true)]
+    gpx_tz: Option<gpx::Zones>,
 
     /// Do not copy GPS location to the output
     #[arg(long)]
@@ -1310,7 +1311,7 @@ fn main() -> Result<()> {
             dpi: cli.dpi,
             keep_rating: cli.keep_rating,
             gpx: gpx_track,
-            gpx_tz: cli.gpx_tz.map(|o| o.0),
+            gpx_tz: cli.gpx_tz.clone(),
             keywords: cli
                 .keywords
                 .iter()

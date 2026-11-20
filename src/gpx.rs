@@ -78,18 +78,68 @@ impl Track {
     }
 }
 
-/// A UTC offset such as "+02:00" or "-05:30", in seconds.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct UtcOffset(pub i64);
+/// The camera clock's UTC offsets for `--gpx-tz`: one offset, or offsets
+/// that change at given camera-clock times, as in
+/// "+01:00,2026-11-17T14:00=+05:30" for a trip across time zones.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Zones {
+    /// The offset before the first change, if given.
+    first: Option<i64>,
+    /// (camera-clock seconds since 1970, offset), sorted.
+    changes: Vec<(i64, i64)>,
+}
 
-impl FromStr for UtcOffset {
+impl FromStr for Zones {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, String> {
-        parse_offset(s.trim())
-            .map(UtcOffset)
-            .ok_or_else(|| format!("'{s}' is not a UTC offset such as +02:00 or -05:30"))
+        let error = |part: &str| {
+            format!("'{part}' is not an offset such as +02:00, or a change such as 2026-11-17T14:00=+05:30")
+        };
+        let mut zones = Zones { first: None, changes: Vec::new() };
+        for part in s.split(',').map(str::trim) {
+            match part.split_once('=') {
+                None if zones.first.is_none() && zones.changes.is_empty() => {
+                    zones.first = Some(parse_offset(part).ok_or_else(|| error(part))?);
+                }
+                None => return Err(format!("'{part}': only the first offset may be given without a time")),
+                Some((when, offset)) => {
+                    let when = parse_local(when.trim()).ok_or_else(|| error(part))?;
+                    let offset = parse_offset(offset.trim()).ok_or_else(|| error(part))?;
+                    zones.changes.push((when, offset));
+                }
+            }
+        }
+        zones.changes.sort_unstable();
+        Ok(zones)
     }
+}
+
+impl Zones {
+    /// The offset in force at camera-clock time `local` (seconds).
+    pub fn at(&self, local: i64) -> Option<i64> {
+        self.changes
+            .iter()
+            .rev()
+            .find(|(when, _)| *when <= local)
+            .map(|(_, offset)| *offset)
+            .or(self.first)
+    }
+}
+
+/// A camera-clock time "2026-11-17T14:00" (seconds optional), or a date
+/// "2026-11-17" (midnight), in seconds since 1970.
+fn parse_local(s: &str) -> Option<i64> {
+    let number = |range: std::ops::Range<usize>| s.get(range)?.parse::<u16>().ok();
+    let (y, mo, d) = (number(0..4)?, number(5..7)? as u8, number(8..10)? as u8);
+    let (h, mi, sec) = match s.len() {
+        10 => (0, 0, 0),
+        16 => (number(11..13)? as u8, number(14..16)? as u8, 0),
+        19 => (number(11..13)? as u8, number(14..16)? as u8, number(17..19)? as u8),
+        _ => return None,
+    };
+    ((1..=12).contains(&mo) && (1..=31).contains(&d) && h < 24 && mi < 60 && sec < 60)
+        .then(|| to_seconds((y, mo, d, h, mi, sec)))
 }
 
 /// "+02:00", "-0530", or "Z" in seconds.
@@ -187,6 +237,21 @@ mod tests {
         assert_eq!(parse_utc("2026-11-14T11:00:00+01:00"), Some(utc(10, 0, 0)));
         assert_eq!(parse_utc("2026-11-14T10:00:00.250Z"), Some(utc(10, 0, 0)));
         assert_eq!(parse_utc("yesterday"), None);
+    }
+
+    #[test]
+    fn zones_change_at_camera_clock_times() {
+        let zones: Zones = "+01:00, 2026-11-17T14:00=+05:30".parse().unwrap();
+        assert_eq!(zones.at(utc(10, 0, 0)), Some(3600)); // 2026-11-14
+        let change = to_seconds((2026, 11, 17, 14, 0, 0));
+        assert_eq!(zones.at(change - 1), Some(3600));
+        assert_eq!(zones.at(change), Some(19800));
+        let only_change: Zones = "2026-11-17=+05:30".parse().unwrap();
+        assert_eq!(only_change.at(utc(10, 0, 0)), None);
+        assert_eq!("+02:00".parse::<Zones>().unwrap().at(0), Some(7200));
+        for bad in ["", "soon", "+01:00,+02:00", "2026-13-01=+01:00", "2026-11-17T25:00=+01:00"] {
+            assert!(bad.parse::<Zones>().is_err(), "{bad}");
+        }
     }
 
     #[test]

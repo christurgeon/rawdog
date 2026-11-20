@@ -24,7 +24,7 @@ pub struct MetadataOptions {
     /// A GPS track for files without a position, and the camera clock's UTC
     /// offset in seconds when the files do not record it.
     pub gpx: Option<std::sync::Arc<crate::gpx::Track>>,
-    pub gpx_tz: Option<i64>,
+    pub gpx_tz: Option<crate::gpx::Zones>,
     /// Print resolution in pixels per inch. Replaces the source value.
     pub dpi: Option<u16>,
     /// Correction of the camera clock, applied to the capture dates.
@@ -530,7 +530,7 @@ fn gpx_position<'a>(
     // The file's own time zone wins; --gpx-tz is for files without one.
     let offset = ascii(Tag::OffsetTimeOriginal)
         .and_then(|o| crate::gpx::parse_offset(&o))
-        .or(meta.gpx_tz);
+        .or_else(|| meta.gpx_tz.as_ref()?.at(local + shift_seconds));
     let Some(offset) = offset else {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1115,7 +1115,7 @@ mod tests {
         let date = field(Tag::DateTimeOriginal, In::PRIMARY, Value::Ascii(vec![b"2026:11:14 10:00:00".to_vec()]));
         let meta = MetadataOptions {
             gpx: Some(std::sync::Arc::new(track)),
-            gpx_tz: Some(7200),
+            gpx_tz: Some("+02:00".parse().unwrap()),
             ..Default::default()
         };
         let out = fields_for_output([date.clone()].iter(), (300, 200), &meta);
@@ -1132,7 +1132,7 @@ mod tests {
 
         // The file's own time zone wins over --gpx-tz.
         let zone = field(Tag::OffsetTimeOriginal, In::PRIMARY, Value::Ascii(vec![b"+02:00".to_vec()]));
-        let wrong_tz = MetadataOptions { gpx_tz: Some(5 * 3600), ..meta.clone() };
+        let wrong_tz = MetadataOptions { gpx_tz: Some("+05:00".parse().unwrap()), ..meta.clone() };
         let out = fields_for_output([date.clone(), zone].iter(), (300, 200), &wrong_tz);
         assert!(out.iter().any(|f| f.tag == Tag::GPSLatitude));
 
