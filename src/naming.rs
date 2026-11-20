@@ -16,6 +16,7 @@ enum Token {
     Serial,
     Rating,
     Seq,
+    Burst,
 }
 
 const TOKENS: &[(&str, Token)] = &[
@@ -30,6 +31,7 @@ const TOKENS: &[(&str, Token)] = &[
     ("serial", Token::Serial),
     ("rating", Token::Rating),
     ("seq", Token::Seq),
+    ("burst", Token::Burst),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -44,6 +46,8 @@ pub struct NameTemplate {
     parts: Vec<Part>,
     /// The first `{seq}` number.
     pub seq_start: u32,
+    /// Largest gap in seconds between two frames of one `{burst}`.
+    pub burst_gap: u32,
 }
 
 impl FromStr for NameTemplate {
@@ -91,7 +95,7 @@ impl FromStr for NameTemplate {
         if literal.is_empty() || literal.ends_with('/') || escapes {
             return Err("must be a relative file path without '..'".to_string());
         }
-        Ok(NameTemplate { parts, seq_start: 1 })
+        Ok(NameTemplate { parts, seq_start: 1, burst_gap: 2 })
     }
 }
 
@@ -371,10 +375,15 @@ impl NameTemplate {
         self.parts.contains(&Part::Token(Token::Seq))
     }
 
+    /// True if the template uses `{burst}`.
+    pub fn uses_burst(&self) -> bool {
+        self.parts.contains(&Part::Token(Token::Burst))
+    }
+
     /// Build the output path, without extension, relative to the output
     /// directory. Values that the file does not have become `unknown`.
-    /// `seq` is the value of `{seq}`.
-    pub fn expand(&self, info: &NameInfo, seq: &str) -> PathBuf {
+    /// `seq` and `burst` are the values of `{seq}` and `{burst}`.
+    pub fn expand(&self, info: &NameInfo, seq: &str, burst: &str) -> PathBuf {
         let unknown = || "unknown".to_string();
         let taken = |f: fn(Taken) -> String| info.taken.map(f).unwrap_or_else(unknown);
         let mut out = String::new();
@@ -399,6 +408,7 @@ impl NameTemplate {
                             r => r.to_string(),
                         },
                         Token::Seq => seq.to_string(),
+                        Token::Burst => burst.to_string(),
                     };
                     // A value must not add path components, and must not
                     // be the name of the current or the parent directory.
@@ -434,7 +444,7 @@ mod tests {
     }
 
     fn expand(template: &str, info: &NameInfo) -> PathBuf {
-        template.parse::<NameTemplate>().unwrap().expand(info, "0007")
+        template.parse::<NameTemplate>().unwrap().expand(info, "0007", "0003")
     }
 
     #[test]
@@ -442,10 +452,13 @@ mod tests {
         let template: NameTemplate = "{date}/{seq}_{stem}".parse().unwrap();
         assert!(template.uses_seq() && template.needs_exif());
         assert_eq!(
-            template.expand(&info(), "0042"),
+            template.expand(&info(), "0042", ""),
             PathBuf::from("2024-03-09/0042_DSC0001")
         );
         assert!(!"{stem}".parse::<NameTemplate>().unwrap().uses_seq());
+        let burst: NameTemplate = "{burst}/{stem}".parse().unwrap();
+        assert!(burst.uses_burst() && burst.needs_exif());
+        assert_eq!(burst.expand(&info(), "", "0003"), PathBuf::from("0003/DSC0001"));
     }
 
     #[test]

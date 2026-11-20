@@ -147,13 +147,21 @@ Dates are the camera clock's local date. A file without the metadata that a filt
 rawdog -R /Volumes/CARD -o ~/Pictures --name "{date}/{model}_{stem}"
 ```
 
-Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), `{model}`, `{lens}`, `{serial}` (the body's serial number, to keep two bodies of one model apart), `{rating}` (0 for unrated, `rejected` for a file rejected in Lightroom), and `{seq}`. A file without that metadata gets `unknown`; some cameras, such as Sony bodies, do not record the serial number in standard metadata. Characters that are not allowed in file names on exFAT drives or Windows (`/ \ : | * ? " < >`) become `_`.
+Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), `{model}`, `{lens}`, `{serial}` (the body's serial number, to keep two bodies of one model apart), `{rating}` (0 for unrated, `rejected` for a file rejected in Lightroom), `{seq}`, and `{burst}`. A file without that metadata gets `unknown`; some cameras, such as Sony bodies, do not record the serial number in standard metadata. Characters that are not allowed in file names on exFAT drives or Windows (`/ \ : | * ? " < >`) become `_`.
 
 `{seq}` numbers the files of the run in capture order (0001, 0002, ...). Numbers have four digits, or more when they pass 9999; a name with five digits does not sort after one with four, so keep a numbering below 10,000 files. Two bodies at a wedding both write `DSC00001`, and a burst puts several frames in one second; with `{seq}` the files of both cameras get one sequence and never share a name:
 
 ```sh
 rawdog -R /Volumes/CARD_A /Volumes/CARD_B -o ./wedding --name "{date}/{seq}_{stem}"
 ```
+
+`{burst}` numbers groups of frames taken close together, so each burst of a wildlife or sports sequence, or each exposure bracket, goes into its own folder for culling. A frame taken more than `--burst-gap` seconds (default 2) after the one before starts a new burst. Capture times have one-second steps, so a gap of 0 separates frames from different seconds only:
+
+```sh
+rawdog -R /Volumes/CARD -r 2048 --fast -o ./cull --name "{burst}/{stem}"
+```
+
+Like `{seq}`, `{burst}` numbers are counted per run, and a run refuses to start when its output files exist.
 
 If a camera clock was set wrong, `--time-shift` corrects the capture time: for every camera (`+1h`), or per camera model to line up two bodies before numbering them:
 
