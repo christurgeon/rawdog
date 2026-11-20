@@ -404,14 +404,18 @@ fn read_rating(path: &Path, fields: &[exif::Field]) -> Option<i8> {
         return None;
     }
     // rawler can panic on files that are not RAW files.
-    let xmp = std::panic::catch_unwind(|| {
-        let source = rawler::rawsource::RawSource::new(path).ok()?;
-        let decoder = rawler::get_decoder(&source).ok()?;
-        decoder
-            .xpacket(&source, &rawler::decoders::RawDecodeParams::default())
-            .ok()?
-    })
-    .ok()??;
+    let read = |source: rawler::rawsource::RawSource| {
+        std::panic::catch_unwind(move || {
+            let decoder = rawler::get_decoder(&source).ok()?;
+            decoder.xpacket(&source, &rawler::decoders::RawDecodeParams::default()).ok()?
+        })
+        .ok()
+        .flatten()
+    };
+    // The start of the file is enough for most; see `head_source`.
+    let xmp = crate::exif::head_source(path)
+        .and_then(read)
+        .or_else(|| read(rawler::rawsource::RawSource::new(path).ok()?))?;
     xmp_rating(&xmp)
 }
 
