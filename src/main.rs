@@ -60,6 +60,11 @@ struct Cli {
     #[arg(long, value_name = "TEMPLATE")]
     name: Option<naming::NameTemplate>,
 
+    /// The first {seq} number, to continue the numbering of an earlier run
+    #[arg(long, value_name = "N", requires = "name", default_value_t = 1,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    seq_start: u32,
+
     /// Convert only files rated at least this many stars (1 to 5). Ratings
     /// come from sidecar XMP files (Lightroom, Capture One, darktable) or
     /// from the camera
@@ -699,11 +704,15 @@ fn main() -> Result<()> {
         files
     };
 
+    let template = cli.name.clone().map(|mut t| {
+        t.seq_start = cli.seq_start;
+        t
+    });
     let jobs = plan_outputs(
         &files,
         cli.output.as_deref(),
         cli.format,
-        cli.name.as_ref(),
+        template.as_ref(),
         cli.time_shift.as_ref(),
     )?;
 
@@ -1139,13 +1148,14 @@ fn canonical(path: &Path) -> PathBuf {
 /// The `{seq}` value of each file: its position in capture order, from 1,
 /// with at least four digits. Files with the same capture time are ordered
 /// by path, and files without one come last.
-fn sequence_numbers(files: &[InputFile], infos: &[naming::NameInfo]) -> Vec<String> {
+fn sequence_numbers(files: &[InputFile], infos: &[naming::NameInfo], start: u32) -> Vec<String> {
     let mut order: Vec<usize> = (0..files.len()).collect();
     order.sort_by_key(|&i| (infos[i].taken.is_none(), infos[i].taken, &files[i].path));
-    let width = files.len().to_string().len().max(4);
+    let last = u64::from(start) + files.len() as u64 - 1;
+    let width = last.to_string().len().max(4);
     let mut seqs = vec![String::new(); files.len()];
     for (n, &i) in order.iter().enumerate() {
-        seqs[i] = format!("{:0width$}", n + 1);
+        seqs[i] = format!("{:0width$}", u64::from(start) + n as u64);
     }
     seqs
 }
@@ -1168,7 +1178,7 @@ fn plan_outputs(
             .map(|f| naming::NameInfo::read(&f.path, needs_exif).shifted(shift))
             .collect();
         let seqs = if t.uses_seq() {
-            sequence_numbers(files, &infos)
+            sequence_numbers(files, &infos, t.seq_start)
         } else {
             vec![String::new(); files.len()]
         };
@@ -1557,7 +1567,9 @@ mod tests {
             taken(None),
             taken(Some((2026, 11, 14, 9, 0, 0))),
         ];
-        assert_eq!(sequence_numbers(&files, &infos), ["0003", "0002", "0004", "0001"]);
+        assert_eq!(sequence_numbers(&files, &infos, 1), ["0003", "0002", "0004", "0001"]);
+        assert_eq!(sequence_numbers(&files, &infos, 413), ["0415", "0414", "0416", "0413"]);
+        assert_eq!(sequence_numbers(&files, &infos, 9998), ["10000", "09999", "10001", "09998"]);
     }
 
     #[test]
@@ -1566,7 +1578,7 @@ mod tests {
             .map(|i| InputFile { path: PathBuf::from(format!("{i:05}.arw")), rel_dir: PathBuf::new() })
             .collect();
         let infos: Vec<naming::NameInfo> = (0..10_000).map(|_| Default::default()).collect();
-        let seqs = sequence_numbers(&files, &infos);
+        let seqs = sequence_numbers(&files, &infos, 1);
         assert_eq!((seqs[0].as_str(), seqs[9_999].as_str()), ("00001", "10000"));
     }
 

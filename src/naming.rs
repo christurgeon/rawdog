@@ -40,7 +40,11 @@ enum Part {
 
 /// A parsed `--name` template.
 #[derive(Clone, Debug)]
-pub struct NameTemplate(Vec<Part>);
+pub struct NameTemplate {
+    parts: Vec<Part>,
+    /// The first `{seq}` number.
+    pub seq_start: u32,
+}
 
 impl FromStr for NameTemplate {
     type Err = String;
@@ -87,7 +91,7 @@ impl FromStr for NameTemplate {
         if literal.is_empty() || literal.ends_with('/') || escapes {
             return Err("must be a relative file path without '..'".to_string());
         }
-        Ok(NameTemplate(parts))
+        Ok(NameTemplate { parts, seq_start: 1 })
     }
 }
 
@@ -357,14 +361,14 @@ impl NameTemplate {
     /// True if the template uses a value that comes from EXIF data.
     /// `{seq}` counts in capture order, so it needs the capture time.
     pub fn needs_exif(&self) -> bool {
-        self.0
+        self.parts
             .iter()
             .any(|p| matches!(p, Part::Token(t) if *t != Token::Stem))
     }
 
     /// True if the template uses `{seq}`.
     pub fn uses_seq(&self) -> bool {
-        self.0.contains(&Part::Token(Token::Seq))
+        self.parts.contains(&Part::Token(Token::Seq))
     }
 
     /// Build the output path, without extension, relative to the output
@@ -374,7 +378,7 @@ impl NameTemplate {
         let unknown = || "unknown".to_string();
         let taken = |f: fn(Taken) -> String| info.taken.map(f).unwrap_or_else(unknown);
         let mut out = String::new();
-        for part in &self.0 {
+        for part in &self.parts {
             match part {
                 Part::Literal(l) => out.push_str(l),
                 Part::Token(token) => {
