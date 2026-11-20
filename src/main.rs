@@ -55,7 +55,7 @@ struct Cli {
 
     /// Name template for output files, relative to the output directory
     /// and without extension. Fields: {stem} {date} {year} {month} {day}
-    /// {time} {model} {rating} {seq}. {seq} numbers the files of the run
+    /// {time} {model} {lens} {serial} {rating} {seq}. {seq} numbers the files of the run
     /// in capture order: 0001, 0002, ... Example: "{date}/{model}_{stem}"
     #[arg(long, value_name = "TEMPLATE")]
     name: Option<naming::NameTemplate>,
@@ -1494,7 +1494,7 @@ mod tests {
             taken: date.map(|(y, m, d)| (y, m, d, 12, 0, 0)),
             model: model.map(str::to_string),
             rating,
-            labels: Vec::new(),
+            ..Default::default()
         }
     }
 
