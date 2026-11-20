@@ -85,7 +85,7 @@ rawdog -R /Volumes/CARD --preview -o ./proofs
 rawdog ./card -r 2048 --fast -o ./proofs
 ```
 
-`--gallery` writes `gallery.html` into the output directory: a page of the output images with file name, capture time, camera, and rating. It works offline and on a phone:
+`--gallery` writes `gallery.html` into the output directory: a page of the output images with file name, capture time, camera, and rating. It works offline and on a phone. Large images are shown as small copies in `gallery-thumbs/`, and each links to the full image, so the page stays fast with full-size output:
 
 ```sh
 rawdog ./wedding -r 1600 --fast -o ./proofs --gallery
@@ -103,6 +103,14 @@ Convert only your picks. Ratings come from sidecar XMP files written by Lightroo
 
 ```sh
 rawdog -R /Volumes/CARD --min-rating 3 -o ./picks
+```
+
+A rotation set while culling in Lightroom or Capture One is stored in the same sidecar file, and rawdog applies it in place of the camera's orientation. darktable keeps rotation in its edit history, which rawdog does not read.
+
+Or convert by colour label, from the same sidecar files. Lightroom and Capture One store the label name (`Red`, or the text set in Lightroom's label set); darktable's five colours are read as red, yellow, green, blue, and purple. A file with any of the listed labels is converted:
+
+```sh
+rawdog -R /Volumes/CARD --label red,green -o ./selects
 ```
 
 Convert one day of a multi-day card, from one of two bodies:
@@ -129,7 +137,7 @@ Dates are the camera clock's local date. A file without the metadata that a filt
 rawdog -R /Volumes/CARD -o ~/Pictures --name "{date}/{model}_{stem}"
 ```
 
-Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), `{model}`, `{rating}` (0 for unrated), and `{seq}`. A file without that metadata gets `unknown`.
+Template fields: `{stem}` (input file name without extension), `{date}` (2024-03-09), `{year}`, `{month}`, `{day}`, `{time}` (070542), `{model}`, `{lens}`, `{serial}` (the body's serial number, to keep two bodies of one model apart), `{rating}` (0 for unrated), and `{seq}`. A file without that metadata gets `unknown`; some cameras, such as Sony bodies, do not record the serial number in standard metadata. Characters that are not allowed in file names on exFAT drives or Windows (`/ \ : | * ? " < >`) become `_`.
 
 `{seq}` numbers the files of the run in capture order (0001, 0002, ...). Two bodies at a wedding both write `DSC00001`, and a burst puts several frames in one second; with `{seq}` the files of both cameras get one sequence and never share a name:
 
@@ -137,7 +145,19 @@ Template fields: `{stem}` (input file name without extension), `{date}` (2024-03
 rawdog -R /Volumes/CARD_A /Volumes/CARD_B -o ./wedding --name "{date}/{seq}_{stem}"
 ```
 
-The numbers depend on which files the run converts: the same selection gives the same numbers, but adding files to a later run renumbers the files taken after them.
+If a camera clock was set wrong, `--time-shift` corrects the capture time: for every camera (`+1h`), or per camera model to line up two bodies before numbering them:
+
+```sh
+rawdog -R /Volumes/CARD_A /Volumes/CARD_B -o ./wedding --name "{date}/{seq}_{stem}" --time-shift "7M4=+3m12s,Z 6=-1h"
+```
+
+Offsets use `d`, `h`, `m`, and `s`, such as `-1d`, `+30m`, or `+1h2m5s`. A camera model matches like `--camera`; a camera that no rule names is not shifted, unless one offset is given without a model. The corrected time is used by the template, `--since`, `--until`, and the gallery, and replaces the capture dates in the output metadata. With `-f original` the RAW files are copied unchanged; only their names use the corrected time.
+
+The numbers depend on which files the run converts, so adding files to a later run renumbers the files taken after them. For that reason a `{seq}` run refuses to start when any of its output files exists; use `--overwrite` to replace them, or write to an empty directory. To add a second day or a late card to an existing set, continue the numbering with `--seq-start`:
+
+```sh
+rawdog -R /Volumes/DAY2 -o ./wedding --name "{date}/{seq}_{stem}" --seq-start 413
+```
 
 The template path is below the `-o` directory. Without `-o` it is below the directory of each input file. With a template, `-R` does not mirror the input tree, so include `{date}` or another field that keeps equal file names apart.
 
@@ -147,15 +167,17 @@ The template path is below the `-o` directory. Without `-o` it is below the dire
 rawdog -R /Volumes/CARD -f original -o ~/Archive --name "{year}/{date}/{stem}"
 ```
 
-Each copy is compared byte for byte with the original and keeps its modification time; the card is never changed. XMP sidecars (`NAME.xmp` from Lightroom or Capture One, `NAME.ARW.xmp` from darktable) are copied with their RAW file, and a sidecar that already exists in the archive is kept. Image options such as `-r` cannot be used with `-f original`.
+Each copy is compared byte for byte with the original and keeps its modification time; the card is never changed. XMP sidecars (`NAME.xmp` from Lightroom or Capture One, `NAME.ARW.xmp` from darktable) are copied with their RAW file, and a sidecar that already exists in the archive is kept. With `--with-jpeg`, the JPEG or HEIF that a camera set to RAW+JPEG wrote next to each RAW file (`DSC1.JPG` or `DSC1.HIF` for `DSC1.ARW`) is copied and checked in the same way. Image options such as `-r` cannot be used with `-f original`.
 
 ### Metadata
 
 Camera, lens, exposure, and date metadata are copied to JPEG, PNG, and TIFF output. For the web, remove the location and add your name:
 
 ```sh
-rawdog ./trip -r 2048 --strip-gps --artist "J. Doe" --copyright "(c) 2026 J. Doe"
+rawdog ./trip -r 2048 --strip-gps --artist "J. Doe" --copyright "(c) {year} J. Doe"
 ```
+
+`{year}` in `--copyright` becomes the year the photo was taken (after `--time-shift`), so a defaults file stays right in a new year and for old shoots. A file without a capture date gets the current year.
 
 `--strip-metadata` copies no metadata at all.
 
@@ -171,6 +193,12 @@ rawdog ./photos/ --quiet                     # print errors only
 
 By default rawdog chooses how many files to convert at the same time from the installed RAM and the size of the largest input, because too many large files at once make the system swap. The choice does not know how much memory other apps use. If a browser or editor already holds most of it, full-size runs can stall while the system swaps; use `-j 1`, or `--fast` for proofs, which needs about a third of the memory.
 
+For a list of files made by another program, `--files-from` reads one path per line from a file, or from standard input with `-`. All files form one run, so `{seq}`, the conflict check, `--report`, and `--gallery` cover them all, which `xargs` does not guarantee:
+
+```sh
+find /Volumes/CARD -name "*.ARW" -newer last-import | rawdog --files-from - -o ./new
+```
+
 `--report` lists each file with its output, its status (converted, skipped, failed, or excluded), the error message, and the time taken. It is JSON if the name ends in `.json`, otherwise CSV.
 
 ### Default options
@@ -179,7 +207,7 @@ Options you use every time can go in `~/.config/rawdog/defaults`, one per line. 
 
 ```
 # ~/.config/rawdog/defaults
---copyright (c) 2026 J. Doe
+--copyright (c) {year} J. Doe
 --artist J. Doe
 --strip-gps
 --sharpen 0.5

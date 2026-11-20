@@ -3,6 +3,7 @@ mod exif;
 mod gallery;
 mod naming;
 mod report;
+mod timeshift;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -36,13 +37,20 @@ pub enum OutputFormat {
     // Options from the defaults file come first; a later value wins.
     args_override_self = true,
     after_help = "Default options can be set in ~/.config/rawdog/defaults (or the file named by \
-                  RAWDOG_DEFAULTS): one option per line, for example `--copyright (c) 2026 J. Doe`."
+                  RAWDOG_DEFAULTS): one option per line, for example `--copyright (c) {year} J. Doe`."
 )]
 struct Cli {
     /// One or more RAW files, or directories that contain RAW files.
     /// Sony ARW and most other camera RAW formats are accepted
-    #[arg(required_unless_present = "completions")]
+    #[arg(required_unless_present_any = ["completions", "files_from"])]
     input: Vec<PathBuf>,
+
+    /// Read more inputs from this file, one path per line; "-" reads
+    /// standard input, as in `find ... | rawdog --files-from - -o out`.
+    /// All inputs form one run, so --name {seq}, --report, and --gallery
+    /// cover them all
+    #[arg(long, value_name = "FILE")]
+    files_from: Option<PathBuf>,
 
     /// Generate shell completion script and exit
     #[arg(long, value_enum, value_name = "SHELL")]
@@ -54,16 +62,28 @@ struct Cli {
 
     /// Name template for output files, relative to the output directory
     /// and without extension. Fields: {stem} {date} {year} {month} {day}
-    /// {time} {model} {rating} {seq}. {seq} numbers the files of the run
+    /// {time} {model} {lens} {serial} {rating} {seq}. {seq} numbers the files of the run
     /// in capture order: 0001, 0002, ... Example: "{date}/{model}_{stem}"
     #[arg(long, value_name = "TEMPLATE")]
     name: Option<naming::NameTemplate>,
+
+    /// The first {seq} number, to continue the numbering of an earlier run
+    #[arg(long, value_name = "N", requires = "name", default_value_t = 1,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    seq_start: u32,
 
     /// Convert only files rated at least this many stars (1 to 5). Ratings
     /// come from sidecar XMP files (Lightroom, Capture One, darktable) or
     /// from the camera
     #[arg(long, value_name = "STARS", value_parser = clap::value_parser!(i8).range(1..=5))]
     min_rating: Option<i8>,
+
+    /// Convert only files with one of these colour labels, such as "red"
+    /// or "red,green" (not case-sensitive). Labels come from sidecar XMP
+    /// files (Lightroom, Capture One, darktable)
+    #[arg(long, value_name = "LABELS", value_delimiter = ',', action = clap::ArgAction::Set,
+          value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    label: Vec<String>,
 
     /// Convert only files taken on or after this date (YYYY-MM-DD, camera
     /// clock)
@@ -79,6 +99,13 @@ struct Cli {
     /// (not case-sensitive), for example "7M4" or "Z 6"
     #[arg(long, value_name = "MODEL", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     camera: Option<String>,
+
+    /// Correct a camera clock that was set wrong: "+1h", "-30m", "+3m12s",
+    /// or per camera model "7M4=+3m12s,Z 6=-1h". Changes the capture time
+    /// used by --name, --since, --until, and --gallery, and the dates in the
+    /// metadata of converted images (-f original copies files unchanged)
+    #[arg(long, value_name = "OFFSET", allow_hyphen_values = true)]
+    time_shift: Option<timeshift::TimeShift>,
 
     /// Convert only the files named in this file, such as a list a client
     /// sent back from the gallery. Names are separated by lines, commas,
@@ -155,7 +182,8 @@ struct Cli {
     #[arg(long, value_name = "NAME")]
     artist: Option<String>,
 
-    /// Set the EXIF Copyright tag in every output file
+    /// Set the EXIF Copyright tag in every output file. {year} becomes the
+    /// capture year, as in "(c) {year} J. Doe"
     #[arg(long, value_name = "TEXT")]
     copyright: Option<String>,
 
@@ -170,6 +198,11 @@ struct Cli {
     /// colours; the size depends on the camera (1616x1080 for Sony)
     #[arg(long, conflicts_with_all = ["fast", "exposure", "wb"])]
     preview: bool,
+
+    /// With -f original, also copy the JPEG or HEIF that the camera wrote
+    /// next to each RAW file with the same name (RAW+JPEG)
+    #[arg(long)]
+    with_jpeg: bool,
 
     /// Blend this logo (a PNG, which may be transparent) into the
     /// bottom-right corner of every image. Its long side is a fifth of the
@@ -212,7 +245,12 @@ fn float_in_range<const MIN: i32, const MAX: i32>(s: &str) -> Result<f32, String
 }
 
 /// Write `dir/gallery.html` for the outputs that exist after the run.
-fn write_gallery(dir: &Path, records: &[report::Record], quiet: bool) -> Result<()> {
+fn write_gallery(
+    dir: &Path,
+    records: &[report::Record],
+    shift: Option<&timeshift::TimeShift>,
+    quiet: bool,
+) -> Result<()> {
     let mut shown: Vec<&report::Record> = records
         .iter()
         .filter(|r| matches!(r.status, report::Status::Converted | report::Status::Skipped))
@@ -222,9 +260,11 @@ fn write_gallery(dir: &Path, records: &[report::Record], quiet: bool) -> Result<
     let entries: Vec<gallery::Entry> = shown
         .par_iter()
         .map(|r| {
-            let info = naming::NameInfo::read(&r.input, true);
+            let info = naming::NameInfo::read(&r.input, true).shifted(shift);
+            let image = r.output.clone().unwrap_or_default();
             gallery::Entry {
-                image: r.output.clone().unwrap_or_default(),
+                thumbnail: gallery::thumbnail(dir, &image),
+                image,
                 caption: gallery::Caption {
                     name: r
                         .input
@@ -350,6 +390,8 @@ struct Selection {
     since: Option<(u16, u8, u8)>,
     until: Option<(u16, u8, u8)>,
     camera: Option<String>,
+    /// Wanted colour labels in lower case; empty for any.
+    labels: Vec<String>,
     picks: Option<Picks>,
 }
 
@@ -363,6 +405,7 @@ impl Selection {
             || self.since.is_some()
             || self.until.is_some()
             || self.camera.is_some()
+            || !self.labels.is_empty()
     }
 
     /// Why a file is excluded, if it is. A file without the metadata that a
@@ -390,6 +433,12 @@ impl Selection {
                 return Some(shown);
             }
         }
+        if !self.labels.is_empty() && !info.labels.iter().any(|l| self.labels.contains(l)) {
+            return Some(match info.labels.first() {
+                Some(label) => format!("label {label}"),
+                None => "no label".to_string(),
+            });
+        }
         if let Some(wanted) = &self.camera {
             let model = info.model.as_deref().unwrap_or_default();
             if !model.to_lowercase().contains(&wanted.to_lowercase()) {
@@ -412,31 +461,47 @@ struct Picks {
 }
 
 impl Picks {
-    fn parse(text: &str) -> Picks {
-        let names = text
-            .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
-            .filter(|n| !n.is_empty())
-            // A name copied from a path or a URL keeps only its last part.
-            .map(|n| n.rsplit(['/', '\\']).next().unwrap_or(n))
-            .filter(|n| !n.is_empty())
-            .map(|n| {
-                let lower = n.to_lowercase();
-                // Only a short extension with a letter is removed, so that
-                // "IMG.0001" stays whole.
-                let bare = match lower.rsplit_once('.') {
-                    Some((stem, ext))
-                        if !stem.is_empty()
-                            && ext.len() <= 4
-                            && ext.chars().any(|c| c.is_ascii_alphabetic()) =>
-                    {
-                        stem.to_string()
-                    }
-                    _ => lower.clone(),
-                };
-                (n.to_string(), lower, bare)
-            })
-            .collect();
+    /// The parts of a list separated by lines, commas, or semicolons.
+    fn pieces(text: &str) -> impl Iterator<Item = &str> {
+        text.split(['\n', '\r', ',', ';']).map(str::trim).filter(|p| !p.is_empty())
+    }
+
+    /// Parse a list. A piece that names one of `stems` as a whole is one
+    /// name, so a file name with spaces (as the gallery lists it) works;
+    /// any other piece is split at spaces, as in "DSC1 DSC2 DSC3".
+    fn parse(text: &str, stems: &[String]) -> Picks {
+        let stems: HashSet<String> = stems.iter().map(|s| s.to_lowercase()).collect();
+        let mut names = Vec::new();
+        for piece in Self::pieces(text) {
+            let whole = Self::name(piece);
+            if stems.contains(&whole.1) || stems.contains(&whole.2) {
+                names.push(whole);
+            } else {
+                names.extend(piece.split_whitespace().map(Self::name));
+            }
+        }
         Picks { names }
+    }
+
+    /// A listed name as written, in lower case, and in lower case without
+    /// its extension.
+    fn name(n: &str) -> (String, String, String) {
+        // A name copied from a path or a URL keeps only its last part.
+        let n = n.rsplit(['/', '\\']).next().unwrap_or(n);
+        let lower = n.to_lowercase();
+        // Only a short extension with a letter is removed, so that
+        // "IMG.0001" stays whole.
+        let bare = match lower.rsplit_once('.') {
+            Some((stem, ext))
+                if !stem.is_empty()
+                    && ext.len() <= 4
+                    && ext.chars().any(|c| c.is_ascii_alphabetic()) =>
+            {
+                stem.to_string()
+            }
+            _ => lower.clone(),
+        };
+        (n.to_string(), lower, bare)
     }
 
     fn contains(&self, stem: &str) -> bool {
@@ -523,6 +588,10 @@ fn main() -> Result<()> {
         bail!("--max-size needs JPEG output; TIFF and PNG files are lossless.");
     }
 
+    if cli.with_jpeg && !matches!(cli.format, OutputFormat::Original) {
+        bail!("--with-jpeg copies the camera's JPEG files, so it needs -f original.");
+    }
+
     if matches!(cli.format, OutputFormat::Original) {
         let image_options = [
             ("--max-size", cli.max_size.is_some()),
@@ -555,15 +624,14 @@ fn main() -> Result<()> {
         bail!("Output path {} exists and is not a directory.", dir.display());
     }
 
-    let picks = match &cli.picks {
+    let picks_text = match &cli.picks {
         Some(path) => {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read picks list {}", path.display()))?;
-            let picks = Picks::parse(&text);
-            if picks.names.is_empty() {
+            if Picks::pieces(&text).next().is_none() {
                 bail!("The picks list {} names no files.", path.display());
             }
-            Some(picks)
+            Some(text)
         }
         None => None,
     };
@@ -578,9 +646,28 @@ fn main() -> Result<()> {
     };
 
     // Collect all RAW files from inputs
-    let files = collect_raw_files(&cli.input, cli.recursive)?;
+    let mut inputs = cli.input.clone();
+    if let Some(list) = &cli.files_from {
+        let text = if list.as_os_str() == "-" {
+            std::io::read_to_string(std::io::stdin()).context("Failed to read standard input")?
+        } else {
+            std::fs::read_to_string(list)
+                .with_context(|| format!("Failed to read file list {}", list.display()))?
+        };
+        let listed = input_list(&text);
+        if listed.is_empty() && inputs.is_empty() {
+            let source = if list.as_os_str() == "-" {
+                "Standard input".to_string()
+            } else {
+                format!("The file list {}", list.display())
+            };
+            bail!("{source} names no files.");
+        }
+        inputs.extend(listed);
+    }
+    let files = collect_raw_files(&inputs, cli.recursive)?;
     // Same condition under which collect_raw_files warns "does not exist".
-    let missing_inputs = cli.input.iter().any(|p| !p.is_dir() && !p.is_file());
+    let missing_inputs = inputs.iter().any(|p| !p.is_dir() && !p.is_file());
 
     if files.is_empty() {
         if missing_inputs {
@@ -589,18 +676,19 @@ fn main() -> Result<()> {
         bail!("No RAW files found in the provided inputs.");
     }
 
+    let stems: Vec<String> = files
+        .iter()
+        .map(|f| f.path.file_stem().unwrap_or_default().to_string_lossy().into_owned())
+        .collect();
     let selection = Selection {
         min_rating: cli.min_rating,
         since: cli.since,
         until: cli.until,
         camera: cli.camera.clone(),
-        picks,
+        labels: cli.label.iter().map(|l| l.trim().to_lowercase()).collect(),
+        picks: picks_text.as_deref().map(|text| Picks::parse(text, &stems)),
     };
     if let (Some(picks), Some(path)) = (&selection.picks, &cli.picks) {
-        let stems: Vec<String> = files
-            .iter()
-            .map(|f| f.path.file_stem().unwrap_or_default().to_string_lossy().into_owned())
-            .collect();
         let unmatched = picks.unmatched(&stems);
         if !unmatched.is_empty() {
             eprintln!(
@@ -616,7 +704,10 @@ fn main() -> Result<()> {
         let needs_exif = selection.needs_exif();
         let excluded: Vec<Option<String>> = files
             .par_iter()
-            .map(|f| selection.exclusion(&naming::NameInfo::read(&f.path, needs_exif)))
+            .map(|f| {
+                let info = naming::NameInfo::read(&f.path, needs_exif);
+                selection.exclusion(&info.shifted(cli.time_shift.as_ref()))
+            })
             .collect();
         let (kept, dropped): (Vec<_>, Vec<_>) =
             files.into_iter().zip(excluded).partition(|(_, reason)| reason.is_none());
@@ -654,12 +745,30 @@ fn main() -> Result<()> {
         files
     };
 
+    let template = cli.name.clone().map(|mut t| {
+        t.seq_start = cli.seq_start;
+        t
+    });
     let jobs = plan_outputs(
         &files,
         cli.output.as_deref(),
         cli.format,
-        cli.name.as_ref(),
+        template.as_ref(),
+        cli.time_shift.as_ref(),
     )?;
+
+    // {seq} numbers the files of each run anew, so an existing output may
+    // hold another input's image; skipping it would lose a file.
+    if cli.name.as_ref().is_some_and(|t| t.uses_seq()) && !cli.overwrite {
+        let existing = jobs.iter().filter(|(_, output)| output.exists()).count();
+        if existing > 0 {
+            bail!(
+                "{existing} output file(s) already exist. {{seq}} numbers the files of each run \
+                 anew, so an existing file may hold another image. Use --overwrite to replace \
+                 them, or write to an empty directory."
+            );
+        }
+    }
 
     let dir_names = DirNames::default();
 
@@ -723,6 +832,7 @@ fn main() -> Result<()> {
         sharpen: cli.sharpen,
         preview: cli.preview,
         look: cli.look,
+        with_jpeg: cli.with_jpeg,
         watermark,
         metadata: exif::MetadataOptions {
             strip_all: cli.strip_metadata,
@@ -730,6 +840,7 @@ fn main() -> Result<()> {
             artist: cli.artist.clone(),
             copyright: cli.copyright.clone(),
             srgb: !cli.preview,
+            time_shift: cli.time_shift.clone(),
         },
     };
 
@@ -855,7 +966,7 @@ fn main() -> Result<()> {
         write_report(path, &mut records)?;
     }
     if let (true, Some(dir)) = (cli.gallery, cli.output.as_deref()) {
-        write_gallery(dir, &records, cli.quiet)?;
+        write_gallery(dir, &records, cli.time_shift.as_ref(), cli.quiet)?;
     }
 
     // Errors scroll away in a long run, so repeat which files failed.
@@ -1077,16 +1188,27 @@ fn canonical(path: &Path) -> PathBuf {
 /// Pair each input with its output path. Fails without converting anything
 /// if two inputs would write the same output path.
 ///
+/// The paths of a `--files-from` list: one per line. Spaces are kept, as
+/// they can be part of a name; empty lines and Windows line ends are not.
+fn input_list(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .filter(|line| !line.trim().is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
 /// The `{seq}` value of each file: its position in capture order, from 1,
 /// with at least four digits. Files with the same capture time are ordered
 /// by path, and files without one come last.
-fn sequence_numbers(files: &[InputFile], infos: &[naming::NameInfo]) -> Vec<String> {
+fn sequence_numbers(files: &[InputFile], infos: &[naming::NameInfo], start: u32) -> Vec<String> {
     let mut order: Vec<usize> = (0..files.len()).collect();
     order.sort_by_key(|&i| (infos[i].taken.is_none(), infos[i].taken, &files[i].path));
-    let width = files.len().to_string().len().max(4);
+    let last = u64::from(start) + files.len() as u64 - 1;
+    let width = last.to_string().len().max(4);
     let mut seqs = vec![String::new(); files.len()];
     for (n, &i) in order.iter().enumerate() {
-        seqs[i] = format!("{:0width$}", n + 1);
+        seqs[i] = format!("{:0width$}", u64::from(start) + n as u64);
     }
     seqs
 }
@@ -1099,16 +1221,17 @@ fn plan_outputs(
     output_dir: Option<&Path>,
     format: OutputFormat,
     template: Option<&naming::NameTemplate>,
+    shift: Option<&timeshift::TimeShift>,
 ) -> Result<Vec<(PathBuf, PathBuf)>> {
     // Reading EXIF for the template opens every file, so do it in parallel.
     let named: Option<Vec<PathBuf>> = template.map(|t| {
         let needs_exif = t.needs_exif();
         let infos: Vec<naming::NameInfo> = files
             .par_iter()
-            .map(|f| naming::NameInfo::read(&f.path, needs_exif))
+            .map(|f| naming::NameInfo::read(&f.path, needs_exif).shifted(shift))
             .collect();
         let seqs = if t.uses_seq() {
-            sequence_numbers(files, &infos)
+            sequence_numbers(files, &infos, t.seq_start)
         } else {
             vec![String::new(); files.len()]
         };
@@ -1349,7 +1472,7 @@ mod tests {
         )
         .unwrap();
         let out = tmp.path().join("out");
-        assert!(plan_outputs(&files, Some(&out), OutputFormat::Jpeg, None).is_err());
+        assert!(plan_outputs(&files, Some(&out), OutputFormat::Jpeg, None, None).is_err());
     }
 
     #[test]
@@ -1437,6 +1560,7 @@ mod tests {
             taken: date.map(|(y, m, d)| (y, m, d, 12, 0, 0)),
             model: model.map(str::to_string),
             rating,
+            ..Default::default()
         }
     }
 
@@ -1446,8 +1570,40 @@ mod tests {
             since: None,
             until: None,
             camera: None,
+            labels: Vec::new(),
             picks: None,
         }
+    }
+
+    #[test]
+    fn label_option_splits_on_commas_and_a_later_one_wins() {
+        let cli = Cli::try_parse_from(["rawdog", "--label", "red,Green", "x.arw"]).unwrap();
+        assert_eq!(cli.label, ["red", "Green"]);
+        let cli = Cli::try_parse_from(["rawdog", "--label", "red", "--label", "blue", "x.arw"]).unwrap();
+        assert_eq!(cli.label, ["blue"]);
+    }
+
+    #[test]
+    fn time_shift_option_accepts_negative_offsets() {
+        let cli = Cli::try_parse_from(["rawdog", "--time-shift", "-1h", "x.arw"]).unwrap();
+        assert_eq!(cli.time_shift.unwrap().seconds_for(None), -3_600);
+        assert!(Cli::try_parse_from(["rawdog", "--time-shift", "soon", "x.arw"]).is_err());
+    }
+
+    #[test]
+    fn selection_by_label() {
+        let sel = Selection {
+            labels: vec!["red".to_string(), "green".to_string()],
+            ..selection()
+        };
+        let labelled = |labels: &[&str]| naming::NameInfo {
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            ..Default::default()
+        };
+        assert!(sel.exclusion(&labelled(&["green"])).is_none());
+        assert!(sel.exclusion(&labelled(&["blue", "red"])).is_none());
+        assert_eq!(sel.exclusion(&labelled(&["blue"])).unwrap(), "label blue");
+        assert_eq!(sel.exclusion(&labelled(&[])).unwrap(), "no label");
     }
 
     #[test]
@@ -1464,7 +1620,9 @@ mod tests {
             taken(None),
             taken(Some((2026, 11, 14, 9, 0, 0))),
         ];
-        assert_eq!(sequence_numbers(&files, &infos), ["0003", "0002", "0004", "0001"]);
+        assert_eq!(sequence_numbers(&files, &infos, 1), ["0003", "0002", "0004", "0001"]);
+        assert_eq!(sequence_numbers(&files, &infos, 413), ["0415", "0414", "0416", "0413"]);
+        assert_eq!(sequence_numbers(&files, &infos, 9998), ["10000", "09999", "10001", "09998"]);
     }
 
     #[test]
@@ -1473,13 +1631,21 @@ mod tests {
             .map(|i| InputFile { path: PathBuf::from(format!("{i:05}.arw")), rel_dir: PathBuf::new() })
             .collect();
         let infos: Vec<naming::NameInfo> = (0..10_000).map(|_| Default::default()).collect();
-        let seqs = sequence_numbers(&files, &infos);
+        let seqs = sequence_numbers(&files, &infos, 1);
         assert_eq!((seqs[0].as_str(), seqs[9_999].as_str()), ("00001", "10000"));
     }
 
     #[test]
+    fn input_list_keeps_spaces_and_skips_empty_lines() {
+        assert_eq!(
+            input_list("a/IMG 1.CR3\r\n\n  \nb.ARW\n"),
+            [PathBuf::from("a/IMG 1.CR3"), PathBuf::from("b.ARW")]
+        );
+    }
+
+    #[test]
     fn picks_parse_names_in_any_list_form() {
-        let picks = Picks::parse("DSC01234.jpg, dsc01300\r\nproofs/DSC01400.JPG;  IMG.0001\n\n");
+        let picks = Picks::parse("DSC01234.jpg, dsc01300\r\nproofs/DSC01400.JPG;  IMG.0001\n\n", &[]);
         for stem in ["DSC01234", "DSC01300", "dsc01400", "IMG.0001"] {
             assert!(picks.contains(stem), "{stem}");
         }
@@ -1488,8 +1654,17 @@ mod tests {
     }
 
     #[test]
+    fn picks_keep_a_file_name_with_spaces_whole() {
+        let stems = ["IMG 1".to_string(), "DSC2".to_string(), "DSC3".to_string()];
+        let picks = Picks::parse("IMG 1.CR3\nDSC2 DSC3\nIMG 9.CR3", &stems);
+        assert!(picks.contains("IMG 1") && picks.contains("DSC2") && picks.contains("DSC3"));
+        assert!(!picks.contains("IMG 9"));
+        assert_eq!(picks.unmatched(&stems), vec!["IMG", "9.CR3"]);
+    }
+
+    #[test]
     fn picks_report_unmatched_names_once() {
-        let picks = Picks::parse("DSC1.jpg DSC2 dsc2.JPG DSC3");
+        let picks = Picks::parse("DSC1.jpg DSC2 dsc2.JPG DSC3", &[]);
         let stems = ["dsc1".to_string(), "DSC9".to_string()];
         assert_eq!(picks.unmatched(&stems), vec!["DSC2", "DSC3"]);
     }
@@ -1497,7 +1672,7 @@ mod tests {
     #[test]
     fn selection_by_picks() {
         let sel = Selection {
-            picks: Some(Picks::parse("x.jpg")),
+            picks: Some(Picks::parse("x.jpg", &[])),
             ..selection()
         };
         assert!(sel.exclusion(&info(None, None, None)).is_none());
@@ -1871,7 +2046,7 @@ mod tests {
 
         let files = collect_raw_files(&[input], true).unwrap();
         let out = Path::new("/out");
-        let jobs = plan_outputs(&files, Some(out), OutputFormat::Jpeg, None).unwrap();
+        let jobs = plan_outputs(&files, Some(out), OutputFormat::Jpeg, None, None).unwrap();
         let outputs: Vec<&Path> = jobs.iter().map(|(_, o)| o.as_path()).collect();
         assert_eq!(
             outputs,
@@ -1894,7 +2069,7 @@ mod tests {
         let template: naming::NameTemplate = "{date}/{stem}-web".parse().unwrap();
 
         let jobs =
-            plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Jpeg, Some(&template))
+            plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Jpeg, Some(&template), None)
                 .unwrap();
         let outputs: Vec<&Path> = jobs.iter().map(|(_, o)| o.as_path()).collect();
         assert_eq!(
@@ -1906,7 +2081,7 @@ mod tests {
         );
 
         // Without an output directory, the path is below each input's directory.
-        let jobs = plan_outputs(&files, None, OutputFormat::Png, Some(&template)).unwrap();
+        let jobs = plan_outputs(&files, None, OutputFormat::Png, Some(&template), None).unwrap();
         assert_eq!(jobs[0].1, input.join("a/unknown/x-web.png"));
     }
 
@@ -1917,7 +2092,7 @@ mod tests {
         fs::write(tmp.path().join("b.arw"), b"fake").unwrap();
         let files = collect_raw_files(&[tmp.path().to_path_buf()], false).unwrap();
         let template: naming::NameTemplate = "{date}".parse().unwrap();
-        assert!(plan_outputs(&files, None, OutputFormat::Jpeg, Some(&template)).is_err());
+        assert!(plan_outputs(&files, None, OutputFormat::Jpeg, Some(&template), None).is_err());
     }
 
     #[test]
@@ -1928,7 +2103,7 @@ mod tests {
         fs::write(nested.join("x.arw"), b"fake").unwrap();
 
         let files = collect_raw_files(&[nested.join("x.arw")], true).unwrap();
-        let jobs = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Png, None).unwrap();
+        let jobs = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Png, None, None).unwrap();
         assert_eq!(jobs[0].1, PathBuf::from("/out/x.png"));
     }
 
@@ -1939,7 +2114,7 @@ mod tests {
         fs::write(tmp.path().join("a/x.arw"), b"fake").unwrap();
 
         let files = collect_raw_files(&[tmp.path().to_path_buf()], true).unwrap();
-        let jobs = plan_outputs(&files, None, OutputFormat::Jpeg, None).unwrap();
+        let jobs = plan_outputs(&files, None, OutputFormat::Jpeg, None, None).unwrap();
         assert_eq!(jobs[0].1, tmp.path().join("a/x.jpg"));
     }
 
@@ -1954,7 +2129,7 @@ mod tests {
         let b = tmp.path().join("b/x.arw");
 
         let files = collect_raw_files(&[a.clone(), b.clone()], false).unwrap();
-        let err = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Jpeg, None)
+        let err = plan_outputs(&files, Some(Path::new("/out")), OutputFormat::Jpeg, None, None)
             .expect_err("expected a conflict error");
         let msg = err.to_string();
         assert!(msg.contains(&*a.to_string_lossy()), "{msg}");
@@ -1969,7 +2144,7 @@ mod tests {
 
         let inputs = vec![tmp.path().join("x.arw"), tmp.path().join(".").join("x.png")];
         let files = collect_raw_files(&inputs, false).unwrap();
-        assert!(plan_outputs(&files, None, OutputFormat::Jpeg, None).is_err());
+        assert!(plan_outputs(&files, None, OutputFormat::Jpeg, None, None).is_err());
     }
 
     #[test]

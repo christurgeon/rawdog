@@ -17,6 +17,8 @@ pub struct MetadataOptions {
     /// The output pixels are sRGB, whatever colour space the camera was set
     /// to. False for `--preview`, which keeps the camera's own encoding.
     pub srgb: bool,
+    /// Correction of the camera clock, applied to the capture dates.
+    pub time_shift: Option<crate::timeshift::TimeShift>,
 }
 
 /// An sRGB ICC profile, generated once.
@@ -346,11 +348,24 @@ fn value_size(value: &exif::Value) -> usize {
 /// - `meta` can remove GPS fields or all source fields, and can set the
 ///   Artist and Copyright tags.
 fn fields_for_output<'a>(
-    fields: impl Iterator<Item = &'a exif::Field>,
+    fields: impl Iterator<Item = &'a exif::Field> + Clone,
     (width, height): (u32, u32),
     meta: &MetadataOptions,
 ) -> Vec<exif::Field> {
     use exif::{Context, Tag};
+
+    let shift_seconds = meta.time_shift.as_ref().map_or(0, |shift| {
+        let model = fields
+            .clone()
+            .find(|f| f.tag == Tag::Model && f.ifd_num == exif::In::PRIMARY)
+            .map(|f| match &f.value {
+                exif::Value::Ascii(v) => {
+                    String::from_utf8_lossy(v.first().map_or(&[][..], |v| v)).trim().to_string()
+                }
+                _ => String::new(),
+            });
+        shift.seconds_for(model.as_deref())
+    });
 
     let replaced = |tag: Tag| {
         (tag == Tag::Artist && meta.artist.is_some())
@@ -361,9 +376,29 @@ fn fields_for_output<'a>(
         ifd_num: exif::In::PRIMARY,
         value: exif::Value::Ascii(vec![text.as_bytes().to_vec()]),
     };
+    // `{year}` in the copyright is the capture year, or the current year
+    // for a file without a capture date.
+    let copyright = meta.copyright.as_ref().map(|text| {
+        if !text.contains("{year}") {
+            return text.clone();
+        }
+        let year = [Tag::DateTimeOriginal, Tag::DateTime]
+            .iter()
+            .find_map(|tag| {
+                let field = fields.clone().find(|f| f.tag == *tag && f.ifd_num == exif::In::PRIMARY)?;
+                let exif::Value::Ascii(texts) = &field.value else {
+                    return None;
+                };
+                let d = exif::DateTime::from_ascii(texts.first()?).ok()?;
+                let taken = (d.year, d.month, d.day, d.hour, d.minute, d.second);
+                Some(crate::timeshift::add_seconds(taken, shift_seconds).0)
+            })
+            .unwrap_or_else(crate::timeshift::current_year);
+        text.replace("{year}", &year.to_string())
+    });
     let added = [
         meta.artist.as_ref().map(|t| text_field(Tag::Artist, t)),
-        meta.copyright.as_ref().map(|t| text_field(Tag::Copyright, t)),
+        copyright.as_ref().map(|t| text_field(Tag::Copyright, t)),
     ];
 
     fields
@@ -382,12 +417,33 @@ fn fields_for_output<'a>(
                 exif::Tag::PixelXDimension => field.value = exif::Value::Long(vec![width]),
                 exif::Tag::PixelYDimension => field.value = exif::Value::Long(vec![height]),
                 exif::Tag::ColorSpace if meta.srgb => field.value = exif::Value::Short(vec![1]),
+                Tag::DateTimeOriginal | Tag::DateTimeDigitized | Tag::DateTime
+                    if shift_seconds != 0 =>
+                {
+                    if let Some(shifted) = shift_date_value(&field.value, shift_seconds) {
+                        field.value = shifted;
+                    }
+                }
                 _ => {}
             }
             field
         })
         .chain(added.into_iter().flatten())
         .collect()
+}
+
+/// An EXIF date value ("YYYY:MM:DD HH:MM:SS") moved by `seconds`.
+fn shift_date_value(value: &exif::Value, seconds: i64) -> Option<exif::Value> {
+    let exif::Value::Ascii(texts) = value else {
+        return None;
+    };
+    let d = exif::DateTime::from_ascii(texts.first()?).ok()?;
+    let (y, mo, day, h, mi, s) = crate::timeshift::add_seconds(
+        (d.year, d.month, d.day, d.hour, d.minute, d.second),
+        seconds,
+    );
+    let text = format!("{y:04}:{mo:02}:{day:02} {h:02}:{mi:02}:{s:02}");
+    Some(exif::Value::Ascii(vec![text.into_bytes()]))
 }
 
 /// Write a 16-bit RGB TIFF file that carries the given EXIF fields.
@@ -813,6 +869,32 @@ mod tests {
     }
 
     #[test]
+    fn copyright_year_is_the_shifted_capture_year() {
+        use exif::{In, Tag, Value};
+        let source = [field(
+            Tag::DateTimeOriginal,
+            In::PRIMARY,
+            Value::Ascii(vec![b"2025:12:31 23:30:00".to_vec()]),
+        )];
+        let meta = |shift: Option<&str>| MetadataOptions {
+            copyright: Some("(c) {year} J. Doe, {stem}".to_string()),
+            time_shift: shift.map(|s| s.parse().unwrap()),
+            ..Default::default()
+        };
+        let copyright = |out: Vec<exif::Field>| {
+            out.into_iter().find(|f| f.tag == Tag::Copyright).unwrap().display_value().to_string()
+        };
+        let out = fields_for_output(source.iter(), (300, 200), &meta(None));
+        assert_eq!(copyright(out), "\"(c) 2025 J. Doe, {stem}\"");
+        let out = fields_for_output(source.iter(), (300, 200), &meta(Some("+1h")));
+        assert_eq!(copyright(out), "\"(c) 2026 J. Doe, {stem}\"");
+        let none: [exif::Field; 0] = [];
+        let out = fields_for_output(none.iter(), (300, 200), &meta(None));
+        let year = crate::timeshift::current_year();
+        assert_eq!(copyright(out), format!("\"(c) {year} J. Doe, {{stem}}\""));
+    }
+
+    #[test]
     fn extract_exif_adds_copyright_when_source_has_no_exif() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), b"not a raw file").unwrap();
@@ -853,6 +935,33 @@ mod tests {
             tags(&out),
             vec![Tag::ImageDescription, Tag::Model, Tag::ISOSpeed]
         );
+    }
+
+    #[test]
+    fn fields_for_output_shifts_capture_dates_for_the_camera() {
+        use exif::{In, Tag, Value};
+        let date = |tag| field(tag, In::PRIMARY, Value::Ascii(vec![b"2026:11:14 23:30:00".to_vec()]));
+        let source = [
+            field(Tag::Model, In::PRIMARY, Value::Ascii(vec![b"ILCE-7M4".to_vec()])),
+            date(Tag::DateTimeOriginal),
+            date(Tag::DateTimeDigitized),
+            date(Tag::DateTime),
+            field(Tag::OffsetTimeOriginal, In::PRIMARY, Value::Ascii(vec![b"+01:00".to_vec()])),
+        ];
+        let meta = |shift: &str| MetadataOptions {
+            time_shift: Some(shift.parse().unwrap()),
+            ..Default::default()
+        };
+        let text = |out: &[exif::Field], tag| {
+            out.iter().find(|f| f.tag == tag).unwrap().display_value().to_string()
+        };
+        let out = fields_for_output(source.iter(), (300, 200), &meta("7M4=+1h,Z 6=-1h"));
+        for tag in [Tag::DateTimeOriginal, Tag::DateTimeDigitized, Tag::DateTime] {
+            assert_eq!(text(&out, tag), "2026-11-15 00:30:00");
+        }
+        assert_eq!(text(&out, Tag::OffsetTimeOriginal), "\"+01:00\"");
+        let out = fields_for_output(source.iter(), (300, 200), &meta("Z 6=-1h"));
+        assert_eq!(text(&out, Tag::DateTimeOriginal), "2026-11-14 23:30:00");
     }
 
     #[test]

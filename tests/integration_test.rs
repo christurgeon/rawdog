@@ -1086,3 +1086,60 @@ fn cli_watermark_marks_the_bottom_right_corner() {
     assert!(img.get_pixel(200 - 3 - 10, 100 - 3 - 10)[0] > 240);
     assert!(img.get_pixel(100, 50)[0] < 200);
 }
+
+#[test]
+fn cli_seq_refuses_to_skip_existing_outputs() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("a.png");
+    image::RgbImage::from_pixel(64, 64, image::Rgb([100, 100, 100]))
+        .save(&input)
+        .unwrap();
+    let out_dir = tmp.path().join("out");
+    let args = |extra: &[&str]| {
+        let mut all: Vec<std::ffi::OsString> =
+            vec![input.clone().into(), "-o".into(), out_dir.clone().into(), "--name".into(), "{seq}".into()];
+        all.extend(extra.iter().map(Into::into));
+        all
+    };
+    let run_with = |extra: &[&str]| {
+        let a = args(extra);
+        run(&a.iter().map(|s| s.as_os_str()).collect::<Vec<_>>())
+    };
+    assert!(run_with(&[]).status.success());
+    assert!(out_dir.join("0001.jpg").exists());
+
+    let again = run_with(&[]);
+    assert!(!again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("1 output file(s) already exist"));
+    assert!(run_with(&["--overwrite"]).status.success());
+}
+
+#[test]
+fn cli_files_from_standard_input_forms_one_run() {
+    use std::io::Write as _;
+    let tmp = TempDir::new().unwrap();
+    let mut list = String::new();
+    for name in ["a one.png", "b.png"] {
+        let path = tmp.path().join(name);
+        image::RgbImage::from_pixel(64, 64, image::Rgb([90, 90, 90])).save(&path).unwrap();
+        list.push_str(&format!("{}\n", path.display()));
+    }
+    let out_dir = tmp.path().join("out");
+    let mut child = Command::new(rawdog_bin())
+        .args(["--files-from", "-", "--name", "{seq}", "-o"])
+        .arg(&out_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(list.as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let mut names: Vec<String> = files_under(&out_dir)
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["0001.jpg", "0002.jpg"]);
+}

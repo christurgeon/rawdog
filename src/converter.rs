@@ -40,6 +40,9 @@ pub struct ConvertOptions {
     pub preview: bool,
     /// Tone curve for RAW development.
     pub look: Look,
+    /// With `-f original`, also copy the camera's JPEG or HEIF of each RAW
+    /// file.
+    pub with_jpeg: bool,
     /// A logo blended into the bottom-right corner of every image.
     pub watermark: Option<std::sync::Arc<image::RgbaImage>>,
     pub metadata: exif_utils::MetadataOptions,
@@ -58,7 +61,7 @@ pub enum Look {
 /// Convert a single ARW file to the specified output format.
 pub fn convert_raw(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<()> {
     if matches!(opts.format, OutputFormat::Original) {
-        return copy_original(input, output);
+        return copy_original(input, output, opts.with_jpeg);
     }
 
     let ConvertOptions {
@@ -228,10 +231,8 @@ fn load_preview(input: &Path) -> Result<RgbImage> {
             return Ok(None);
         };
         // The preview is stored as the sensor recorded it.
-        let orientation = decoder
-            .raw_metadata(&source, &params)
-            .ok()
-            .and_then(|m| m.exif.orientation)
+        let orientation = crate::naming::sidecar_orientation(input)
+            .or_else(|| decoder.raw_metadata(&source, &params).ok()?.exif.orientation)
             .and_then(|n| u8::try_from(n).ok())
             .and_then(image::metadata::Orientation::from_exif);
         if let Some(orientation) = orientation {
@@ -269,7 +270,7 @@ fn load_preview(input: &Path) -> Result<RgbImage> {
 /// The RAW decoders come first because most RAW files are TIFF containers,
 /// and a raster loader could open one and return only its preview.
 fn open_pipeline(input: &Path) -> Result<Pipeline> {
-    let raw = match decode_with_rawler(input) {
+    let mut raw = match decode_with_rawler(input) {
         Ok(raw) => raw,
         Err(new_decoder) => match rawloader::decode_file(input) {
             Ok(raw) => raw,
@@ -290,6 +291,9 @@ fn open_pipeline(input: &Path) -> Result<Pipeline> {
             }
         },
     };
+    if let Some(orientation) = crate::naming::sidecar_orientation(input) {
+        raw.orientation = rawloader::Orientation::from_u16(orientation);
+    }
     if let Some(problem) = implausible_samples(&raw) {
         return Err(anyhow!(
             "Cannot decode {}: the decoder returned invalid data ({problem}); \
@@ -536,7 +540,7 @@ fn exposure_curve(ev: f32, base: &SplineFunc) -> Vec<(f32, f32)> {
 ///
 /// The copy goes to a temporary file, is compared byte for byte with the
 /// source, and only then gets its final name. The source is never changed.
-fn copy_original(input: &Path, output: &Path) -> Result<()> {
+fn copy_original(input: &Path, output: &Path, with_jpeg: bool) -> Result<()> {
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create output directory {}", parent.display()))?;
@@ -569,7 +573,71 @@ fn copy_original(input: &Path, output: &Path) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return result;
     }
-    copy_sidecars(input, output)
+    copy_sidecars(input, output)?;
+    if with_jpeg {
+        copy_companions(input, output)?;
+    }
+    Ok(())
+}
+
+/// Copy the JPEG or HEIF files that a camera set to RAW+JPEG wrote next to
+/// `input` with the same name, such as `DSC1.JPG` for `DSC1.ARW`. Each copy
+/// keeps its modification time and is compared with the original; an
+/// existing file at the destination is kept.
+fn copy_companions(input: &Path, output: &Path) -> Result<()> {
+    const EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "hif", "heic"];
+    let (Some(dir), Some(stem)) = (input.parent(), input.file_stem()) else {
+        return Ok(());
+    };
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let source = entry.path();
+        let Some(ext) = source.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if source.file_stem() != Some(stem)
+            || !EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+            || !source.is_file()
+        {
+            continue;
+        }
+        let destination = output.with_extension(ext);
+        if destination.exists() {
+            continue;
+        }
+        copy_verified(&source, &destination, true).map_err(|e| {
+            anyhow!("Copied {} but not {}: {e:#}", input.display(), source.display())
+        })?;
+    }
+    Ok(())
+}
+
+/// Copy `source` to `destination` through a temporary file, compare the
+/// bytes, and rename. With `keep_time`, the copy gets the modification time
+/// of the source.
+fn copy_verified(source: &Path, destination: &Path, keep_time: bool) -> Result<()> {
+    let tmp = temp_path_for(destination);
+    let _guard = TempFileGuard::register(&tmp);
+    let result = (|| -> Result<()> {
+        std::fs::copy(source, &tmp)?;
+        if keep_time {
+            if let Ok(modified) = std::fs::metadata(source).and_then(|m| m.modified()) {
+                std::fs::File::options().write(true).open(&tmp)?.set_modified(modified)?;
+            }
+        }
+        if !same_contents(source, &tmp)? {
+            return Err(anyhow!("the copy differs from the original"));
+        }
+        std::fs::rename(&tmp, destination)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Copy the XMP sidecars of `input` next to `output`, in the same naming
@@ -592,20 +660,7 @@ fn copy_sidecars(input: &Path, output: &Path) -> Result<()> {
         if !source.is_file() || destination.exists() {
             continue;
         }
-        let tmp = temp_path_for(&destination);
-        let _guard = TempFileGuard::register(&tmp);
-        let copied = std::fs::copy(&source, &tmp)
-            .map_err(anyhow::Error::from)
-            .and_then(|_| same_contents(&source, &tmp))
-            .and_then(|same| {
-                if same {
-                    std::fs::rename(&tmp, &destination).map_err(Into::into)
-                } else {
-                    Err(anyhow!("the copy differs from the original"))
-                }
-            });
-        if let Err(e) = copied {
-            let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = copy_verified(&source, &destination, false) {
             return Err(anyhow!(
                 "Copied {} but not its sidecar {}: {e:#}",
                 input.display(),
@@ -1386,7 +1441,7 @@ mod tests {
         std::fs::File::options().write(true).open(&input).unwrap().set_modified(old).unwrap();
 
         let output = tmp.path().join("2023/11/DSC1.ARW");
-        copy_original(&input, &output).unwrap();
+        copy_original(&input, &output, false).unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), data);
         assert_eq!(std::fs::metadata(&output).unwrap().modified().unwrap(), old);
         assert_eq!(std::fs::read(&input).unwrap(), data, "source changed");
@@ -1407,12 +1462,46 @@ mod tests {
         std::fs::create_dir_all(&out_dir).unwrap();
         std::fs::write(out_dir.join("2024-01-01_DSC1.ARW.xmp"), b"newer edits").unwrap();
 
-        copy_original(&input, &output).unwrap();
+        copy_original(&input, &output, false).unwrap();
         assert_eq!(std::fs::read(out_dir.join("2024-01-01_DSC1.xmp")).unwrap(), b"lightroom");
         assert_eq!(
             std::fs::read(out_dir.join("2024-01-01_DSC1.ARW.xmp")).unwrap(),
             b"newer edits"
         );
+    }
+
+    #[test]
+    fn copy_original_copies_camera_jpegs_only_when_asked() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let input = tmp.path().join("DSC1.ARW");
+        std::fs::write(&input, b"raw").unwrap();
+        std::fs::write(tmp.path().join("DSC1.JPG"), b"jpeg").unwrap();
+        std::fs::write(tmp.path().join("DSC1.HIF"), b"heif").unwrap();
+        std::fs::write(tmp.path().join("DSC10.JPG"), b"other frame").unwrap();
+        std::fs::write(tmp.path().join("DSC1.txt"), b"not an image").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(tmp.path().join("DSC1.JPG"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let out = tmp.path().join("plain");
+        copy_original(&input, &out.join("x.ARW"), false).unwrap();
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
+
+        let out = tmp.path().join("archive");
+        copy_original(&input, &out.join("2024_DSC1.ARW"), true).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["2024_DSC1.ARW", "2024_DSC1.HIF", "2024_DSC1.JPG"]);
+        let copied = out.join("2024_DSC1.JPG");
+        assert_eq!(std::fs::read(&copied).unwrap(), b"jpeg");
+        assert_eq!(std::fs::metadata(&copied).unwrap().modified().unwrap(), old);
     }
 
     #[test]
@@ -1495,6 +1584,7 @@ mod tests {
             preview: true,
             look: Look::Flat,
             watermark: None,
+            with_jpeg: false,
             metadata: Default::default(),
         }
     }
@@ -1640,6 +1730,7 @@ mod tests {
                 preview: false,
                 look: Look::Flat,
                 watermark: None,
+                with_jpeg: false,
                 metadata: Default::default(),
             },
         );
@@ -1667,6 +1758,7 @@ mod tests {
                 preview: false,
                 look: Look::Flat,
                 watermark: None,
+                with_jpeg: false,
                 metadata: Default::default(),
             },
         );
