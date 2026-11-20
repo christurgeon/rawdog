@@ -39,7 +39,12 @@ pub enum OutputFormat {
     args_override_self = true,
     after_help = "Default options can be set in ~/.config/rawdog/defaults (or the file named by \
                   RAWDOG_DEFAULTS): one option per line, for example `--copyright (c) {year} J. Doe`. \
-                  --no-defaults ignores the file for one run."
+                  --no-defaults ignores the file for one run.\n\n\
+Examples:\n  \
+rawdog photo.ARW                                   photo.jpg next to the RAW file\n  \
+rawdog -R /Volumes/CARD -r 2048 --fast -o proofs --gallery\n  \
+rawdog -R /Volumes/CARD --min-rating 3 -o picks --dry-run\n  \
+rawdog -R /Volumes/CARD -f original -o ~/Archive --name \"{year}/{date}/{stem}\" --manifest"
 )]
 struct Cli {
     /// One or more RAW files, or directories that contain RAW files.
@@ -47,20 +52,8 @@ struct Cli {
     #[arg(required_unless_present_any = ["completions", "files_from"])]
     input: Vec<PathBuf>,
 
-    /// Read more inputs from this file, one path per line; "-" reads
-    /// standard input, as in `find ... | rawdog --files-from - -o out`.
-    /// Relative paths are relative to the current directory.
-    /// All inputs form one run, so --name {seq}, --report, and --gallery
-    /// cover them all
-    #[arg(long, value_name = "FILE")]
-    files_from: Option<PathBuf>,
-
-    /// Generate shell completion script and exit
-    #[arg(long, value_enum, value_name = "SHELL")]
-    completions: Option<Shell>,
-
     /// Output directory (defaults to same directory as each input file)
-    #[arg(short, long)]
+    #[arg(help_heading = "Output", short, long)]
     output: Option<PathBuf>,
 
     /// Name template for output files, relative to the output directory
@@ -68,257 +61,269 @@ struct Cli {
     /// {time} {model} {lens} {serial} {iso} {focal} {aperture} {shutter}
     /// {rating} {label} {seq} {burst}. {seq} numbers the files of the run
     /// in capture order: 0001, 0002, ... Example: "{date}/{model}_{stem}"
-    #[arg(long, value_name = "TEMPLATE")]
+    #[arg(help_heading = "Naming", long, value_name = "TEMPLATE")]
     name: Option<naming::NameTemplate>,
 
     /// The first {seq} number, to continue the numbering of an earlier run
-    #[arg(long, value_name = "N", requires = "name", default_value_t = 1,
+    #[arg(help_heading = "Naming", long, value_name = "N", requires = "name", default_value_t = 1,
           value_parser = clap::value_parser!(u32).range(1..))]
     seq_start: u32,
 
     /// Largest gap in seconds between two frames of one {burst} or of one
     /// group for --burst-pick, such as 0.3 for a 20 fps burst
-    #[arg(long, value_name = "SECONDS", default_value_t = 2.0,
+    #[arg(help_heading = "Selecting files", long, value_name = "SECONDS", default_value_t = 2.0,
           value_parser = float_in_range::<0, 3600>)]
     burst_gap: f32,
 
     /// Keep one frame of each burst or exposure bracket. "ev0" keeps the
     /// frame with the exposure compensation closest to 0, the normal
     /// exposure of a bracket. Frames belong together as for {burst}
-    #[arg(long, value_name = "RULE", value_enum)]
+    #[arg(help_heading = "Selecting files", long, value_name = "RULE", value_enum)]
     burst_pick: Option<BurstPick>,
 
     /// Convert only files rated at least this many stars (1 to 5). Ratings
     /// come from sidecar XMP files (Lightroom, Capture One, darktable) or
     /// from the camera
-    #[arg(long, value_name = "STARS", value_parser = clap::value_parser!(i8).range(1..=5))]
+    #[arg(help_heading = "Selecting files", long, value_name = "STARS", value_parser = clap::value_parser!(i8).range(1..=5))]
     min_rating: Option<i8>,
 
     /// Convert only files with one of these colour labels, such as "red"
     /// or "red,green" (not case-sensitive). Labels come from sidecar XMP
     /// files (Lightroom, Capture One, darktable)
-    #[arg(long, value_name = "LABELS", value_delimiter = ',', action = clap::ArgAction::Set,
+    #[arg(help_heading = "Selecting files", long, value_name = "LABELS", value_delimiter = ',', action = clap::ArgAction::Set,
           value_parser = clap::builder::NonEmptyStringValueParser::new())]
     label: Vec<String>,
 
     /// Convert only files taken on or after this date (YYYY-MM-DD, camera
     /// clock)
-    #[arg(long, value_name = "DATE", value_parser = parse_date)]
+    #[arg(help_heading = "Selecting files", long, value_name = "DATE", value_parser = parse_date)]
     since: Option<(u16, u8, u8)>,
 
     /// Convert only files taken on or before this date (YYYY-MM-DD, camera
     /// clock)
-    #[arg(long, value_name = "DATE", value_parser = parse_date)]
+    #[arg(help_heading = "Selecting files", long, value_name = "DATE", value_parser = parse_date)]
     until: Option<(u16, u8, u8)>,
 
     /// Convert only files from cameras whose model contains this text
     /// (not case-sensitive), for example "7M4" or "Z 6"
-    #[arg(long, value_name = "MODEL", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(help_heading = "Selecting files", long, value_name = "MODEL", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     camera: Option<String>,
 
     /// Convert only files taken with a lens whose name contains this text
     /// (not case-sensitive), for example "70-200" or "GM". Some cameras
     /// (Nikon DSLRs, Pentax, older Panasonic) record no lens name that
     /// rawdog reads; their files are excluded
-    #[arg(long, value_name = "LENS", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(help_heading = "Selecting files", long, value_name = "LENS", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     lens: Option<String>,
 
     /// Correct a camera clock that was set wrong: "+1h", "-30m", "+3m12s",
     /// or per camera model "7M4=+3m12s,Z 6=-1h". Changes the capture time
     /// used by --name, --since, --until, and --gallery, and the dates in the
     /// metadata of converted images (-f original copies files unchanged)
-    #[arg(long, value_name = "OFFSET", allow_hyphen_values = true)]
+    #[arg(help_heading = "Naming", long, value_name = "OFFSET", allow_hyphen_values = true)]
     time_shift: Option<timeshift::TimeShift>,
 
     /// Convert only the files named in this file, such as a list a client
     /// sent back from the gallery. Names are separated by lines, commas,
     /// or spaces, and may include an extension (DSC01234 or DSC01234.jpg)
-    #[arg(long, value_name = "FILE")]
+    #[arg(help_heading = "Selecting files", long, value_name = "FILE")]
     picks: Option<PathBuf>,
-
-    /// Write what happened to each file to this file: JSON if the name ends
-    /// in .json, otherwise CSV. Columns: input, output, status (converted,
-    /// skipped, failed, excluded), message, seconds
-    #[arg(long, value_name = "FILE")]
-    report: Option<PathBuf>,
 
     /// Write gallery.html into the output directory: a proof page of the
     /// output images with file name, capture time, camera, and rating.
     /// Needs -o and JPEG or PNG output; replaces an earlier gallery.html.
     /// With several --resize sizes, it shows the smallest, in its folder
-    #[arg(long, requires = "output")]
+    #[arg(help_heading = "Output", long, requires = "output")]
     gallery: bool,
 
     /// With --gallery, also write a gallery.html into each output folder
     /// that holds images, such as one per day with --name "{date}/{stem}"
-    #[arg(long, requires = "gallery")]
+    #[arg(help_heading = "Output", long, requires = "gallery")]
     gallery_per_folder: bool,
 
     /// Output format
-    #[arg(short, long, value_enum, default_value_t = OutputFormat::Jpeg)]
+    #[arg(help_heading = "Output", short, long, value_enum, default_value_t = OutputFormat::Jpeg)]
     format: OutputFormat,
 
     /// JPEG quality (1-100, ignored for tiff/png)
-    #[arg(short, long, default_value_t = 92, value_parser = clap::value_parser!(u8).range(1..=100))]
+    #[arg(help_heading = "Output", short, long, default_value_t = 92, value_parser = clap::value_parser!(u8).range(1..=100))]
     quality: u8,
 
     /// Largest JPEG file, such as 2MB or 500KB (1 MB is 1,000,000 bytes).
     /// The quality is lowered until each file fits; --quality is the
     /// highest quality used
-    #[arg(long, value_name = "SIZE", value_parser = byte_size)]
+    #[arg(help_heading = "Output", long, value_name = "SIZE", value_parser = byte_size)]
     max_size: Option<u64>,
 
     /// Resize long edge to this many pixels, preserving aspect ratio.
     /// Several sizes, such as 3000,2048,1080, write each size into its own
     /// folder below -o; "full" is the full size, as in full,2048
-    #[arg(short, long, value_name = "PIXELS", value_delimiter = ',',
+    #[arg(help_heading = "Output", short, long, value_name = "PIXELS", value_delimiter = ',',
           action = clap::ArgAction::Set, value_parser = resize_value)]
     resize: Vec<u32>,
 
     /// Crop the centre to this aspect ratio, such as 4:5, 16:9, or 1:1. The
     /// ratio follows each image's orientation (4:5 makes a landscape 5:4).
     /// --resize applies to the cropped image
-    #[arg(long, value_name = "W:H", value_parser = aspect_ratio)]
+    #[arg(help_heading = "Output", long, value_name = "W:H", value_parser = aspect_ratio)]
     aspect: Option<(u32, u32)>,
 
     /// Scale during RAW decoding when --resize is set. Several times
     /// faster and slightly softer; intended for proofs and culling
-    #[arg(long, requires = "resize")]
+    #[arg(help_heading = "Output", long, requires = "resize")]
     fast: bool,
 
     /// Exposure correction in stops, from -5 to 5. Highlights roll off
     /// instead of clipping
-    #[arg(short, long, value_name = "EV", allow_hyphen_values = true,
+    #[arg(help_heading = "Developing", short, long, value_name = "EV", allow_hyphen_values = true,
           value_parser = float_in_range::<-5, 5>)]
     exposure: Option<f32>,
 
     /// White balance colour temperature in kelvin, from 1500 to 15000.
     /// Replaces the as-shot white balance of every file
-    #[arg(long, value_name = "KELVIN", value_parser = float_in_range::<1500, 15000>)]
+    #[arg(help_heading = "Developing", long, value_name = "KELVIN", value_parser = float_in_range::<1500, 15000>)]
     wb: Option<f32>,
 
     /// Use the as-shot white balance of this RAW file for every file, so a
     /// time-lapse or a set shot under one light does not change colour from
     /// frame to frame. Files must come from the same camera model
-    #[arg(long, value_name = "RAW", conflicts_with_all = ["wb", "preview"])]
+    #[arg(help_heading = "Developing", long, value_name = "RAW", conflicts_with_all = ["wb", "preview"])]
     wb_from: Option<PathBuf>,
 
     /// White balance tint for --wb. Above 1 is more magenta, below 1 is
     /// more green
-    #[arg(long, requires = "wb", default_value_t = 1.0, value_parser = tint_value)]
+    #[arg(help_heading = "Developing", long, requires = "wb", default_value_t = 1.0, value_parser = tint_value)]
     tint: f32,
 
     /// Sharpen the output after the resize, from 0 to 3. Without a value
     /// the amount is 0.5, which suits images resized for screens
-    #[arg(long, value_name = "AMOUNT", num_args = 0..=1, default_missing_value = "0.5",
+    #[arg(help_heading = "Output", long, value_name = "AMOUNT", num_args = 0..=1, default_missing_value = "0.5",
           value_parser = float_in_range::<0, 3>)]
     sharpen: Option<f32>,
 
     /// Write each file's star rating and colour label into the output as
     /// XMP, so Lightroom and other catalogs keep the culling decisions
-    #[arg(long)]
+    #[arg(help_heading = "Metadata", long)]
     keep_rating: bool,
 
     /// Keywords for stock sites and catalogs, separated by commas, such as
     /// "wedding,Smith,2026". Written into every output as XMP dc:subject
-    #[arg(long, value_name = "WORDS", value_delimiter = ',', action = clap::ArgAction::Set)]
+    #[arg(help_heading = "Metadata", long, value_name = "WORDS", value_delimiter = ',', action = clap::ArgAction::Set)]
     keywords: Vec<String>,
 
     /// Print resolution in pixels per inch, such as 300, for print labs and
     /// layout software. Without it, the camera's value is copied
-    #[arg(long, value_name = "DPI", value_parser = clap::value_parser!(u16).range(1..=10000))]
+    #[arg(help_heading = "Metadata", long, value_name = "DPI", value_parser = clap::value_parser!(u16).range(1..=10000))]
     dpi: Option<u16>,
 
     /// Add GPS positions from this GPX track to files without their own,
     /// for cameras without GPS. Matched by capture time
-    #[arg(long, value_name = "FILE", conflicts_with = "strip_gps")]
+    #[arg(help_heading = "Metadata", long, value_name = "FILE", conflicts_with = "strip_gps")]
     gpx: Option<PathBuf>,
 
     /// The camera clock's UTC offset for --gpx, such as +02:00, for files
     /// that do not record it. For a trip across time zones, add changes at
     /// camera-clock times: "+01:00,2026-11-17T14:00=+05:30"
-    #[arg(long, value_name = "OFFSETS", requires = "gpx", allow_hyphen_values = true)]
+    #[arg(help_heading = "Metadata", long, value_name = "OFFSETS", requires = "gpx", allow_hyphen_values = true)]
     gpx_tz: Option<gpx::Zones>,
 
     /// Do not copy GPS location to the output
-    #[arg(long)]
+    #[arg(help_heading = "Metadata", long)]
     strip_gps: bool,
 
     /// Do not copy any metadata to the output
-    #[arg(long)]
+    #[arg(help_heading = "Metadata", long)]
     strip_metadata: bool,
 
     /// Set the EXIF Artist tag in every output file
-    #[arg(long, value_name = "NAME")]
+    #[arg(help_heading = "Metadata", long, value_name = "NAME")]
     artist: Option<String>,
 
     /// Set the EXIF Copyright tag in every output file. {year} becomes the
     /// capture year, as in "(c) {year} J. Doe"
-    #[arg(long, value_name = "TEXT")]
+    #[arg(help_heading = "Metadata", long, value_name = "TEXT")]
     copyright: Option<String>,
 
     /// Use the JPEG preview that the camera embedded in each RAW file,
     /// without developing the RAW data. Very fast, with the camera's own
     /// colours; the size depends on the camera (1616x1080 for most Sony
     /// bodies)
-    #[arg(long, conflicts_with_all = ["fast", "exposure", "wb"])]
+    #[arg(help_heading = "Output", long, conflicts_with_all = ["fast", "exposure", "wb"])]
     preview: bool,
 
     /// With -f original, write a SHA256SUMS file into each destination
     /// folder, so `shasum -a 256 -c SHA256SUMS` can later prove that the
     /// archive is unchanged
-    #[arg(long)]
+    #[arg(help_heading = "Importing (-f original)", long)]
     manifest: bool,
 
     /// With -f original, also copy the JPEG or HEIF that the camera wrote
     /// next to each RAW file with the same name (RAW+JPEG)
-    #[arg(long)]
+    #[arg(help_heading = "Importing (-f original)", long)]
     with_jpeg: bool,
 
     /// Blend this logo (a PNG, which may be transparent) into the
     /// bottom-right corner of every image. Its long side is a fifth of the
     /// image's short edge
-    #[arg(long, value_name = "PNG")]
+    #[arg(help_heading = "Output", long, value_name = "PNG")]
     watermark: Option<PathBuf>,
 
     /// Put the watermark only on these --resize sizes, such as 2048,1080,
     /// so that full-size finals stay clean
-    #[arg(long, value_name = "PIXELS", value_delimiter = ',', requires = "watermark",
+    #[arg(help_heading = "Output", long, value_name = "PIXELS", value_delimiter = ',', requires = "watermark",
           action = clap::ArgAction::Set, value_parser = clap::value_parser!(u32).range(1..))]
     watermark_sizes: Vec<u32>,
 
     /// Overwrite existing output files (default: skip if exists)
-    #[arg(long)]
+    #[arg(help_heading = "Runs and scripts", long)]
     overwrite: bool,
 
     /// Recurse into subdirectories when scanning for RAW files
-    #[arg(short = 'R', long)]
+    #[arg(help_heading = "Runs and scripts", short = 'R', long)]
     recursive: bool,
 
     /// Also convert when the input file is newer than the existing output
-    #[arg(short, long, conflicts_with = "overwrite")]
+    #[arg(help_heading = "Runs and scripts", short, long, conflicts_with = "overwrite")]
     update: bool,
 
     /// Print what would be converted, then exit without writing anything
-    #[arg(short = 'n', long)]
+    #[arg(help_heading = "Runs and scripts", short = 'n', long)]
     dry_run: bool,
 
     /// Number of files to convert at the same time. Each file uses all
     /// CPU cores and holds a full-size image in memory. The default is
     /// chosen from the installed RAM and the size of the largest input
-    #[arg(short, long, value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(help_heading = "Runs and scripts", short, long, value_parser = clap::value_parser!(u32).range(1..))]
     jobs: Option<u32>,
 
     /// Keep running and convert new files as they arrive, checking every
     /// SECONDS (default 5), for tethered or event shooting. Stop with Ctrl-C
-    #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "5",
+    #[arg(help_heading = "Runs and scripts", long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "5",
           conflicts_with_all = ["dry_run", "files_from"],
           value_parser = clap::value_parser!(u64).range(1..=3600))]
     watch: Option<u64>,
 
     /// Print errors only
-    #[arg(long)]
+    #[arg(help_heading = "Runs and scripts", long)]
     quiet: bool,
+
+    /// Read more inputs from this file, one path per line; "-" reads
+    /// standard input, as in `find ... | rawdog --files-from - -o out`.
+    /// Relative paths are relative to the current directory.
+    /// All inputs form one run, so --name {seq}, --report, and --gallery
+    /// cover them all
+    #[arg(help_heading = "Runs and scripts", long, value_name = "FILE")]
+    files_from: Option<PathBuf>,
+
+    /// Generate shell completion script and exit
+    #[arg(help_heading = "Runs and scripts", long, value_enum, value_name = "SHELL")]
+    completions: Option<Shell>,
+
+    /// Write what happened to each file to this file: JSON if the name ends
+    /// in .json, otherwise CSV. Columns: input, output, status (converted,
+    /// skipped, failed, excluded), message, seconds
+    #[arg(help_heading = "Runs and scripts", long, value_name = "FILE")]
+    report: Option<PathBuf>,
 }
 
 fn float_in_range<const MIN: i32, const MAX: i32>(s: &str) -> Result<f32, String> {
