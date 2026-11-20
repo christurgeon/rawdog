@@ -191,6 +191,12 @@ To deliver one frame of each exposure bracket, `--burst-pick ev0` keeps the fram
 rawdog -R /Volumes/CARD -r 2048 -o ./rooms --burst-pick ev0 --dry-run
 ```
 
+For a wildlife or sports burst, `--burst-pick sharpest` keeps the sharpest frame of each burst, measured on the middle half of the embedded preview, where the subject usually is. It is a quick first cull: check the result, because a sharp background can score higher than a moving subject.
+
+```sh
+rawdog -R /Volumes/CARD -r 2048 --fast -o ./keepers --burst-pick sharpest --burst-gap 0.3
+```
+
 `{seq}` and `{burst}` numbers are counted per run, so adding files to a later run renumbers the files taken after them. For that reason such a run refuses to start when any of its output files exists; use `--overwrite` to replace them, or write to an empty directory. To add a second day or a late card to an existing set, continue the numbering with `--seq-start`. Numbers have four digits, or more past 9999; a name with five digits does not sort after one with four, so keep a numbering below 10,000 files.
 
 ```sh

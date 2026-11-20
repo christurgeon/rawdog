@@ -449,6 +449,35 @@ fn load_preview(input: &Path) -> Result<Option<RgbImage>> {
     }
 }
 
+/// How sharp a frame is, for `--burst-pick sharpest`: the variance of the
+/// Laplacian of the embedded preview, scaled to 800 pixels, on the middle
+/// half where the subject usually is. Higher is sharper. `None` without a
+/// readable preview.
+pub fn sharpness(input: &Path) -> Option<f64> {
+    let preview = load_preview(input).ok().flatten()?;
+    let small = image::imageops::thumbnail(&preview, 800, 800);
+    let grey = image::DynamicImage::ImageRgb8(small).into_luma8();
+    Some(laplacian_variance(&grey))
+}
+
+/// Variance of the 4-neighbour Laplacian over the middle half of `img`.
+fn laplacian_variance(img: &image::GrayImage) -> f64 {
+    let (w, h) = img.dimensions();
+    let (x0, x1, y0, y1) = (w / 4, w * 3 / 4, h / 4, h * 3 / 4);
+    let mut values = Vec::new();
+    for y in y0.max(1)..y1.min(h.saturating_sub(1)) {
+        for x in x0.max(1)..x1.min(w.saturating_sub(1)) {
+            let p = |dx: i64, dy: i64| f64::from(img.get_pixel((x as i64 + dx) as u32, (y as i64 + dy) as u32)[0]);
+            values.push(p(1, 0) + p(-1, 0) + p(0, 1) + p(0, -1) - 4.0 * p(0, 0));
+        }
+    }
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64
+}
+
 /// Warn once per run when `--resize` asks for more pixels than a preview
 /// has, because a preview is never enlarged.
 fn warn_if_preview_is_small(preview: &RgbImage, resize: Option<u32>) {
@@ -1566,6 +1595,17 @@ mod tests {
         let out = crop_to_aspect(img, Some((1, 1)));
         assert_eq!(out.dimensions(), (10, 10));
         assert_eq!(out.get_pixel(0, 0)[0], 10);
+    }
+
+    #[test]
+    fn laplacian_variance_is_higher_for_sharp_detail() {
+        let sharp = image::GrayImage::from_fn(64, 64, |x, y| image::Luma([if (x + y) % 2 == 0 { 0 } else { 255 }]));
+        let blurred = image::imageops::blur(&sharp, 3.0);
+        let flat = image::GrayImage::from_pixel(64, 64, image::Luma([128]));
+        assert!(laplacian_variance(&sharp) > laplacian_variance(&blurred));
+        assert!(laplacian_variance(&blurred) >= laplacian_variance(&flat));
+        assert_eq!(laplacian_variance(&flat), 0.0);
+        assert_eq!(laplacian_variance(&image::GrayImage::new(2, 2)), 0.0);
     }
 
     // -----------------------------------------------------------------------
