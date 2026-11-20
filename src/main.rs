@@ -351,6 +351,7 @@ fn watch(args: &[std::ffi::OsString], interval: u64, quiet: bool) -> Result<()> 
     if !quiet {
         println!("Watching for new RAW files every {interval} s; press Ctrl-C to stop.");
     }
+    let mut reported = HashSet::new();
     loop {
         // The arguments already contain the defaults file.
         let round = std::process::Command::new(&exe)
@@ -362,11 +363,32 @@ fn watch(args: &[std::ffi::OsString], interval: u64, quiet: bool) -> Result<()> 
             .context("Failed to start a watch round")?;
         let stdout = String::from_utf8_lossy(&round.stdout);
         let stderr = String::from_utf8_lossy(&round.stderr);
-        let idle = stdout.lines().any(|l| l.starts_with("0 succeeded, 0 failed"))
-            || stderr.contains("No RAW files found");
-        if !idle {
-            print!("{stdout}");
+        let no_files = stderr.contains("No RAW files found");
+        let summary = stdout.lines().find_map(|l| {
+            let (succeeded, rest) = l.split_once(" succeeded, ")?;
+            Some((succeeded.parse::<usize>().ok()?, rest.starts_with("0 failed")))
+        });
+        // A round that stops before converting (invalid options, a refused
+        // output) would fail the same way every time.
+        if !round.status.success() && summary.is_none() && !no_files {
             eprint!("{stderr}");
+            std::process::exit(round.status.code().unwrap_or(1));
+        }
+        // A file that fails stays without output and is tried every round;
+        // report each error once.
+        let errors: Vec<&str> =
+            stderr.lines().filter(|l| l.starts_with("Error converting")).collect();
+        let new_errors: Vec<&str> =
+            errors.iter().copied().filter(|e| reported.insert(e.to_string())).collect();
+        let converted = summary.is_some_and(|(succeeded, _)| succeeded > 0);
+        if converted || !new_errors.is_empty() {
+            print!("{stdout}");
+            for line in stderr.lines() {
+                let old_error = line.starts_with("Error converting") && !new_errors.contains(&line);
+                if !old_error {
+                    eprintln!("{line}");
+                }
+            }
         }
         std::thread::sleep(std::time::Duration::from_secs(interval));
     }
@@ -650,6 +672,12 @@ fn main() -> Result<()> {
     }
     let cli = Cli::parse_from(&args);
 
+    if cli.watch.is_some() && cli.name.as_ref().is_some_and(|t| t.uses_seq() || t.uses_burst()) {
+        bail!(
+            "--watch cannot be used with {{seq}} or {{burst}}: their numbers are counted per run, \
+             and each round is a new run."
+        );
+    }
     if let Some(interval) = cli.watch.filter(|_| std::env::var_os(WATCH_ROUND).is_none()) {
         return watch(&args, interval, cli.quiet);
     }
@@ -668,7 +696,8 @@ fn main() -> Result<()> {
         }
     }
 
-    if cli.resize.len() > 1 && cli.output.is_none() {
+    let distinct_sizes = cli.resize.iter().collect::<HashSet<_>>().len();
+    if distinct_sizes > 1 && cli.output.is_none() {
         bail!("Several --resize sizes need -o: each size is written into its own folder there.");
     }
 
