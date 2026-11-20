@@ -177,6 +177,11 @@ struct Cli {
           value_parser = float_in_range::<0, 3>)]
     sharpen: Option<f32>,
 
+    /// Print resolution in pixels per inch, such as 300, for print labs and
+    /// layout software. Without it, the camera's value is copied
+    #[arg(long, value_name = "DPI", value_parser = clap::value_parser!(u16).range(1..=10000))]
+    dpi: Option<u16>,
+
     /// Do not copy GPS location to the output
     #[arg(long)]
     strip_gps: bool,
@@ -623,6 +628,7 @@ fn main() -> Result<()> {
             ("--strip-metadata", cli.strip_metadata),
             ("--artist", cli.artist.is_some()),
             ("--copyright", cli.copyright.is_some()),
+            ("--dpi", cli.dpi.is_some()),
             ("--watermark", cli.watermark.is_some()),
         ];
         let used: Vec<&str> = image_options
@@ -879,6 +885,7 @@ fn main() -> Result<()> {
             copyright: cli.copyright.clone(),
             srgb: !cli.preview,
             time_shift: cli.time_shift.clone(),
+            dpi: cli.dpi,
         },
     };
 

@@ -761,6 +761,9 @@ fn encode_jpeg(img: &RgbImage, input: &Path, opts: &ConvertOptions) -> Result<Ve
     let mut encode = |quality: u8| -> Result<Vec<u8>> {
         let mut jpeg_buf = Vec::new();
         let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, quality);
+        if let Some(dpi) = opts.metadata.dpi {
+            encoder.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(dpi));
+        }
         if opts.metadata.srgb {
             encoder.set_icc_profile(exif_utils::srgb_icc_profile().to_vec())?;
         }
