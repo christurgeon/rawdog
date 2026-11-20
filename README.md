@@ -140,7 +140,7 @@ Convert the frames a client chose from the gallery. Each image in `gallery.html`
 rawdog -R /Volumes/CARD --picks picks.txt -o ./finals
 ```
 
-Names are compared with the RAW file names, without letter case, so proofs made with `--name` need their `{stem}` in the name. rawdog warns about each listed name that matches no RAW file, so a typing error is not missed.
+Names are compared with the RAW file names, without letter case. The gallery's list always gives the RAW file names, also for proofs named with `--name`; a client who types names from proof files named without `{stem}` gives names that do not match. rawdog warns about each listed name that matches no RAW file, so a typing error is not missed.
 
 Dates are the camera clock's local date. A file without the metadata that a filter needs is excluded; `--dry-run` lists each excluded file with the reason.
 
@@ -230,7 +230,7 @@ For print, `--dpi 300` sets the print resolution that labs and layout software r
 
 ### Watching a folder
 
-For tethered or event shooting, `--watch` keeps running and converts new files as they arrive, checking every 5 seconds (or the number given). A file is converted once it has not changed for 3 seconds, so a file that is still being copied is left for the next check. With `--gallery`, the page is updated each time:
+For tethered or event shooting, `--watch` keeps running and converts new files as they arrive, checking every 5 seconds (or the number given). A file is converted once it has not changed for 3 seconds, so a file that is still being copied is left for the next check. With `--gallery`, the page is updated each time, and it reloads itself in the browser, so a screen at the event shows new images:
 
 ```sh
 rawdog ./incoming -r 2048 --fast -o ./live --gallery --watch

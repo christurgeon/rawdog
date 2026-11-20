@@ -93,7 +93,8 @@ fn relative_url(page_dir: &Path, image: &Path) -> Option<String> {
 }
 
 /// Render the page. Images that are not below `page_dir` are left out.
-pub fn render(title: &str, page_dir: &Path, entries: &[Entry]) -> String {
+/// With `refresh`, the page reloads itself every that many seconds.
+pub fn render(title: &str, page_dir: &Path, entries: &[Entry], refresh: Option<u64>) -> String {
     let mut cards = String::new();
     for entry in entries {
         let Some(url) = relative_url(page_dir, &entry.image) else {
@@ -133,6 +134,7 @@ pub fn render(title: &str, page_dir: &Path, entries: &[Entry]) -> String {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+{refresh}
 <title>{title}</title>
 <style>
   :root {{ color-scheme: light dark; --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; --card: #ffffff; }}
@@ -190,6 +192,9 @@ pub fn render(title: &str, page_dir: &Path, entries: &[Entry]) -> String {
 "##,
         title = escape(title),
         count = entries.len(),
+        refresh = refresh
+            .map(|s| format!("<meta http-equiv=\"refresh\" content=\"{s}\">"))
+            .unwrap_or_default(),
     )
 }
 
@@ -217,6 +222,7 @@ mod tests {
             "Shoot <1>",
             Path::new("/out"),
             &[entry("/out/2026-11-14/a b&c.jpg", "a b&c.ARW")],
+            None,
         );
         assert!(page.contains("<title>Shoot &lt;1&gt;</title>"));
         assert!(page.contains(r#"src="2026-11-14/a%20b%26c.jpg""#), "{page}");
@@ -226,10 +232,17 @@ mod tests {
     }
 
     #[test]
+    fn render_adds_a_refresh_only_when_asked() {
+        let page = render("x", Path::new("/out"), &[], Some(10));
+        assert!(page.contains(r#"<meta http-equiv="refresh" content="10">"#));
+        assert!(!render("x", Path::new("/out"), &[], None).contains("refresh"));
+    }
+
+    #[test]
     fn render_shows_the_thumbnail_and_links_the_image() {
         let mut e = entry("/out/a.jpg", "a.ARW");
         e.thumbnail = Some(PathBuf::from("/out/gallery-thumbs/a.jpg"));
-        let page = render("x", Path::new("/out"), &[e]);
+        let page = render("x", Path::new("/out"), &[e], None);
         assert!(page.contains(r#"<a href="a.jpg"><img src="gallery-thumbs/a.jpg""#), "{page}");
     }
 
@@ -258,7 +271,7 @@ mod tests {
 
     #[test]
     fn render_leaves_out_images_outside_the_page_directory() {
-        let page = render("x", Path::new("/out"), &[entry("/elsewhere/a.jpg", "a")]);
+        let page = render("x", Path::new("/out"), &[entry("/elsewhere/a.jpg", "a")], None);
         assert!(!page.contains("<img"));
     }
 }
