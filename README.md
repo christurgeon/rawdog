@@ -128,7 +128,7 @@ Or convert by colour label, from the same sidecar files. Lightroom and Capture O
 rawdog -R /Volumes/CARD --label red,green -o ./selects
 ```
 
-Convert one day of a multi-day card, from one of two bodies (`--lens 70-200` selects by lens in the same way):
+Convert one day of a multi-day card, from one of two bodies (`--lens 70-200` selects by lens in the same way; Nikon DSLRs, Pentax, and older Panasonic bodies record no lens name that rawdog reads, so their files are excluded):
 
 ```sh
 rawdog -R /Volumes/CARD --since 2026-11-14 --until 2026-11-14 --camera 7M4 -o ./day2
