@@ -17,6 +17,14 @@ pub struct MetadataOptions {
     /// The output pixels are sRGB, whatever colour space the camera was set
     /// to. False for `--preview`, which keeps the camera's own encoding.
     pub srgb: bool,
+    /// Write the rating and colour label into the output as XMP.
+    pub keep_rating: bool,
+    /// Keywords written into the output as XMP `dc:subject`.
+    pub keywords: Vec<String>,
+    /// A GPS track for files without a position, and the camera clock's UTC
+    /// offset in seconds when the files do not record it.
+    pub gpx: Option<std::sync::Arc<crate::gpx::Track>>,
+    pub gpx_tz: Option<crate::gpx::Zones>,
     /// Print resolution in pixels per inch. Replaces the source value.
     pub dpi: Option<u16>,
     /// Correction of the camera clock, applied to the capture dates.
@@ -26,7 +34,17 @@ pub struct MetadataOptions {
 /// An sRGB ICC profile, generated once.
 pub fn srgb_icc_profile() -> &'static [u8] {
     static PROFILE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    PROFILE.get_or_init(|| moxcms::ColorProfile::new_srgb().encode().unwrap_or_default())
+    PROFILE.get_or_init(|| {
+        let mut icc = moxcms::ColorProfile::new_srgb().encode().unwrap_or_default();
+        // The encoder stamps the current time into the header, which made
+        // two conversions of the same file differ. Use a fixed date. The
+        // profile ID, which would cover the date, is left empty (zero).
+        const DATE: [u8; 12] = [0x07, 0xe8, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0]; // 2024-01-01 00:00:00
+        if icc.len() >= 100 && icc[84..100].iter().all(|b| *b == 0) {
+            icc[24..36].copy_from_slice(&DATE);
+        }
+        icc
+    })
 }
 
 /// TIFF tag that holds an ICC profile.
@@ -78,6 +96,16 @@ pub fn read_source_exif(path: &Path) -> Result<Option<exif::Exif>> {
 
 /// How much of a file `read_source_exif` reads first.
 const HEAD_BYTES: u64 = 1 << 20;
+
+/// The first `HEAD_BYTES` of a file as a decoder source. A CR3 file keeps
+/// its metadata boxes at the start, and `RawSource::new` would read the
+/// whole file (it maps and loads it), which is slow from a memory card.
+/// Callers fall back to the whole file when the start is not enough.
+pub fn head_source(path: &Path) -> Option<rawler::rawsource::RawSource> {
+    let mut head = Vec::new();
+    std::fs::File::open(path).ok()?.take(HEAD_BYTES).read_to_end(&mut head).ok()?;
+    Some(rawler::rawsource::RawSource::new_from_slice(&head))
+}
 
 enum Parsed {
     Complete(exif::Exif),
@@ -165,12 +193,17 @@ fn decoder_fields(path: &Path) -> Option<Vec<exif::Field>> {
     use rawler::rawsource::RawSource;
 
     // rawler can panic on files that are not RAW files.
-    let meta = std::panic::catch_unwind(|| {
-        let source = RawSource::new(path).ok()?;
-        let decoder = rawler::get_decoder(&source).ok()?;
-        decoder.raw_metadata(&source, &RawDecodeParams::default()).ok()
-    })
-    .ok()??;
+    let read = |source: RawSource| {
+        std::panic::catch_unwind(move || {
+            let decoder = rawler::get_decoder(&source).ok()?;
+            decoder.raw_metadata(&source, &RawDecodeParams::default()).ok()
+        })
+        .ok()
+        .flatten()
+    };
+    let meta = head_source(path)
+        .and_then(read)
+        .or_else(|| read(RawSource::new(path).ok()?))?;
     let e = meta.exif;
 
     let mut fields = Vec::new();
@@ -210,6 +243,7 @@ fn decoder_fields(path: &Path) -> Option<Vec<exif::Field>> {
     push(Tag::Artist, text(e.artist));
     push(Tag::Copyright, text(e.copyright));
     push(Tag::DateTimeOriginal, text(e.date_time_original));
+    push(Tag::SubSecTimeOriginal, text(e.sub_sec_time_original));
     push(Tag::DateTimeDigitized, text(e.create_date));
     push(Tag::DateTime, text(e.modify_date));
     push(Tag::ExposureTime, rational(e.exposure_time));
@@ -369,6 +403,7 @@ fn fields_for_output<'a>(
         shift.seconds_for(model.as_deref())
     });
 
+    let position = gpx_position(fields.clone(), meta, shift_seconds);
     let replaced = |tag: Tag| {
         (tag == Tag::Artist && meta.artist.is_some())
             || (tag == Tag::Copyright && meta.copyright.is_some())
@@ -407,6 +442,22 @@ fn fields_for_output<'a>(
             value: exif::Value::Rational(vec![exif::Rational { num: dpi.into(), denom: 1 }]),
         })
     };
+    let gps_fields = position.into_iter().flat_map(|(lat, lon)| {
+        let gps = |tag, value| exif::Field { tag, ifd_num: exif::In::PRIMARY, value };
+        let dms = |v: f64| {
+            exif::Value::Rational(
+                crate::gpx::to_dms(v).iter().map(|&(num, denom)| exif::Rational { num, denom }).collect(),
+            )
+        };
+        let reference = |r: &str| exif::Value::Ascii(vec![r.as_bytes().to_vec()]);
+        [
+            gps(Tag::GPSVersionID, exif::Value::Byte(vec![2, 3, 0, 0])),
+            gps(Tag::GPSLatitudeRef, reference(if lat < 0.0 { "S" } else { "N" })),
+            gps(Tag::GPSLatitude, dms(lat)),
+            gps(Tag::GPSLongitudeRef, reference(if lon < 0.0 { "W" } else { "E" })),
+            gps(Tag::GPSLongitude, dms(lon)),
+        ]
+    });
     let added = [
         meta.artist.as_ref().map(|t| text_field(Tag::Artist, t)),
         copyright.as_ref().map(|t| text_field(Tag::Copyright, t)),
@@ -424,6 +475,9 @@ fn fields_for_output<'a>(
         .filter(|f| f.ifd_num == exif::In::PRIMARY && !describes_source_layout(f.tag))
         .filter(|f| value_size(&f.value) <= MAX_FIELD_BYTES)
         .filter(|f| !(meta.strip_gps && f.tag.context() == Context::Gps))
+        // A track position replaces a partial GPS directory of the source
+        // (many cameras write only GPSVersionID), so no tag appears twice.
+        .filter(|f| !(position.is_some() && f.tag.context() == Context::Gps))
         .filter(|f| !replaced(f.tag))
         // A camera set to Adobe RGB marks its files with ColorSpace 0xFFFF
         // and interoperability index "R03". The developed output is sRGB.
@@ -447,7 +501,48 @@ fn fields_for_output<'a>(
             field
         })
         .chain(added.into_iter().flatten())
+        .chain(gps_fields)
         .collect()
+}
+
+/// The position for `--gpx`: from the track at the capture time, for a
+/// file without GPS data of its own and unless GPS is stripped.
+fn gpx_position<'a>(
+    fields: impl Iterator<Item = &'a exif::Field> + Clone,
+    meta: &MetadataOptions,
+    shift_seconds: i64,
+) -> Option<(f64, f64)> {
+    use exif::Tag;
+    let track = meta.gpx.as_ref().filter(|_| !meta.strip_gps)?;
+    if fields.clone().any(|f| f.tag == Tag::GPSLatitude) {
+        return None;
+    }
+    let ascii = |tag| {
+        fields.clone().find(|f| f.tag == tag && f.ifd_num == exif::In::PRIMARY).and_then(|f| {
+            match &f.value {
+                exif::Value::Ascii(v) => v.first().map(|b| String::from_utf8_lossy(b).trim().to_string()),
+                _ => None,
+            }
+        })
+    };
+    let d = exif::DateTime::from_ascii(ascii(Tag::DateTimeOriginal)?.as_bytes()).ok()?;
+    let local = crate::timeshift::to_seconds((d.year, d.month, d.day, d.hour, d.minute, d.second));
+    // The file's own time zone wins; --gpx-tz is for files without one.
+    let offset = ascii(Tag::OffsetTimeOriginal)
+        .and_then(|o| crate::gpx::parse_offset(&o))
+        // Zone changes are given in camera-clock time, before --time-shift.
+        .or_else(|| meta.gpx_tz.as_ref()?.at(local));
+    let Some(offset) = offset else {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "Warning: some files do not record their time zone; give the camera clock's \
+                 offset with --gpx-tz, such as --gpx-tz +02:00, to geotag them"
+            );
+        }
+        return None;
+    };
+    track.position(local + shift_seconds - offset)
 }
 
 /// An EXIF date value ("YYYY:MM:DD HH:MM:SS") moved by `seconds`.
@@ -545,6 +640,84 @@ pub fn inject_exif_into_jpeg(jpeg_bytes: &[u8], exif_data: &[u8]) -> Result<Vec<
     Ok(output)
 }
 
+/// An XMP packet with `xmp:Rating`, `xmp:Label`, and keywords
+/// (`dc:subject`), which Lightroom and other catalogs and stock sites read
+/// on import. `None` when there is none of them.
+pub fn rating_xmp(rating: Option<i8>, label: Option<&str>, keywords: &[String]) -> Option<String> {
+    if rating.is_none() && label.is_none() && keywords.is_empty() {
+        return None;
+    }
+    let escape = |s: &str| {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    };
+    let mut attributes = String::new();
+    if let Some(rating) = rating {
+        attributes.push_str(&format!(" xmp:Rating=\"{rating}\""));
+    }
+    if let Some(label) = label {
+        // Lightroom's own labels start with a capital: Red, Green.
+        let mut chars = label.chars();
+        let label: String = chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default();
+        attributes.push_str(&format!(" xmp:Label=\"{}\"", escape(&label)));
+    }
+    let description = if keywords.is_empty() {
+        format!("<rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"{attributes}/>")
+    } else {
+        let items: String =
+            keywords.iter().map(|k| format!("<rdf:li>{}</rdf:li>", escape(k))).collect();
+        format!(
+            "<rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" \
+             xmlns:dc=\"http://purl.org/dc/elements/1.1/\"{attributes}>\
+             <dc:subject><rdf:Bag>{items}</rdf:Bag></dc:subject></rdf:Description>"
+        )
+    };
+    Some(format!(
+        "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\
+         <x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+         {description}</rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>"
+    ))
+}
+
+/// Add an XMP packet to a JPEG, in the APP1 segment that XMP readers look
+/// for, after the other application segments.
+pub fn inject_xmp_into_jpeg(jpeg_bytes: &[u8], xmp: &str) -> Result<Vec<u8>> {
+    use img_parts::jpeg::{markers, Jpeg, JpegSegment};
+    let mut jpeg = Jpeg::from_bytes(jpeg_bytes.to_vec().into())
+        .map_err(|e| anyhow::anyhow!("Failed to parse JPEG for XMP: {}", e))?;
+    let mut contents = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+    contents.extend_from_slice(xmp.as_bytes());
+    let segments = jpeg.segments_mut();
+    let at = segments
+        .iter()
+        .position(|s| !(markers::APP0..=markers::APP15).contains(&s.marker()))
+        .unwrap_or(segments.len());
+    segments.insert(at, JpegSegment::new_with_contents(markers::APP1, contents.into()));
+    let mut output = Vec::with_capacity(jpeg.len());
+    jpeg.encoder()
+        .write_to(&mut output)
+        .map_err(|e| anyhow::anyhow!("Failed to write JPEG with XMP: {}", e))?;
+    Ok(output)
+}
+
+/// Add an XMP packet to a PNG, in the iTXt chunk that XMP readers look for,
+/// before the image data.
+pub fn inject_xmp_into_png(png_bytes: &[u8], xmp: &str) -> Result<Vec<u8>> {
+    use img_parts::png::{Png, PngChunk};
+    let mut png = Png::from_bytes(png_bytes.to_vec().into())
+        .map_err(|e| anyhow::anyhow!("Failed to parse PNG for XMP: {}", e))?;
+    // Keyword, no compression, empty language tag and translated keyword.
+    let mut contents = b"XML:com.adobe.xmp\0\0\0\0\0".to_vec();
+    contents.extend_from_slice(xmp.as_bytes());
+    let chunks = png.chunks_mut();
+    let at = chunks.iter().position(|c| c.kind() == *b"IDAT").unwrap_or(chunks.len());
+    chunks.insert(at, PngChunk::new(*b"iTXt", contents.into()));
+    let mut output = Vec::with_capacity(png.len());
+    png.encoder()
+        .write_to(&mut output)
+        .map_err(|e| anyhow::anyhow!("Failed to write PNG with XMP: {}", e))?;
+    Ok(output)
+}
+
 /// Inject raw EXIF bytes (a TIFF blob) into an already-encoded PNG buffer.
 ///
 /// Returns the new PNG bytes with the EXIF data embedded in an eXIf chunk.
@@ -581,6 +754,35 @@ pub fn inject_exif_into_png(png_bytes: &[u8], exif_data: &[u8]) -> Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rating_xmp_is_read_back_by_the_rating_parser() {
+        let xmp = rating_xmp(Some(4), Some("red"), &[]).unwrap();
+        assert!(xmp.contains(r#"xmp:Rating="4""#) && xmp.contains(r#"xmp:Label="Red""#), "{xmp}");
+        assert_eq!(rating_xmp(None, None, &[]), None);
+        assert!(rating_xmp(None, Some("a<b"), &[]).unwrap().contains("A&lt;b"));
+        let tagged = rating_xmp(None, None, &["wedding".to_string(), "Smith & Co".to_string()]).unwrap();
+        assert!(
+            tagged.contains("<dc:subject><rdf:Bag><rdf:li>wedding</rdf:li><rdf:li>Smith &amp; Co</rdf:li></rdf:Bag></dc:subject>"),
+            "{tagged}"
+        );
+
+        let img: image::RgbImage = image::ImageBuffer::from_pixel(2, 2, image::Rgb([1u8, 2, 3]));
+        let mut jpeg = Vec::new();
+        img.write_with_encoder(image::codecs::jpeg::JpegEncoder::new(&mut jpeg)).unwrap();
+        let with = inject_xmp_into_jpeg(&jpeg, &xmp).unwrap();
+        assert!(with.windows(29).any(|w| w == b"http://ns.adobe.com/xap/1.0/\0"));
+        assert!(image::load_from_memory(&with).is_ok());
+
+        let mut png = Vec::new();
+        img.write_with_encoder(image::codecs::png::PngEncoder::new(&mut png)).unwrap();
+        let with = inject_xmp_into_png(&png, &xmp).unwrap();
+        let parsed = img_parts::png::Png::from_bytes(with.clone().into()).unwrap();
+        let kinds: Vec<[u8; 4]> = parsed.chunks().iter().map(|c| c.kind()).collect();
+        let itxt = kinds.iter().position(|k| k == b"iTXt").unwrap();
+        assert!(itxt < kinds.iter().position(|k| k == b"IDAT").unwrap());
+        assert!(image::load_from_memory(&with).is_ok());
+    }
 
     #[test]
     fn extract_exif_returns_none_for_nonexistent_file() {
@@ -905,6 +1107,47 @@ mod tests {
     }
 
     #[test]
+    fn gpx_adds_a_position_only_to_files_without_one() {
+        use exif::{In, Tag, Value};
+        let track = crate::gpx::Track::parse(
+            r#"<trkpt lat="-33.5" lon="151.25"><time>2026-11-14T08:00:00Z</time></trkpt>"#,
+        )
+        .unwrap();
+        let date = field(Tag::DateTimeOriginal, In::PRIMARY, Value::Ascii(vec![b"2026:11:14 10:00:00".to_vec()]));
+        let meta = MetadataOptions {
+            gpx: Some(std::sync::Arc::new(track)),
+            gpx_tz: Some("+02:00".parse().unwrap()),
+            ..Default::default()
+        };
+        let out = fields_for_output([date.clone()].iter(), (300, 200), &meta);
+        let get = |tag| out.iter().find(|f| f.tag == tag).map(|f| f.display_value().to_string());
+        assert_eq!(get(Tag::GPSLatitudeRef).as_deref(), Some("S"));
+        assert_eq!(get(Tag::GPSLongitudeRef).as_deref(), Some("E"));
+        assert!(get(Tag::GPSLatitude).is_some());
+
+        // A partial GPS directory of the source is replaced, so no tag
+        // appears twice.
+        let version = field(Tag::GPSVersionID, In::PRIMARY, Value::Byte(vec![2, 2, 0, 0]));
+        let out = fields_for_output([date.clone(), version].iter(), (300, 200), &meta);
+        assert_eq!(out.iter().filter(|f| f.tag == Tag::GPSVersionID).count(), 1);
+
+        // The file's own time zone wins over --gpx-tz.
+        let zone = field(Tag::OffsetTimeOriginal, In::PRIMARY, Value::Ascii(vec![b"+02:00".to_vec()]));
+        let wrong_tz = MetadataOptions { gpx_tz: Some("+05:00".parse().unwrap()), ..meta.clone() };
+        let out = fields_for_output([date.clone(), zone].iter(), (300, 200), &wrong_tz);
+        assert!(out.iter().any(|f| f.tag == Tag::GPSLatitude));
+
+        // A file with its own position keeps it; --strip-gps adds nothing.
+        let own = field(Tag::GPSLatitude, In::PRIMARY, Value::Rational(vec![exif::Rational { num: 1, denom: 1 }]));
+        let out = fields_for_output([date.clone(), own].iter(), (300, 200), &meta);
+        assert_eq!(out.iter().filter(|f| f.tag == Tag::GPSLatitude).count(), 1);
+        assert!(out.iter().all(|f| f.tag != Tag::GPSLongitude));
+        let stripped = MetadataOptions { strip_gps: true, ..meta };
+        let out = fields_for_output([date].iter(), (300, 200), &stripped);
+        assert!(out.iter().all(|f| f.tag.context() != exif::Context::Gps));
+    }
+
+    #[test]
     fn copyright_year_is_the_shifted_capture_year() {
         use exif::{In, Tag, Value};
         let source = [field(
@@ -1032,6 +1275,8 @@ mod tests {
         assert_eq!(&icc[12..16], b"mntr");
         assert_eq!(&icc[16..20], b"RGB ");
         assert_eq!(&icc[36..40], b"acsp");
+        // A fixed creation date, so outputs are reproducible.
+        assert_eq!(&icc[24..30], &[0x07, 0xe8, 0, 1, 0, 1]);
     }
 
     #[test]

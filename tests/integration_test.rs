@@ -1143,3 +1143,43 @@ fn cli_preview_develops_a_file_without_a_preview() {
     assert!(out_dir.join("grey.jpg").exists());
     assert!(String::from_utf8_lossy(&output.stderr).contains("developing the RAW data instead"));
 }
+
+#[test]
+fn cli_manifest_lists_the_checksum_of_each_copy() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("a.png");
+    fs::write(&input, b"abc").unwrap();
+    let out_dir = tmp.path().join("archive");
+    let output = run(&[
+        input.as_ref(),
+        "-f".as_ref(),
+        "original".as_ref(),
+        "--manifest".as_ref(),
+        "-o".as_ref(),
+        out_dir.as_ref(),
+    ]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        fs::read_to_string(out_dir.join("SHA256SUMS")).unwrap(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  a.png\n"
+    );
+    let output = run(&[input.as_ref(), "--manifest".as_ref(), "-o".as_ref(), out_dir.as_ref()]);
+    assert!(!output.status.success());
+}
+
+#[test]
+fn cli_several_sizes_go_into_one_folder_each() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("grey.png");
+    image::RgbImage::from_pixel(300, 200, image::Rgb([100, 100, 100])).save(&input).unwrap();
+    let out_dir = tmp.path().join("out");
+    let output = run(&[input.as_ref(), "-r".as_ref(), "60,150".as_ref(), "-o".as_ref(), out_dir.as_ref()]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    for (size, dims) in [("150", (150, 100)), ("60", (60, 40))] {
+        let path = out_dir.join(size).join("grey.jpg");
+        assert_eq!(image::image_dimensions(&path).unwrap(), dims, "{}", path.display());
+    }
+    let output = run(&[input.as_ref(), "-r".as_ref(), "60,150".as_ref()]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("need -o"));
+}

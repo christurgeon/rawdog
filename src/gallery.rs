@@ -16,6 +16,8 @@ pub struct Caption {
     pub name: String,
     pub taken: Option<String>,
     pub model: Option<String>,
+    /// Exposure settings, such as "1/250 s · f/2.8 · ISO 800".
+    pub exposure: Option<String>,
     pub rating: Option<i8>,
 }
 
@@ -35,7 +37,10 @@ pub fn thumbnail(dir: &Path, image: &Path) -> Option<PathBuf> {
     if width.max(height) <= THUMB_EDGE * 3 / 2 {
         return None;
     }
-    let mut thumb = dir.join(THUMB_DIR).join(image.strip_prefix(dir).ok()?).into_os_string();
+    // Next to the image, so that the page of a folder and the page above
+    // it share one thumbnail.
+    image.strip_prefix(dir).ok()?;
+    let mut thumb = image.parent()?.join(THUMB_DIR).join(image.file_name()?).into_os_string();
     let is_jpeg = image
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg"));
@@ -91,7 +96,8 @@ fn relative_url(page_dir: &Path, image: &Path) -> Option<String> {
 }
 
 /// Render the page. Images that are not below `page_dir` are left out.
-pub fn render(title: &str, page_dir: &Path, entries: &[Entry]) -> String {
+/// With `refresh`, the page reloads itself every that many seconds.
+pub fn render(title: &str, page_dir: &Path, entries: &[Entry], refresh: Option<u64>) -> String {
     let mut cards = String::new();
     for entry in entries {
         let Some(url) = relative_url(page_dir, &entry.image) else {
@@ -109,6 +115,9 @@ pub fn render(title: &str, page_dir: &Path, entries: &[Entry]) -> String {
         }
         if let Some(model) = &c.model {
             details.push(escape(model));
+        }
+        if let Some(exposure) = &c.exposure {
+            details.push(escape(exposure));
         }
         if let Some(r) = c.rating.filter(|r| *r > 0) {
             details.push("★".repeat(r as usize));
@@ -128,6 +137,7 @@ pub fn render(title: &str, page_dir: &Path, entries: &[Entry]) -> String {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+{refresh}
 <title>{title}</title>
 <style>
   :root {{ color-scheme: light dark; --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; --card: #ffffff; }}
@@ -185,6 +195,9 @@ pub fn render(title: &str, page_dir: &Path, entries: &[Entry]) -> String {
 "##,
         title = escape(title),
         count = entries.len(),
+        refresh = refresh
+            .map(|s| format!("<meta http-equiv=\"refresh\" content=\"{s}\">"))
+            .unwrap_or_default(),
     )
 }
 
@@ -200,6 +213,7 @@ mod tests {
                 name: name.to_string(),
                 taken: Some("2026-11-14 18:02".to_string()),
                 model: Some("ILCE-7M4".to_string()),
+                exposure: None,
                 rating: Some(3),
             },
         }
@@ -211,6 +225,7 @@ mod tests {
             "Shoot <1>",
             Path::new("/out"),
             &[entry("/out/2026-11-14/a b&c.jpg", "a b&c.ARW")],
+            None,
         );
         assert!(page.contains("<title>Shoot &lt;1&gt;</title>"));
         assert!(page.contains(r#"src="2026-11-14/a%20b%26c.jpg""#), "{page}");
@@ -220,10 +235,17 @@ mod tests {
     }
 
     #[test]
+    fn render_adds_a_refresh_only_when_asked() {
+        let page = render("x", Path::new("/out"), &[], Some(10));
+        assert!(page.contains(r#"<meta http-equiv="refresh" content="10">"#));
+        assert!(!render("x", Path::new("/out"), &[], None).contains("refresh"));
+    }
+
+    #[test]
     fn render_shows_the_thumbnail_and_links_the_image() {
         let mut e = entry("/out/a.jpg", "a.ARW");
         e.thumbnail = Some(PathBuf::from("/out/gallery-thumbs/a.jpg"));
-        let page = render("x", Path::new("/out"), &[e]);
+        let page = render("x", Path::new("/out"), &[e], None);
         assert!(page.contains(r#"<a href="a.jpg"><img src="gallery-thumbs/a.jpg""#), "{page}");
     }
 
@@ -239,7 +261,7 @@ mod tests {
         let large = dir.join("day/large.png");
         image::RgbImage::from_pixel(2000, 1000, image::Rgb([200, 10, 10])).save(&large).unwrap();
         let thumb = thumbnail(dir, &large).unwrap();
-        assert_eq!(thumb, dir.join("gallery-thumbs/day/large.png.jpg"));
+        assert_eq!(thumb, dir.join("day/gallery-thumbs/large.png.jpg"));
         assert_eq!(image::image_dimensions(&thumb).unwrap(), (800, 400));
 
         // A thumbnail older than its image is made again.
@@ -252,7 +274,7 @@ mod tests {
 
     #[test]
     fn render_leaves_out_images_outside_the_page_directory() {
-        let page = render("x", Path::new("/out"), &[entry("/elsewhere/a.jpg", "a")]);
+        let page = render("x", Path::new("/out"), &[entry("/elsewhere/a.jpg", "a")], None);
         assert!(!page.contains("<img"));
     }
 }

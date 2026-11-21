@@ -118,6 +118,14 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 }, m, d)
 }
 
+/// Seconds since 1970-01-01 of a capture time, for measuring gaps.
+pub fn to_seconds((y, mo, d, h, mi, s): Taken) -> i64 {
+    days_from_civil(y.into(), mo.into(), d.into()) * 86_400
+        + i64::from(h) * 3_600
+        + i64::from(mi) * 60
+        + i64::from(s)
+}
+
 /// `taken` moved by `seconds`. A time outside the years 1 to 9999 is left
 /// unchanged.
 pub fn add_seconds(taken: Taken, seconds: i64) -> Taken {

@@ -15,7 +15,13 @@ enum Token {
     Lens,
     Serial,
     Rating,
+    Label,
+    Iso,
+    Focal,
+    Aperture,
+    Shutter,
     Seq,
+    Burst,
 }
 
 const TOKENS: &[(&str, Token)] = &[
@@ -29,7 +35,13 @@ const TOKENS: &[(&str, Token)] = &[
     ("lens", Token::Lens),
     ("serial", Token::Serial),
     ("rating", Token::Rating),
+    ("label", Token::Label),
+    ("iso", Token::Iso),
+    ("focal", Token::Focal),
+    ("aperture", Token::Aperture),
+    ("shutter", Token::Shutter),
     ("seq", Token::Seq),
+    ("burst", Token::Burst),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -44,6 +56,8 @@ pub struct NameTemplate {
     parts: Vec<Part>,
     /// The first `{seq}` number.
     pub seq_start: u32,
+    /// Largest gap in seconds between two frames of one `{burst}`.
+    pub burst_gap: f64,
 }
 
 impl FromStr for NameTemplate {
@@ -91,7 +105,7 @@ impl FromStr for NameTemplate {
         if literal.is_empty() || literal.ends_with('/') || escapes {
             return Err("must be a relative file path without '..'".to_string());
         }
-        Ok(NameTemplate { parts, seq_start: 1 })
+        Ok(NameTemplate { parts, seq_start: 1, burst_gap: 2.0 })
     }
 }
 
@@ -102,6 +116,8 @@ use crate::timeshift::Taken;
 pub struct NameInfo {
     pub stem: String,
     pub taken: Option<Taken>,
+    /// Milliseconds within the capture second, for frames of a fast burst.
+    pub subsec_ms: Option<u16>,
     pub model: Option<String>,
     pub lens: Option<String>,
     /// The camera body's serial number.
@@ -110,6 +126,80 @@ pub struct NameInfo {
     pub rating: Option<i8>,
     /// Colour labels in lower case, such as "red". Empty when unlabelled.
     pub labels: Vec<String>,
+    pub exposure: Exposure,
+}
+
+/// The exposure settings of a frame.
+#[derive(Debug, Default, PartialEq, Clone, Copy)]
+pub struct Exposure {
+    pub iso: Option<u32>,
+    pub focal_mm: Option<f64>,
+    pub aperture: Option<f64>,
+    /// Exposure time as a fraction of a second.
+    pub shutter: Option<(u32, u32)>,
+    /// Exposure compensation in EV, as set for a bracket.
+    pub bias: Option<f64>,
+}
+
+/// `v` with up to `decimals` decimals, without trailing zeros: 2.8, 8, 0.95.
+fn trimmed(v: f64, decimals: usize) -> String {
+    let text = format!("{v:.decimals$}");
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        text
+    }
+}
+
+/// `v` with one decimal, without a trailing ".0": 2.8, 8, 4.2.
+fn one_decimal(v: f64) -> String {
+    trimmed(v, 1)
+}
+
+impl Exposure {
+    /// The exposure time as "1/250" or "2", for long or short exposures.
+    fn shutter_parts(&self) -> Option<(bool, String)> {
+        let (num, den) = self.shutter.filter(|(n, d)| *n > 0 && *d > 0)?;
+        let seconds = f64::from(num) / f64::from(den);
+        Some(if seconds >= 0.3 {
+            (false, one_decimal(seconds))
+        } else {
+            (true, format!("{}", (1.0 / seconds).round()))
+        })
+    }
+
+    /// The values for `{iso}`, `{focal}`, `{aperture}`, and `{shutter}`,
+    /// without characters that cannot be in a file name: 800, 70mm, f2.8,
+    /// 1-250s.
+    fn field(&self, token: Token) -> Option<String> {
+        match token {
+            Token::Iso => self.iso.map(|v| v.to_string()),
+            Token::Focal => self.focal_mm.map(|v| format!("{}mm", one_decimal(v))),
+            Token::Aperture => self.aperture.map(|v| format!("f{}", trimmed(v, 2))),
+            Token::Shutter => self.shutter_parts().map(|(fraction, v)| {
+                if fraction { format!("1-{v}s") } else { format!("{v}s") }
+            }),
+            _ => None,
+        }
+    }
+
+    /// For display: "1/250 s · f/2.8 · ISO 800 · 70 mm", or empty.
+    pub fn caption(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some((fraction, v)) = self.shutter_parts() {
+            parts.push(if fraction { format!("1/{v} s") } else { format!("{v} s") });
+        }
+        if let Some(v) = self.aperture {
+            parts.push(format!("f/{}", trimmed(v, 2)));
+        }
+        if let Some(v) = self.iso {
+            parts.push(format!("ISO {v}"));
+        }
+        if let Some(v) = self.focal_mm {
+            parts.push(format!("{} mm", one_decimal(v)));
+        }
+        parts.join(" · ")
+    }
 }
 
 impl NameInfo {
@@ -145,6 +235,7 @@ impl NameInfo {
             .or_else(|| ascii(exif::Tag::DateTime))
             .and_then(|raw| exif::DateTime::from_ascii(&raw).ok())
             .map(|d| (d.year, d.month, d.day, d.hour, d.minute, d.second));
+        info.subsec_ms = ascii(exif::Tag::SubSecTimeOriginal).and_then(|raw| subsec_ms(&raw));
         let text = |tag| {
             ascii(tag)
                 .map(|raw| String::from_utf8_lossy(&raw).trim().to_string())
@@ -153,6 +244,35 @@ impl NameInfo {
         info.model = text(exif::Tag::Model);
         info.lens = text(exif::Tag::LensModel);
         info.serial = text(exif::Tag::BodySerialNumber);
+        let field = |tag| {
+            fields.iter().find(|f| f.tag == tag && f.ifd_num == exif::In::PRIMARY).map(|f| &f.value)
+        };
+        let rational = |tag| match field(tag) {
+            Some(exif::Value::Rational(v)) => v.first().filter(|r| r.denom != 0).map(|r| (r.num, r.denom)),
+            _ => None,
+        };
+        let decimal = |tag| rational(tag).map(|(n, d)| f64::from(n) / f64::from(d)).filter(|v| *v > 0.0);
+        info.exposure = Exposure {
+            // Older Panasonic RW2 files keep the ISO in their own IFD0 tag.
+            iso: field(exif::Tag::PhotographicSensitivity)
+                .and_then(|v| v.get_uint(0))
+                .filter(|v| *v > 0)
+                .or_else(|| {
+                    field(exif::Tag(exif::Context::Tiff, 0x17))
+                        .and_then(|v| v.get_uint(0))
+                        .filter(|v| *v > 0)
+                }),
+            focal_mm: decimal(exif::Tag::FocalLength),
+            aperture: decimal(exif::Tag::FNumber),
+            shutter: rational(exif::Tag::ExposureTime),
+            bias: match field(exif::Tag::ExposureBiasValue) {
+                Some(exif::Value::SRational(v)) => v
+                    .first()
+                    .filter(|r| r.denom != 0)
+                    .map(|r| f64::from(r.num) / f64::from(r.denom)),
+                _ => None,
+            },
+        };
         info.rating = read_rating(path, &fields);
         info.labels = read_labels(path, &fields);
         info
@@ -167,6 +287,30 @@ impl NameInfo {
         }
         self
     }
+}
+
+impl NameInfo {
+    /// The capture time in milliseconds since 1970 (camera clock), with the
+    /// fraction of a second when the camera records it.
+    pub fn time_ms(&self) -> Option<i64> {
+        let seconds = crate::timeshift::to_seconds(self.taken?);
+        Some(seconds * 1000 + i64::from(self.subsec_ms.unwrap_or(0)))
+    }
+}
+
+/// The digits of a SubSecTime value as milliseconds: "5" is 500, "12" is
+/// 120, "1234" is 123.
+fn subsec_ms(raw: &[u8]) -> Option<u16> {
+    let digits: String = String::from_utf8_lossy(raw)
+        .trim()
+        .trim_end_matches('\0')
+        .chars()
+        .take(3)
+        .collect();
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    format!("{digits:0<3}").parse().ok()
 }
 
 /// The sidecar XMP files that may belong to `path`: `NAME.xmp` (Lightroom,
@@ -296,14 +440,18 @@ fn read_rating(path: &Path, fields: &[exif::Field]) -> Option<i8> {
         return None;
     }
     // rawler can panic on files that are not RAW files.
-    let xmp = std::panic::catch_unwind(|| {
-        let source = rawler::rawsource::RawSource::new(path).ok()?;
-        let decoder = rawler::get_decoder(&source).ok()?;
-        decoder
-            .xpacket(&source, &rawler::decoders::RawDecodeParams::default())
-            .ok()?
-    })
-    .ok()??;
+    let read = |source: rawler::rawsource::RawSource| {
+        std::panic::catch_unwind(move || {
+            let decoder = rawler::get_decoder(&source).ok()?;
+            decoder.xpacket(&source, &rawler::decoders::RawDecodeParams::default()).ok()?
+        })
+        .ok()
+        .flatten()
+    };
+    // The start of the file is enough for most; see `head_source`.
+    let xmp = crate::exif::head_source(path)
+        .and_then(read)
+        .or_else(|| read(rawler::rawsource::RawSource::new(path).ok()?))?;
     xmp_rating(&xmp)
 }
 
@@ -371,10 +519,15 @@ impl NameTemplate {
         self.parts.contains(&Part::Token(Token::Seq))
     }
 
+    /// True if the template uses `{burst}`.
+    pub fn uses_burst(&self) -> bool {
+        self.parts.contains(&Part::Token(Token::Burst))
+    }
+
     /// Build the output path, without extension, relative to the output
     /// directory. Values that the file does not have become `unknown`.
-    /// `seq` is the value of `{seq}`.
-    pub fn expand(&self, info: &NameInfo, seq: &str) -> PathBuf {
+    /// `seq` and `burst` are the values of `{seq}` and `{burst}`.
+    pub fn expand(&self, info: &NameInfo, seq: &str, burst: &str) -> PathBuf {
         let unknown = || "unknown".to_string();
         let taken = |f: fn(Taken) -> String| info.taken.map(f).unwrap_or_else(unknown);
         let mut out = String::new();
@@ -399,6 +552,11 @@ impl NameTemplate {
                             r => r.to_string(),
                         },
                         Token::Seq => seq.to_string(),
+                        Token::Burst => burst.to_string(),
+                        Token::Label => info.labels.first().cloned().unwrap_or_else(|| "none".to_string()),
+                        Token::Iso | Token::Focal | Token::Aperture | Token::Shutter => {
+                            info.exposure.field(*token).unwrap_or_else(unknown)
+                        }
                     };
                     // A value must not add path components, and must not
                     // be the name of the current or the parent directory.
@@ -434,7 +592,7 @@ mod tests {
     }
 
     fn expand(template: &str, info: &NameInfo) -> PathBuf {
-        template.parse::<NameTemplate>().unwrap().expand(info, "0007")
+        template.parse::<NameTemplate>().unwrap().expand(info, "0007", "0003")
     }
 
     #[test]
@@ -442,10 +600,39 @@ mod tests {
         let template: NameTemplate = "{date}/{seq}_{stem}".parse().unwrap();
         assert!(template.uses_seq() && template.needs_exif());
         assert_eq!(
-            template.expand(&info(), "0042"),
+            template.expand(&info(), "0042", ""),
             PathBuf::from("2024-03-09/0042_DSC0001")
         );
         assert!(!"{stem}".parse::<NameTemplate>().unwrap().uses_seq());
+        let labelled = NameInfo { labels: vec!["red".to_string(), "blue".to_string()], ..info() };
+        assert_eq!(expand("{label}/{stem}", &labelled), PathBuf::from("red/DSC0001"));
+        assert_eq!(expand("{label}/{stem}", &info()), PathBuf::from("none/DSC0001"));
+        let exposed = NameInfo {
+            exposure: Exposure {
+                iso: Some(800),
+                focal_mm: Some(70.0),
+                aperture: Some(2.8),
+                shutter: Some((1, 250)),
+                bias: None,
+            },
+            ..info()
+        };
+        assert_eq!(
+            expand("{shutter}_{aperture}_{iso}_{focal}", &exposed),
+            PathBuf::from("1-250s_f2.8_800_70mm")
+        );
+        assert_eq!(expand("{shutter}", &info()), PathBuf::from("unknown"));
+        assert_eq!(exposed.exposure.caption(), "1/250 s · f/2.8 · ISO 800 · 70 mm");
+        let long = Exposure { shutter: Some((25, 10)), focal_mm: Some(4.2), ..Default::default() };
+        assert_eq!(long.field(Token::Shutter).as_deref(), Some("2.5s"));
+        assert_eq!(long.caption(), "2.5 s · 4.2 mm");
+        let noct = Exposure { aperture: Some(0.95), ..Default::default() };
+        assert_eq!(noct.field(Token::Aperture).as_deref(), Some("f0.95"));
+        assert_eq!(trimmed(8.0, 2), "8");
+        assert_eq!(trimmed(2.8, 2), "2.8");
+        let burst: NameTemplate = "{burst}/{stem}".parse().unwrap();
+        assert!(burst.uses_burst() && burst.needs_exif());
+        assert_eq!(burst.expand(&info(), "", "0003"), PathBuf::from("0003/DSC0001"));
     }
 
     #[test]
@@ -563,6 +750,15 @@ mod tests {
         assert_eq!(expand("{lens}_{serial}", &bare), PathBuf::from("unknown_unknown"));
         let sigma = NameInfo { lens: Some("50mm F1.4 DG | A <x>*?\"".to_string()), ..Default::default() };
         assert_eq!(expand("{lens}", &sigma), PathBuf::from("50mm F1.4 DG _ A _x____"));
+    }
+
+    #[test]
+    fn subsec_digits_become_milliseconds() {
+        assert_eq!(subsec_ms(b"5"), Some(500));
+        assert_eq!(subsec_ms(b"12"), Some(120));
+        assert_eq!(subsec_ms(b"1234"), Some(123));
+        assert_eq!(subsec_ms(b"  "), None);
+        assert_eq!(subsec_ms(b"x1"), None);
     }
 
     #[test]
