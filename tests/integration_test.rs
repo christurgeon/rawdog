@@ -1424,3 +1424,72 @@ fn cli_gpx_geotags_a_file_from_the_track() {
     assert!((degrees(exif::Tag::GPSLatitude) - 10.5).abs() < 1e-4);
     assert!((degrees(exif::Tag::GPSLongitude) - 20.5).abs() < 1e-4);
 }
+
+#[test]
+fn cli_gallery_per_folder_writes_one_page_per_day() {
+    let tmp = TempDir::new().unwrap();
+    let a = tmp.path().join("a.jpg");
+    let b = tmp.path().join("b.jpg");
+    jpeg_with_exif(&a, "2026:11:14 10:00:00", None, "Cam", None);
+    jpeg_with_exif(&b, "2026:11:15 10:00:00", None, "Cam", None);
+    let out = tmp.path().join("out");
+    let args = vec![
+        a.clone().into_os_string(),
+        b.clone().into_os_string(),
+        "--name".into(),
+        "{date}/{stem}".into(),
+        "--gallery".into(),
+        "--gallery-per-folder".into(),
+        "-o".into(),
+        out.clone().into_os_string(),
+    ];
+    let output = run_os(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let count = |page: &std::path::Path| fs::read_to_string(page).unwrap().matches("<figure>").count();
+    assert_eq!(count(&out.join("gallery.html")), 2);
+    assert_eq!(count(&out.join("2026-11-14/gallery.html")), 1);
+    assert_eq!(count(&out.join("2026-11-15/gallery.html")), 1);
+}
+
+#[test]
+fn cli_bursts_are_per_camera_body() {
+    let tmp = TempDir::new().unwrap();
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    // Two bodies fire in the same second; each frame is its own photo.
+    for (name, model) in [("a1", "Body A"), ("b1", "Body B"), ("a2", "Body A"), ("b2", "Body B")] {
+        let path = tmp.path().join(format!("{name}.jpg"));
+        jpeg_with_exif(&path, "2026:11:14 10:00:01", None, model, None);
+        args.push(path.into_os_string());
+    }
+    let out = tmp.path().join("out");
+    args.extend(os(&["--name", "{burst}/{stem}", "-o"]));
+    args.push(out.clone().into_os_string());
+    let output = run_os(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(names_under(&out), ["0001/a1.jpg", "0001/a2.jpg", "0002/b1.jpg", "0002/b2.jpg"]);
+}
+
+#[test]
+fn cli_with_jpeg_and_manifest_cover_the_camera_jpeg() {
+    let tmp = TempDir::new().unwrap();
+    let card = tmp.path().join("card");
+    fs::create_dir_all(&card).unwrap();
+    // Any file works for -f original; a PNG stands in for the RAW file.
+    image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3])).save(card.join("DSC1.png")).unwrap();
+    fs::write(card.join("DSC1.JPG"), b"camera jpeg").unwrap();
+    let out = tmp.path().join("archive");
+    let args = vec![
+        card.join("DSC1.png").into_os_string(),
+        "-f".into(),
+        "original".into(),
+        "--with-jpeg".into(),
+        "--manifest".into(),
+        "-o".into(),
+        out.clone().into_os_string(),
+    ];
+    let output = run_os(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fs::read(out.join("DSC1.JPG")).unwrap(), b"camera jpeg");
+    let manifest = fs::read_to_string(out.join("SHA256SUMS")).unwrap();
+    assert!(manifest.contains("  DSC1.JPG\n") && manifest.contains("  DSC1.png\n"), "{manifest}");
+}
