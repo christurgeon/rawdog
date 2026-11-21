@@ -290,6 +290,13 @@ struct Cli {
     #[arg(help_heading = "Runs and scripts", short = 'n', long)]
     dry_run: bool,
 
+    /// Print the metadata that rawdog reads from each file (capture time,
+    /// camera, serial, lens, exposure, rating, labels), one tab-separated
+    /// line per file, and convert nothing. Shows why a filter or a name
+    /// template does what it does
+    #[arg(help_heading = "Runs and scripts", long, conflicts_with = "watch")]
+    info: bool,
+
     /// Number of files to convert at the same time. Each file uses all
     /// CPU cores and holds a full-size image in memory. The default is
     /// chosen from the installed RAM and the size of the largest input
@@ -1120,6 +1127,17 @@ fn main() -> Result<()> {
             bail!("No RAW files found: one or more input paths do not exist.");
         }
         bail!("No RAW files found in the provided inputs.");
+    }
+
+    if cli.info {
+        let infos: Vec<naming::NameInfo> = files
+            .par_iter()
+            .map(|f| naming::NameInfo::read(&f.path, true).shifted(cli.time_shift.as_ref()))
+            .collect();
+        for (file, info) in files.iter().zip(&infos) {
+            println!("{}", info_line(&file.path, info));
+        }
+        return Ok(());
     }
 
     // Before selection and naming, which read the metadata of every file
@@ -1957,6 +1975,28 @@ fn input_list(text: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// One `--info` line: path, capture time, model, serial, lens, exposure,
+/// rating, and labels, separated by tabs; "-" for a missing value.
+fn info_line(path: &Path, info: &naming::NameInfo) -> String {
+    let or_dash = |v: Option<String>| v.filter(|v| !v.is_empty()).unwrap_or_else(|| "-".to_string());
+    let taken = info.taken.map(|(y, mo, d, h, mi, s)| {
+        let fraction = info.subsec_ms.map(|ms| format!(".{ms:03}")).unwrap_or_default();
+        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}{fraction}")
+    });
+    let rating = info.rating.map(|r| if r < 0 { "rejected".to_string() } else { format!("{r} stars") });
+    [
+        path.display().to_string(),
+        or_dash(taken),
+        or_dash(info.model.clone()),
+        or_dash(info.serial.clone()),
+        or_dash(info.lens.clone()),
+        or_dash(Some(info.exposure.caption())),
+        or_dash(rating),
+        or_dash(Some(info.labels.join(","))),
+    ]
+    .join("\t")
+}
+
 /// The `{seq}` value of each file: its position in capture order, from 1,
 /// with at least four digits. Files with the same capture time are ordered
 /// by path, and files without one come last.
@@ -2370,6 +2410,22 @@ mod tests {
             .map(String::from)
             .to_vec();
         assert_eq!(defaults_summary(&args), "--strip-gps, --sharpen 0.5, --copyright (c) J. Doe");
+    }
+
+    #[test]
+    fn info_line_has_a_dash_for_missing_values() {
+        let info = naming::NameInfo {
+            taken: Some((2026, 11, 14, 10, 0, 5)),
+            subsec_ms: Some(120),
+            model: Some("ILCE-7M4".to_string()),
+            rating: Some(-1),
+            labels: vec!["red".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            info_line(Path::new("a.ARW"), &info),
+            "a.ARW\t2026-11-14 10:00:05.120\tILCE-7M4\t-\t-\t-\trejected\tred"
+        );
     }
 
     #[test]

@@ -150,6 +150,12 @@ rawdog -R /Volumes/CARD --picks picks.txt -o ./finals
 
 Names are compared with the RAW file names, without letter case. The gallery's list always gives the RAW file names, also for proofs named with `--name`; a client who types names from proof files named without `{stem}` gives names that do not match. rawdog warns about each listed name that matches no RAW file, so a typing error is not missed.
 
+To see the metadata that filters and name templates use, `--info` prints one tab-separated line per file and converts nothing:
+
+```sh
+rawdog -R /Volumes/CARD --info
+```
+
 Dates are the camera clock's local date. A file without the metadata that a filter needs is excluded; `--dry-run` lists each excluded file with the reason.
 
 ### Naming output files

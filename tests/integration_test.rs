@@ -1493,3 +1493,20 @@ fn cli_with_jpeg_and_manifest_cover_the_camera_jpeg() {
     let manifest = fs::read_to_string(out.join("SHA256SUMS")).unwrap();
     assert!(manifest.contains("  DSC1.JPG\n") && manifest.contains("  DSC1.png\n"), "{manifest}");
 }
+
+#[test]
+fn cli_info_prints_metadata_and_converts_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("a.jpg");
+    jpeg_with_exif(&input, "2026:11:14 10:00:05", None, "Cam X", Some(1));
+    fs::write(tmp.path().join("a.xmp"), r#"<x xmp:Rating="3" xmp:Label="Green"/>"#).unwrap();
+    let out = tmp.path().join("out");
+    let args = vec![input.clone().into_os_string(), "--info".into(), "-o".into(), out.clone().into_os_string()];
+    let output = run_os(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let fields: Vec<&str> = stdout.trim_end().split('\t').collect();
+    assert_eq!(&fields[1..4], ["2026-11-14 10:00:05", "Cam X", "-"], "{stdout}");
+    assert_eq!(&fields[6..], ["3 stars", "green"], "{stdout}");
+    assert!(!out.exists());
+}
