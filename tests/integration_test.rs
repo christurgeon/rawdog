@@ -1542,3 +1542,35 @@ fn cli_burst_pick_sharpest_keeps_the_sharp_frame() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(names_under(&out), ["sharp.jpg"]);
 }
+
+#[test]
+fn cli_watch_converts_a_file_that_arrives_later() {
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+    // The watched input does not exist yet; rounds stay idle until it does.
+    // (Directory scans take RAW extensions only, and the tests have no RAW
+    // file, so an explicit image path is watched.)
+    let arrived = tmp.path().join("late.png");
+    let mut child = Command::new(rawdog_bin())
+        .arg(&arrived)
+        .args(["--watch", "1", "--no-defaults", "-o"])
+        .arg(&out)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    // A finished file: an old modification time passes the settle delay.
+    grey_png(&tmp.path().join("staging/late.png"));
+    fs::rename(tmp.path().join("staging/late.png"), &arrived).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    fs::File::options().write(true).open(&arrived).unwrap().set_modified(old).unwrap();
+    let expected = out.join("late.jpg");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !expected.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(expected.exists(), "the watch did not convert the new file");
+}
