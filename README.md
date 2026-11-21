@@ -300,7 +300,7 @@ Options you use every time can go in `~/.config/rawdog/defaults`, one per line. 
 --watermark ~/logo.png
 ```
 
-`--sharpen` needs its amount in the file. Each run names the options it took from the file (except with `--quiet`), so a forgotten watermark is noticed. An option on the command line overrides the same option in the file. `--no-defaults` ignores the file for one run, and `RAWDOG_DEFAULTS` names a different file.
+`--sharpen` needs its amount in the file. Each run names the options it took from the file (except with `--quiet`), so a forgotten watermark is noticed. An option on the command line overrides the same option in the file. `--no-defaults` ignores the file for one run, and `RAWDOG_DEFAULTS` names a different file. On Windows the file is `%APPDATA%\rawdog\defaults`.
 
 ## Existing Files
 
