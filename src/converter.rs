@@ -449,6 +449,37 @@ fn load_preview(input: &Path) -> Result<Option<RgbImage>> {
     }
 }
 
+/// The pixel size of a RAW file's image, from the start of the file and
+/// without decoding the image data. `None` when the start is not enough.
+pub fn raw_dimensions(input: &Path) -> Option<(u32, u32)> {
+    // Most cameras record the image size in EXIF, which is read from the
+    // start of the file.
+    if let Ok(Some((fields, _))) = exif_utils::read_source_fields(input) {
+        let get = |tag| {
+            fields
+                .iter()
+                .find(|f| f.tag == tag && f.ifd_num == exif::In::PRIMARY)
+                .and_then(|f| f.value.get_uint(0))
+        };
+        if let (Some(w), Some(h)) = (get(exif::Tag::PixelXDimension), get(exif::Tag::PixelYDimension)) {
+            if w > 160 && h > 120 {
+                return Some((w, h));
+            }
+        }
+    }
+    let source = exif_utils::head_source(input)?;
+    std::panic::catch_unwind(move || {
+        let decoder = rawler::get_decoder(&source).ok()?;
+        let image = decoder
+            .raw_image(&source, &rawler::decoders::RawDecodeParams::default(), true)
+            .ok()?;
+        Some((image.width as u32, image.height as u32))
+    })
+    .ok()
+    .flatten()
+    .filter(|(w, h)| *w > 0 && *h > 0)
+}
+
 /// How sharp a frame is, for `--burst-pick sharpest`: the variance of the
 /// Laplacian of the embedded preview, scaled to 800 pixels, on the middle
 /// half where the subject usually is. Higher is sharper. `None` without a

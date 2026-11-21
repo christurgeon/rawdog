@@ -37,7 +37,10 @@ pub fn thumbnail(dir: &Path, image: &Path) -> Option<PathBuf> {
     if width.max(height) <= THUMB_EDGE * 3 / 2 {
         return None;
     }
-    let mut thumb = dir.join(THUMB_DIR).join(image.strip_prefix(dir).ok()?).into_os_string();
+    // Next to the image, so that the page of a folder and the page above
+    // it share one thumbnail.
+    image.strip_prefix(dir).ok()?;
+    let mut thumb = image.parent()?.join(THUMB_DIR).join(image.file_name()?).into_os_string();
     let is_jpeg = image
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg"));
@@ -258,7 +261,7 @@ mod tests {
         let large = dir.join("day/large.png");
         image::RgbImage::from_pixel(2000, 1000, image::Rgb([200, 10, 10])).save(&large).unwrap();
         let thumb = thumbnail(dir, &large).unwrap();
-        assert_eq!(thumb, dir.join("gallery-thumbs/day/large.png.jpg"));
+        assert_eq!(thumb, dir.join("day/gallery-thumbs/large.png.jpg"));
         assert_eq!(image::image_dimensions(&thumb).unwrap(), (800, 400));
 
         // A thumbnail older than its image is made again.
