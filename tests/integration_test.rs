@@ -1305,3 +1305,122 @@ fn cli_names_options_from_the_defaults_file() {
     assert!(stderr.contains("Defaults from") && stderr.contains("--strip-gps"), "{stderr}");
     assert!(!stderr.contains("--quality 80"), "an overridden default is named: {stderr}");
 }
+
+/// A 300x200 JPEG at `path` with EXIF: capture time ("2026:11:14 10:00:05"),
+/// optional time zone, camera model, and exposure compensation in EV.
+fn jpeg_with_exif(path: &std::path::Path, taken: &str, zone: Option<&str>, model: &str, bias: Option<i32>) {
+    use exif::{Field, In, Tag, Value};
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let img = image::RgbImage::from_pixel(300, 200, image::Rgb([120, 120, 120]));
+    let mut jpeg = Vec::new();
+    img.write_with_encoder(image::codecs::jpeg::JpegEncoder::new(&mut jpeg)).unwrap();
+    let ascii = |tag, text: &str| Field { tag, ifd_num: In::PRIMARY, value: Value::Ascii(vec![text.as_bytes().to_vec()]) };
+    let mut fields = vec![ascii(Tag::DateTimeOriginal, taken), ascii(Tag::Model, model)];
+    if let Some(zone) = zone {
+        fields.push(ascii(Tag::OffsetTimeOriginal, zone));
+    }
+    if let Some(ev) = bias {
+        fields.push(Field {
+            tag: Tag::ExposureBiasValue,
+            ifd_num: In::PRIMARY,
+            value: Value::SRational(vec![exif::SRational { num: ev, denom: 1 }]),
+        });
+    }
+    let mut writer = exif::experimental::Writer::new();
+    for f in &fields {
+        writer.push_field(f);
+    }
+    let mut blob = std::io::Cursor::new(Vec::new());
+    writer.write(&mut blob, false).unwrap();
+    let mut parsed = img_parts::jpeg::Jpeg::from_bytes(jpeg.into()).unwrap();
+    img_parts::ImageEXIF::set_exif(&mut parsed, Some(blob.into_inner().into()));
+    let mut out = Vec::new();
+    parsed.encoder().write_to(&mut out).unwrap();
+    fs::write(path, out).unwrap();
+}
+
+/// The file names below `dir`, sorted, as paths relative to it.
+fn names_under(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = files_under(dir)
+        .iter()
+        .map(|p| p.strip_prefix(dir).unwrap().to_string_lossy().replace('\\', "/"))
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn cli_time_shift_and_seq_name_files_in_corrected_capture_order() {
+    let tmp = TempDir::new().unwrap();
+    let a = tmp.path().join("card/a.jpg");
+    let b = tmp.path().join("card/b.jpg");
+    // Camera B's clock is 10 minutes slow: without the shift, b sorts first.
+    jpeg_with_exif(&a, "2026:11:14 10:00:00", None, "Cam A", None);
+    jpeg_with_exif(&b, "2026:11:14 09:55:00", None, "Cam B", None);
+    let out = tmp.path().join("out");
+    let args = vec![
+        a.clone().into_os_string(),
+        b.clone().into_os_string(),
+        "--name".into(),
+        "{date}/{seq}_{time}_{stem}".into(),
+        "--time-shift".into(),
+        "Cam B=+10m".into(),
+        "-o".into(),
+        out.clone().into_os_string(),
+    ];
+    let output = run_os(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(names_under(&out), ["2026-11-14/0001_100000_a.jpg", "2026-11-14/0002_100500_b.jpg"]);
+}
+
+#[test]
+fn cli_burst_pick_ev0_keeps_the_normal_exposure_of_a_bracket() {
+    let tmp = TempDir::new().unwrap();
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    for (name, ev) in [("minus", -2), ("zero", 0), ("plus", 2)] {
+        let path = tmp.path().join(format!("{name}.jpg"));
+        jpeg_with_exif(&path, "2026:11:14 10:00:01", None, "Cam", Some(ev));
+        args.push(path.into_os_string());
+    }
+    let out = tmp.path().join("out");
+    args.extend(os(&["--burst-pick", "ev0", "-o"]));
+    args.push(out.clone().into_os_string());
+    let output = run_os(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(names_under(&out), ["zero.jpg"]);
+}
+
+#[test]
+fn cli_gpx_geotags_a_file_from_the_track() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.jpg");
+    // 12:00:30 at +02:00 is 10:00:30 UTC, halfway between two points.
+    jpeg_with_exif(&input, "2026:11:14 12:00:30", Some("+02:00"), "Cam", None);
+    let track = tmp.path().join("track.gpx");
+    fs::write(
+        &track,
+        r#"<gpx><trk><trkseg>
+        <trkpt lat="10.0" lon="20.0"><time>2026-11-14T10:00:00Z</time></trkpt>
+        <trkpt lat="11.0" lon="21.0"><time>2026-11-14T10:01:00Z</time></trkpt>
+        </trkseg></trk></gpx>"#,
+    )
+    .unwrap();
+    let out = tmp.path().join("out");
+    let args = vec![
+        input.clone().into_os_string(),
+        "--gpx".into(),
+        track.into_os_string(),
+        "-o".into(),
+        out.clone().into_os_string(),
+    ];
+    let output = run_os(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let file = fs::File::open(out.join("in.jpg")).unwrap();
+    let exif = exif::Reader::new().read_from_container(&mut std::io::BufReader::new(file)).unwrap();
+    let degrees = |tag| match &exif.get_field(tag, exif::In::PRIMARY).unwrap().value {
+        exif::Value::Rational(v) => v[0].to_f64() + v[1].to_f64() / 60.0 + v[2].to_f64() / 3600.0,
+        other => panic!("{other:?}"),
+    };
+    assert!((degrees(exif::Tag::GPSLatitude) - 10.5).abs() < 1e-4);
+    assert!((degrees(exif::Tag::GPSLongitude) - 20.5).abs() < 1e-4);
+}
