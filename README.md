@@ -382,6 +382,12 @@ osascript -e "display notification \"$(echo "$RESULT" | grep -E 'succeeded|No RA
 
 If the action doesn't appear, check **System Settings → Privacy & Security → Extensions → Finder**.
 
+## Agents
+
+`skills/rawdog/SKILL.md` is a skill that tells a coding agent how to use the
+CLI. For Claude Code, copy the `skills/rawdog` folder to `~/.claude/skills/`.
+`AGENTS.md` has notes for agents that change the code.
+
 ## Supported cameras
 
 Two decoder libraries are used. [rawler](https://github.com/dnglab/dnglab) is tried first: it knows cameras up to now (for example the Sony a7 IV, a7R V, and a1), Canon CR3, and the exact sensor crop of most bodies. [rawloader](https://github.com/pedrocr/rawloader) decodes a few files that rawler does not. For CR3 files the main metadata fields are copied (camera, lens, exposure, date, GPS).
