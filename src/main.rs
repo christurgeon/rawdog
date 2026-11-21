@@ -247,7 +247,7 @@ struct Cli {
     /// Tone curve for RAW files. `camera` gives brightness and contrast
     /// close to the camera's own JPEG; `flat` is darker and flatter, with
     /// more room for editing afterwards
-    #[arg(long, value_enum, default_value_t = converter::Look::Camera)]
+    #[arg(help_heading = "Developing", long, value_enum, default_value_t = converter::Look::Camera)]
     look: converter::Look,
 
     /// Use the JPEG preview that the camera embedded in each RAW file,
