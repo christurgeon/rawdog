@@ -43,6 +43,8 @@ pub struct ConvertOptions {
     /// Use the JPEG preview that the camera embedded in the RAW file
     /// instead of developing the RAW data.
     pub preview: bool,
+    /// Tone curve for RAW development.
+    pub look: Look,
     /// With `-f original`, also copy the camera's JPEG or HEIF of each RAW
     /// file.
     pub with_jpeg: bool,
@@ -51,6 +53,16 @@ pub struct ConvertOptions {
     /// The `resize` values that get the watermark; empty for all.
     pub watermark_sizes: Vec<u32>,
     pub metadata: exif_utils::MetadataOptions,
+}
+
+/// Tone curve for RAW development.
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
+pub enum Look {
+    /// Brightness and contrast close to the camera's own JPEG.
+    Camera,
+    /// imagepipe's base curve alone: darker and flatter, with more room for
+    /// editing afterwards.
+    Flat,
 }
 
 /// The as-shot white balance of one RAW file, applied to other files of the
@@ -119,6 +131,12 @@ fn prepare_source(input: &Path, opts: &ConvertOptions) -> Result<Option<Source>>
             // higher value gives a greener image. `--tint` is defined the
             // other way: above 1 is more magenta.
             pipeline.ops.tolab.set_temp(kelvin, 1.0 / tint);
+        }
+        // Raster input (JPEG, PNG, TIFF) is already rendered.
+        let raw_input = matches!(pipeline.globals.image, ImageSource::Raw(_));
+        if raw_input && opts.look == Look::Camera {
+            let curve = &mut pipeline.ops.basecurve;
+            curve.points = camera_look_curve(&curve.get_spline());
         }
         if let Some(reference) = &opts.wb_from {
             // Multipliers are specific to a sensor.
@@ -741,6 +759,38 @@ fn decode_with_rawler(input: &Path) -> Result<rawloader::RawImage, String> {
             RawImageData::Float(data) => rawloader::RawImageData::Float(data),
         },
     })
+}
+
+/// How the camera's own JPEG maps the lightness of imagepipe's output, as
+/// pairs of normalised CIE L* (imagepipe output, camera JPEG).
+///
+/// Measured on 38 cameras from 11 makers: the median over cameras of the
+/// median camera-JPEG lightness for each output lightness, in areas without
+/// texture. Values above 0.85 are extended smoothly to (1, 1).
+const CAMERA_LOOK: [(f32, f32); 10] = [
+    (0.05, 0.036),
+    (0.10, 0.08),
+    (0.20, 0.20),
+    (0.30, 0.33),
+    (0.40, 0.46),
+    (0.50, 0.59),
+    (0.60, 0.715),
+    (0.70, 0.815),
+    (0.80, 0.90),
+    (0.90, 0.955),
+];
+
+/// Tone curve points for the camera look: the pipeline's own base curve,
+/// followed by `CAMERA_LOOK`.
+fn camera_look_curve(base: &SplineFunc) -> Vec<(f32, f32)> {
+    const STEPS: usize = 32;
+    let look = SplineFunc::new(&CAMERA_LOOK);
+    (1..STEPS)
+        .map(|i| {
+            let x = i as f32 / STEPS as f32;
+            (x, look.interpolate(base.interpolate(x)).clamp(0.0, 1.0))
+        })
+        .collect()
 }
 
 /// Multiply the light in RAW samples by `gain`: the part above the black
@@ -2177,6 +2227,7 @@ mod tests {
             wb_from: None,
             sharpen: None,
             preview: true,
+            look: Look::Flat,
             watermark: None,
             watermark_sizes: Vec::new(),
             with_jpeg: false,
@@ -2253,6 +2304,22 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn camera_look_curve_brightens_midtones_and_keeps_the_ends() {
+        let base = SplineFunc::new(&[(0.5, 0.6)]);
+        let points = camera_look_curve(&base);
+        for pair in points.windows(2) {
+            assert!(pair[1].1 > pair[0].1, "not increasing at {}", pair[1].0);
+        }
+        let curve = SplineFunc::new(&points);
+        assert!(curve.interpolate(0.0).abs() < 1e-6);
+        assert!((curve.interpolate(1.0) - 1.0).abs() < 1e-6);
+        // Midtones: brighter than the base curve, as in camera JPEGs.
+        assert!(curve.interpolate(0.5) > base.interpolate(0.5) + 0.05);
+        // Deep shadows: not lifted.
+        assert!(curve.interpolate(0.04) <= base.interpolate(0.04) + 0.01);
+    }
+
+    #[test]
     fn exposure_curve_zero_ev_equals_base_curve() {
         let base = SplineFunc::new(&[(0.5, 0.6)]);
         for (x, y) in exposure_curve(0.0, &base) {
@@ -2309,6 +2376,7 @@ mod tests {
                 wb_from: None,
                 sharpen: None,
                 preview: false,
+                look: Look::Flat,
                 watermark: None,
                 watermark_sizes: Vec::new(),
                 with_jpeg: false,
@@ -2339,6 +2407,7 @@ mod tests {
                 wb_from: None,
                 sharpen: None,
                 preview: false,
+                look: Look::Flat,
                 watermark: None,
                 watermark_sizes: Vec::new(),
                 with_jpeg: false,

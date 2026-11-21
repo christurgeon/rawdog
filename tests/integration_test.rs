@@ -684,6 +684,25 @@ fn cli_preview_conflicts_with_development_options() {
 }
 
 #[test]
+fn cli_look_values_are_validated() {
+    let output = run(&["--look".as_ref(), "vivid".as_ref(), "/tmp/fake.arw".as_ref()]);
+    assert_eq!(output.status.code(), Some(2));
+    let output = run(&["--help".as_ref()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--look"), "got: {stdout}");
+}
+
+#[test]
+fn cli_look_does_not_change_raster_input() {
+    // A PNG is already rendered; the look applies to RAW files only.
+    let camera = convert_grey_with(&["--look", "camera"]);
+    let flat = convert_grey_with(&["--look", "flat"]);
+    for c in 0..3 {
+        assert!((camera[c] - flat[c]).abs() < 0.5, "{camera:?} vs {flat:?}");
+    }
+}
+
+#[test]
 fn cli_output_carries_an_srgb_icc_profile_in_every_format() {
     let tmp = TempDir::new().unwrap();
     let input = tmp.path().join("in.png");

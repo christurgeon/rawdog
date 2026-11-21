@@ -77,6 +77,8 @@ Every output carries an sRGB colour profile, so colours are the same in every vi
 
 ### Developing
 
+RAW files are developed with a tone curve that gives brightness and contrast close to the camera's own JPEG. Use `--look flat` for the darker, flatter result of earlier versions, which leaves more room for editing afterwards.
+
 Brighten a dark batch by two thirds of a stop and set the white balance to 3400 K:
 
 ```sh
