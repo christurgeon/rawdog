@@ -425,6 +425,20 @@ fn free_space(_dir: &Path) -> Option<u64> {
     None
 }
 
+/// A rough output size from the RAW file size, for the free-space warning:
+/// a full-size 16-bit TIFF or PNG is about 3 times the RAW file, a JPEG
+/// about 0.6 times; a resized output scales with its area, assuming a
+/// 6000-pixel long edge. A copy is the RAW size.
+fn estimated_output_size(raw: u64, format: OutputFormat, size: Option<u32>) -> u64 {
+    let factor = match format {
+        OutputFormat::Original => return raw,
+        OutputFormat::Tiff | OutputFormat::Png => 3.0,
+        OutputFormat::Jpeg => 0.6,
+    };
+    let area = size.map_or(1.0, |s| (f64::from(s) / 6000.0).powi(2).min(1.0));
+    (raw as f64 * factor * area) as u64
+}
+
 /// Set for the runs that `--watch` starts.
 const WATCH_ROUND: &str = "RAWDOG_WATCH_ROUND";
 
@@ -1250,15 +1264,22 @@ fn main() -> Result<()> {
     // A card import that fills the disk fails partway; say so before it
     // starts. Only a warning: the free space that statvfs reports can leave
     // out space that macOS frees on demand.
-    if let (OutputFormat::Original, Some(dir), false) = (cli.format, cli.output.as_deref(), cli.dry_run) {
+    if let (Some(dir), false) = (cli.output.as_deref(), cli.dry_run) {
         let needed: u64 = jobs
             .iter()
             .filter(|(_, output)| cli.overwrite || !output.exists())
-            .filter_map(|(input, _)| std::fs::metadata(input).ok().map(|m| m.len()))
+            .filter_map(|(input, output)| {
+                let raw = std::fs::metadata(input).ok()?.len();
+                Some(estimated_output_size(raw, cli.format, job_sizes.get(output).copied().flatten()))
+            })
             .sum();
         if let Some(free) = free_space(dir).filter(|free| needed > *free) {
+            let (what, kind) = match cli.format {
+                OutputFormat::Original => ("the copies need", "import"),
+                _ => ("the outputs need about", "run"),
+            };
             eprintln!(
-                "Warning: the copies need {}, but {} has only {} free; the import will stop when the disk is full.",
+                "Warning: {what} {}, but {} has only {} free; the {kind} will stop when the disk is full.",
                 converter::format_size(needed),
                 dir.display(),
                 converter::format_size(free)
@@ -2277,6 +2298,14 @@ mod tests {
             .map(String::from)
             .to_vec();
         assert_eq!(defaults_summary(&args), "--strip-gps, --sharpen 0.5, --copyright (c) J. Doe");
+    }
+
+    #[test]
+    fn output_size_estimates() {
+        assert_eq!(estimated_output_size(25_000_000, OutputFormat::Original, None), 25_000_000);
+        assert_eq!(estimated_output_size(25_000_000, OutputFormat::Tiff, None), 75_000_000);
+        assert_eq!(estimated_output_size(25_000_000, OutputFormat::Jpeg, Some(3000)), 3_750_000);
+        assert_eq!(estimated_output_size(25_000_000, OutputFormat::Png, Some(9000)), 75_000_000);
     }
 
     #[test]
