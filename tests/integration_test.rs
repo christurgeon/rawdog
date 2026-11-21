@@ -1510,3 +1510,35 @@ fn cli_info_prints_metadata_and_converts_nothing() {
     assert_eq!(&fields[6..], ["3 stars", "green"], "{stdout}");
     assert!(!out.exists());
 }
+
+#[test]
+fn cli_burst_pick_sharpest_keeps_the_sharp_frame() {
+    let tmp = TempDir::new().unwrap();
+    // One scene, sharp and blurred, as a burst in one second.
+    let scene = image::RgbImage::from_fn(300, 200, |x, y| {
+        let v = if (x / 4 + y / 4) % 2 == 0 { 40 } else { 220 };
+        image::Rgb([v, v, v])
+    });
+    let blurred = image::imageops::blur(&scene, 3.0);
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    for (name, img) in [("blurred1", &blurred), ("sharp", &scene), ("blurred2", &blurred)] {
+        let path = tmp.path().join(format!("{name}.jpg"));
+        jpeg_with_exif(&path, "2026:11:14 10:00:01", None, "Cam", None);
+        // Replace the grey pixels, keeping the EXIF segment.
+        let mut encoded = Vec::new();
+        img.write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 95)).unwrap();
+        let exif = img_parts::ImageEXIF::exif(&img_parts::jpeg::Jpeg::from_bytes(fs::read(&path).unwrap().into()).unwrap());
+        let mut jpeg = img_parts::jpeg::Jpeg::from_bytes(encoded.into()).unwrap();
+        img_parts::ImageEXIF::set_exif(&mut jpeg, exif);
+        let mut out = Vec::new();
+        jpeg.encoder().write_to(&mut out).unwrap();
+        fs::write(&path, out).unwrap();
+        args.push(path.into_os_string());
+    }
+    let out = tmp.path().join("out");
+    args.extend(os(&["--burst-pick", "sharpest", "-o"]));
+    args.push(out.clone().into_os_string());
+    let output = run_os(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(names_under(&out), ["sharp.jpg"]);
+}

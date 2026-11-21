@@ -482,10 +482,15 @@ pub fn raw_dimensions(input: &Path) -> Option<(u32, u32)> {
 
 /// How sharp a frame is, for `--burst-pick sharpest`: the variance of the
 /// Laplacian of the embedded preview, scaled to 800 pixels, on the middle
-/// half where the subject usually is. Higher is sharper. `None` without a
-/// readable preview.
+/// half where the subject usually is. Higher is sharper. `None` when the
+/// file cannot be read.
 pub fn sharpness(input: &Path) -> Option<f64> {
-    let preview = load_preview(input).ok().flatten()?;
+    // A file without a readable preview, such as a JPEG or PNG input, is
+    // measured on its own pixels.
+    let preview = load_preview(input)
+        .ok()
+        .flatten()
+        .or_else(|| image::open(input).ok().map(|img| img.into_rgb8()))?;
     // DynamicImage::thumbnail keeps the aspect ratio.
     let grey = image::DynamicImage::ImageRgb8(preview).thumbnail(800, 800).into_luma8();
     Some(laplacian_variance(&grey))
