@@ -2391,7 +2391,8 @@ mod tests {
     #[test]
     fn expand_home_replaces_only_a_leading_tilde() {
         let home = Some(std::ffi::OsStr::new("/Users/jd"));
-        assert_eq!(expand_home("~/logo.png", home), "/Users/jd/logo.png");
+        let expected = Path::new("/Users/jd").join("logo.png");
+        assert_eq!(expand_home("~/logo.png", home), expected.to_string_lossy());
         assert_eq!(expand_home("(c) ~ J. Doe", home), "(c) ~ J. Doe");
         assert_eq!(expand_home("~other/x", home), "~other/x");
         assert_eq!(expand_home("~/logo.png", None), "~/logo.png");
