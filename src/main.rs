@@ -299,8 +299,9 @@ struct Cli {
     /// Print the metadata that rawdog reads from each file (capture time,
     /// camera, serial, lens, exposure, rating, labels), one tab-separated
     /// line per file, and convert nothing. Shows why a filter or a name
-    /// template does what it does
-    #[arg(help_heading = "Runs and scripts", long, conflicts_with = "watch")]
+    /// template does what it does. With selection options, a last column
+    /// says whether each file is selected, or why not
+    #[arg(help_heading = "Runs and scripts", long, conflicts_with_all = ["watch", "report", "dry_run"])]
     info: bool,
 
     /// Number of files to convert at the same time. Each file uses all
@@ -1135,20 +1136,9 @@ fn main() -> Result<()> {
         bail!("No RAW files found in the provided inputs.");
     }
 
-    if cli.info {
-        let infos: Vec<naming::NameInfo> = files
-            .par_iter()
-            .map(|f| naming::NameInfo::read(&f.path, true).shifted(cli.time_shift.as_ref()))
-            .collect();
-        for (file, info) in files.iter().zip(&infos) {
-            println!("{}", info_line(&file.path, info));
-        }
-        return Ok(());
-    }
-
     // Before selection and naming, which read the metadata of every file
     // and take a while on a memory card.
-    if !cli.quiet && !cli.dry_run {
+    if !cli.quiet && !cli.dry_run && !cli.info {
         println!("Found {} RAW file(s)", files.len());
     }
     let stems: Vec<String> = files
@@ -1174,6 +1164,24 @@ fn main() -> Result<()> {
                 unmatched.join(", ")
             );
         }
+    }
+    if cli.info {
+        let infos: Vec<naming::NameInfo> = files
+            .par_iter()
+            .map(|f| naming::NameInfo::read(&f.path, true).shifted(cli.time_shift.as_ref()))
+            .collect();
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        for (file, info) in files.iter().zip(&infos) {
+            let status = selection
+                .is_active()
+                .then(|| selection.exclusion(info).unwrap_or_else(|| "selected".to_string()));
+            // Stop quietly when the reader goes away, as with `| head`.
+            if writeln!(out, "{}", info_line(&file.path, info, status)).is_err() {
+                break;
+            }
+        }
+        return Ok(());
     }
     let template = cli.name.clone().map(|mut t| {
         t.seq_start = cli.seq_start;
@@ -1700,7 +1708,8 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut records = std::mem::take(&mut *records.lock().unwrap_or_else(|e| e.into_inner()));
+    // A copy, not a move: a Ctrl-C from here on still writes the full report.
+    let mut records = records.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some(path) = &cli.report {
         write_report(path, &mut records)?;
     }
@@ -1983,16 +1992,21 @@ fn input_list(text: &str) -> Vec<PathBuf> {
 }
 
 /// One `--info` line: path, capture time, model, serial, lens, exposure,
-/// rating, and labels, separated by tabs; "-" for a missing value.
-fn info_line(path: &Path, info: &naming::NameInfo) -> String {
-    let or_dash = |v: Option<String>| v.filter(|v| !v.is_empty()).unwrap_or_else(|| "-".to_string());
+/// rating, labels, and the selection status if given, separated by tabs;
+/// "-" for a missing value. Tabs and line breaks in a value become spaces.
+fn info_line(path: &Path, info: &naming::NameInfo, status: Option<String>) -> String {
+    let or_dash = |v: Option<String>| {
+        v.filter(|v| !v.is_empty())
+            .map(|v| v.replace(['\t', '\n', '\r'], " "))
+            .unwrap_or_else(|| "-".to_string())
+    };
     let taken = info.taken.map(|(y, mo, d, h, mi, s)| {
         let fraction = info.subsec_ms.map(|ms| format!(".{ms:03}")).unwrap_or_default();
         format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}{fraction}")
     });
     let rating = info.rating.map(|r| if r < 0 { "rejected".to_string() } else { format!("{r} stars") });
-    [
-        path.display().to_string(),
+    let mut fields = vec![
+        or_dash(Some(path.display().to_string())),
         or_dash(taken),
         or_dash(info.model.clone()),
         or_dash(info.serial.clone()),
@@ -2000,8 +2014,9 @@ fn info_line(path: &Path, info: &naming::NameInfo) -> String {
         or_dash(Some(info.exposure.caption())),
         or_dash(rating),
         or_dash(Some(info.labels.join(","))),
-    ]
-    .join("\t")
+    ];
+    fields.extend(status.map(|s| or_dash(Some(s))));
+    fields.join("\t")
 }
 
 /// The `{seq}` value of each file: its position in capture order, from 1,
@@ -2430,8 +2445,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            info_line(Path::new("a.ARW"), &info),
+            info_line(Path::new("a.ARW"), &info, None),
             "a.ARW\t2026-11-14 10:00:05.120\tILCE-7M4\t-\t-\t-\trejected\tred"
+        );
+    }
+
+    #[test]
+    fn info_line_replaces_tabs_and_line_breaks_and_adds_the_status() {
+        let info = naming::NameInfo { lens: Some("FE\t24-70\nGM".to_string()), ..Default::default() };
+        assert_eq!(
+            info_line(Path::new("a\tb.ARW"), &info, Some("rating 2".to_string())),
+            "a b.ARW\t-\t-\t-\tFE 24-70 GM\t-\t-\t-\trating 2"
         );
     }
 

@@ -1531,6 +1531,23 @@ fn cli_info_prints_metadata_and_converts_nothing() {
 }
 
 #[test]
+fn cli_info_shows_the_selection_status() {
+    let tmp = TempDir::new().unwrap();
+    let keep = tmp.path().join("keep.jpg");
+    let drop = tmp.path().join("drop.jpg");
+    jpeg_with_exif(&keep, "2026:11:14 10:00:05", None, "Cam", None);
+    jpeg_with_exif(&drop, "2026:11:14 10:00:06", None, "Cam", None);
+    fs::write(tmp.path().join("keep.xmp"), r#"<x xmp:Rating="4"/>"#).unwrap();
+    fs::write(tmp.path().join("drop.xmp"), r#"<x xmp:Rating="1"/>"#).unwrap();
+    let args = vec![keep.into_os_string(), drop.into_os_string(), "--info".into(), "--min-rating".into(), "3".into()];
+    let output = run_os(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let last: Vec<&str> = stdout.lines().map(|l| l.rsplit('\t').next().unwrap()).collect();
+    assert_eq!(last, ["rating 1", "selected"], "{stdout}");
+}
+
+#[test]
 fn cli_burst_pick_sharpest_keeps_the_sharp_frame() {
     let tmp = TempDir::new().unwrap();
     // One scene, sharp and blurred, as a burst in one second.
