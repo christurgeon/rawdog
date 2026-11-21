@@ -2,11 +2,15 @@ name: Release
 
 # Builds rawdog for macOS, Linux, and Windows. On a pushed tag such as
 # v0.2.0, the builds are attached to a GitHub Release. Started by hand, it
-# only uploads them as workflow artifacts, to test the builds.
+# (or on a pull request that changes this file) it only uploads them as
+# workflow artifacts, to test the builds.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+  # Test the builds when this workflow changes.
+  pull_request:
+    paths: [".github/workflows/release.yml"]
 
 permissions:
   contents: write
