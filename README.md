@@ -396,4 +396,4 @@ Not supported: Nikon High Efficiency NEF (Z 8, Z f), and some phone DNG files (S
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
