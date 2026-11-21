@@ -524,6 +524,16 @@ fn warn_if_preview_is_small(preview: &RgbImage, resize: Option<u32>) {
     }
 }
 
+/// The first line of a decoder error, without the library's wrapping:
+/// `RawLoaderError: "Couldn't find …` loses its prefix and its unbalanced
+/// quote, and rawler's `Error: ` prefix goes too.
+fn decoder_detail(error: &str) -> String {
+    let line = error.lines().next().unwrap_or_default().trim();
+    let line = line.strip_prefix("RawLoaderError: ").unwrap_or(line);
+    let line = line.strip_prefix("Error: ").unwrap_or(line);
+    line.trim_matches('"').trim_end_matches('.').trim().to_string()
+}
+
 /// Decode `input` and build the processing pipeline for it.
 ///
 /// Decoders are tried in this order:
@@ -545,11 +555,10 @@ fn open_pipeline(input: &Path) -> Result<Pipeline> {
             Err(old_decoder) => {
                 return Pipeline::new_from_file(input).map_err(|_| {
                     // Both decoders give long messages; one line is enough.
-                    let detail = |e: &str| e.lines().next().unwrap_or_default().to_string();
                     anyhow!(
                         "the file is corrupt or its format is not supported ({}; {})",
-                        detail(&new_decoder),
-                        detail(&old_decoder.to_string())
+                        decoder_detail(&new_decoder),
+                        decoder_detail(&old_decoder.to_string())
                     )
                 })
             }
@@ -2029,6 +2038,22 @@ mod tests {
             Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         );
         assert_eq!(compare_copy(&a, &b, false).unwrap(), (true, None));
+    }
+
+    #[test]
+    fn decoder_detail_removes_library_wrapping() {
+        assert_eq!(
+            decoder_detail("RawLoaderError: \"Couldn't find a decoder for this file.\nmore"),
+            "Couldn't find a decoder for this file"
+        );
+        assert_eq!(
+            decoder_detail("Error: No decoder found, model '', make: '', mode: ''"),
+            "No decoder found, model '', make: '', mode: ''"
+        );
+        assert_eq!(
+            decoder_detail("RawLoaderError: \"Couldn't find camera \"NIKON\" \"Z f\" mode \"14bit\".\""),
+            "Couldn't find camera \"NIKON\" \"Z f\" mode \"14bit\""
+        );
     }
 
     #[test]
