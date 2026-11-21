@@ -425,18 +425,33 @@ fn free_space(_dir: &Path) -> Option<u64> {
     None
 }
 
-/// A rough output size from the RAW file size, for the free-space warning:
-/// a full-size 16-bit TIFF or PNG is about 3 times the RAW file, a JPEG
-/// about 0.6 times; a resized output scales with its area, assuming a
-/// 6000-pixel long edge. A copy is the RAW size.
-fn estimated_output_size(raw: u64, format: OutputFormat, size: Option<u32>) -> u64 {
-    let factor = match format {
+/// A rough output size for the free-space warning: 6 bytes per pixel for
+/// 16-bit TIFF and PNG, about 0.5 for JPEG. The pixel count is the largest
+/// of the recorded image size (some cameras record a smaller preview size,
+/// others none), the RAW file size (compressed RAW files are small), and
+/// 24 megapixels, so that the warning comes early rather than not at all.
+/// A resized output scales with its area; a copy is the RAW size.
+fn estimated_output_size(
+    raw: u64,
+    pixels: Option<(u32, u32)>,
+    format: OutputFormat,
+    size: Option<u32>,
+) -> u64 {
+    let per_pixel = match format {
         OutputFormat::Original => return raw,
-        OutputFormat::Tiff | OutputFormat::Png => 3.0,
-        OutputFormat::Jpeg => 0.6,
+        OutputFormat::Tiff | OutputFormat::Png => 6.0,
+        OutputFormat::Jpeg => 0.5,
     };
-    let area = size.map_or(1.0, |s| (f64::from(s) / 6000.0).powi(2).min(1.0));
-    (raw as f64 * factor * area) as u64
+    // An uncompressed RAW file has about 2 bytes per pixel.
+    let recorded = pixels.map_or(0.0, |(w, h)| f64::from(w) * f64::from(h));
+    let count = recorded.max(raw as f64 / 2.0).max(24e6);
+    // The recorded long edge when it decided the count, else a 3:2 frame.
+    let long_edge = match pixels {
+        Some((w, h)) if recorded >= count => f64::from(w.max(h)),
+        _ => (count * 1.5).sqrt(),
+    };
+    let area = size.map_or(1.0, |s| (f64::from(s) / long_edge).powi(2).min(1.0));
+    (count * per_pixel * area) as u64
 }
 
 /// Set for the runs that `--watch` starts.
@@ -539,6 +554,34 @@ fn parse_defaults(text: &str) -> Result<Vec<String>, String> {
         }
     }
     Ok(args)
+}
+
+/// The defaults (option, value) that the typed arguments do not replace.
+fn not_overridden(defaults: &[String], typed: &[std::ffi::OsString]) -> Vec<String> {
+    let command = Cli::command();
+    let typed_option = |long: &str| {
+        let short = command
+            .get_arguments()
+            .find(|a| a.get_long() == Some(long))
+            .and_then(|a| a.get_short())
+            .map(|c| format!("-{c}"));
+        typed.iter().filter_map(|a| a.to_str()).any(|a| {
+            a == format!("--{long}")
+                || a.starts_with(&format!("--{long}="))
+                || short.as_deref().is_some_and(|s| a == s || (a.starts_with(s) && !a.starts_with("--")))
+        })
+    };
+    let mut kept = Vec::new();
+    let mut keep = false;
+    for arg in defaults {
+        if let Some(long) = arg.strip_prefix("--") {
+            keep = !typed_option(long);
+        }
+        if keep {
+            kept.push(arg.clone());
+        }
+    }
+    kept
 }
 
 /// The defaults as they would be typed: `--strip-gps, --sharpen 0.5`.
@@ -888,8 +931,9 @@ fn main() -> Result<()> {
     // Options from the defaults file act without being typed; name them,
     // so that a forgotten --watermark or --strip-gps is noticed.
     if let (Some(path), false) = (&defaults_file, cli.quiet || cli.completions.is_some()) {
-        if !defaults_used.is_empty() {
-            eprintln!("Defaults from {}: {}", path.display(), defaults_summary(&defaults_used));
+        let in_effect = not_overridden(&defaults_used, &typed);
+        if !in_effect.is_empty() {
+            eprintln!("Defaults from {}: {}", path.display(), defaults_summary(&in_effect));
         }
     }
 
@@ -1268,9 +1312,16 @@ fn main() -> Result<()> {
         let needed: u64 = jobs
             .iter()
             .filter(|(_, output)| cli.overwrite || !output.exists())
+            .collect::<Vec<_>>()
+            .par_iter()
             .filter_map(|(input, output)| {
                 let raw = std::fs::metadata(input).ok()?.len();
-                Some(estimated_output_size(raw, cli.format, job_sizes.get(output).copied().flatten()))
+                let pixels = match cli.format {
+                    OutputFormat::Original => None,
+                    _ => converter::raw_dimensions(input),
+                };
+                let size = job_sizes.get(output).copied().flatten();
+                Some(estimated_output_size(raw, pixels, cli.format, size))
             })
             .sum();
         if let Some(free) = free_space(dir).filter(|free| needed > *free) {
@@ -2293,6 +2344,13 @@ mod tests {
     }
 
     #[test]
+    fn defaults_replaced_on_the_command_line_are_not_named() {
+        let defaults: Vec<String> = ["--quality", "80", "--strip-gps", "--resize", "2048"].map(String::from).to_vec();
+        let typed: Vec<std::ffi::OsString> = ["rawdog", "x.arw", "-q", "95", "--resize=1024"].map(Into::into).to_vec();
+        assert_eq!(not_overridden(&defaults, &typed), ["--strip-gps"]);
+    }
+
+    #[test]
     fn defaults_summary_joins_options_with_their_values() {
         let args: Vec<String> = ["--strip-gps", "--sharpen", "0.5", "--copyright", "(c) J. Doe"]
             .map(String::from)
@@ -2302,10 +2360,18 @@ mod tests {
 
     #[test]
     fn output_size_estimates() {
-        assert_eq!(estimated_output_size(25_000_000, OutputFormat::Original, None), 25_000_000);
-        assert_eq!(estimated_output_size(25_000_000, OutputFormat::Tiff, None), 75_000_000);
-        assert_eq!(estimated_output_size(25_000_000, OutputFormat::Jpeg, Some(3000)), 3_750_000);
-        assert_eq!(estimated_output_size(25_000_000, OutputFormat::Png, Some(9000)), 75_000_000);
+        let raw = 25_000_000;
+        assert_eq!(estimated_output_size(raw, None, OutputFormat::Original, None), raw);
+        // A 45 MP compressed file: the pixels decide, not the file size.
+        let px = Some((8192, 5464));
+        let full = 8192 * 5464 * 6;
+        assert_eq!(estimated_output_size(raw, px, OutputFormat::Tiff, None), full);
+        assert_eq!(estimated_output_size(raw, px, OutputFormat::Png, Some(20000)), full);
+        let half = estimated_output_size(raw, px, OutputFormat::Tiff, Some(4096));
+        assert!((full / 4 - 1000..=full / 4 + 1000).contains(&half), "{half}");
+        // Unknown size: at least 24 MP; a large uncompressed file counts more.
+        assert_eq!(estimated_output_size(6_000_000, None, OutputFormat::Tiff, None), 144_000_000);
+        assert_eq!(estimated_output_size(100_000_000, None, OutputFormat::Tiff, None), 300_000_000);
     }
 
     #[test]
