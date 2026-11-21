@@ -1437,7 +1437,8 @@ fn main() -> Result<()> {
         converter::manifest::enable();
     }
     let failures: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-    let records: Mutex<Vec<report::Record>> = Mutex::new(excluded_records);
+    let records: std::sync::Arc<Mutex<Vec<report::Record>>> =
+        std::sync::Arc::new(Mutex::new(excluded_records));
     let record = |input: &Path, output: &Path, status, message: String, seconds: f64| {
         if cli.report.is_some() || cli.gallery {
             records.lock().unwrap().push(report::Record {
@@ -1471,10 +1472,16 @@ fn main() -> Result<()> {
 
     // On Ctrl-C, remove the partial outputs before exiting. 130 is the
     // usual exit status after SIGINT.
-    let _ = ctrlc::set_handler(|| {
+    let interrupted_report = (cli.report.clone(), std::sync::Arc::clone(&records));
+    let _ = ctrlc::set_handler(move || {
         converter::remove_active_temp_files();
         // Keep the checksums of the copies that are complete.
         let _ = converter::manifest::write();
+        // And the report of the files done so far, which a long run would
+        // otherwise lose.
+        if let (Some(path), Ok(mut done)) = (&interrupted_report.0, interrupted_report.1.try_lock()) {
+            let _ = write_report(path, &mut done);
+        }
         std::process::exit(130);
     });
 
@@ -1661,7 +1668,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut records = records.into_inner().unwrap();
+    let mut records = std::mem::take(&mut *records.lock().unwrap_or_else(|e| e.into_inner()));
     if let Some(path) = &cli.report {
         write_report(path, &mut records)?;
     }
