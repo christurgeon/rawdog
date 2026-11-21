@@ -1164,3 +1164,144 @@ fn cli_several_sizes_go_into_one_folder_each() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("need -o"));
 }
+
+/// A 300x200 grey PNG at `path`.
+fn grey_png(path: &std::path::Path) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    image::RgbImage::from_pixel(300, 200, image::Rgb([120, 120, 120])).save(path).unwrap();
+}
+
+fn os(args: &[&str]) -> Vec<std::ffi::OsString> {
+    args.iter().map(Into::into).collect()
+}
+
+fn run_os(args: &[std::ffi::OsString]) -> std::process::Output {
+    run(&args.iter().map(|a| a.as_os_str()).collect::<Vec<_>>())
+}
+
+#[test]
+fn cli_aspect_crops_in_the_image_orientation() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    grey_png(&input);
+    let out = tmp.path().join("out");
+    let mut args = os(&["--aspect", "1:1", "-o"]);
+    args.insert(0, input.clone().into());
+    args.push(out.clone().into());
+    let output = run_os(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(image::image_dimensions(out.join("in.jpg")).unwrap(), (200, 200));
+}
+
+#[test]
+fn cli_keep_rating_and_keywords_write_xmp_from_the_sidecar() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    grey_png(&input);
+    fs::write(tmp.path().join("in.xmp"), r#"<x xmp:Rating="4" xmp:Label="Red"/>"#).unwrap();
+    let out = tmp.path().join("out");
+    let mut args = os(&["--keep-rating", "--keywords", "wedding, smith", "-o"]);
+    args.insert(0, input.clone().into());
+    args.push(out.clone().into());
+    let output = run_os(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let bytes = fs::read(out.join("in.jpg")).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains(r#"xmp:Rating="4""#) && text.contains(r#"xmp:Label="Red""#), "rating");
+    assert!(text.contains("<rdf:li>wedding</rdf:li><rdf:li>smith</rdf:li>"), "keywords");
+    assert!(image::load_from_memory(&bytes).is_ok());
+}
+
+#[test]
+fn cli_label_selects_files_by_sidecar_label() {
+    let tmp = TempDir::new().unwrap();
+    let (red, blue) = (tmp.path().join("red.png"), tmp.path().join("blue.png"));
+    grey_png(&red);
+    grey_png(&blue);
+    fs::write(tmp.path().join("red.xmp"), r#"<x xmp:Label="Red"/>"#).unwrap();
+    fs::write(tmp.path().join("blue.xmp"), r#"<x xmp:Label="Blue"/>"#).unwrap();
+    let out = tmp.path().join("out");
+    let args = vec![
+        red.clone().into_os_string(),
+        blue.clone().into_os_string(),
+        "--label".into(),
+        "red".into(),
+        "-o".into(),
+        out.clone().into_os_string(),
+    ];
+    let output = run_os(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(out.join("red.jpg").exists());
+    assert!(!out.join("blue.jpg").exists());
+}
+
+#[test]
+fn cli_full_size_and_watermark_sizes() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    grey_png(&input);
+    let mark = tmp.path().join("logo.png");
+    image::RgbaImage::from_pixel(10, 10, image::Rgba([255, 255, 255, 255])).save(&mark).unwrap();
+    let out = tmp.path().join("out");
+    let args = vec![
+        input.clone().into_os_string(),
+        "-r".into(),
+        "full,100".into(),
+        "--watermark".into(),
+        mark.clone().into_os_string(),
+        "--watermark-sizes".into(),
+        "100".into(),
+        "-o".into(),
+        out.clone().into_os_string(),
+    ];
+    let output = run_os(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(image::image_dimensions(out.join("full/in.jpg")).unwrap(), (300, 200));
+    assert_eq!(image::image_dimensions(out.join("100/in.jpg")).unwrap(), (100, 67));
+    // The full-size copy has no mark in its corner; the small one does.
+    let full = image::open(out.join("full/in.jpg")).unwrap().into_rgb8();
+    let small = image::open(out.join("100/in.jpg")).unwrap().into_rgb8();
+    assert!(full.get_pixel(300 - 25, 200 - 25)[0] < 200);
+    assert!(small.get_pixel(100 - 10, 67 - 10)[0] > 200);
+
+    // A watermark size that is not a --resize size is refused.
+    let mut wrong = args.clone();
+    wrong[6] = "50".into();
+    assert!(!run_os(&wrong).status.success());
+}
+
+#[test]
+fn cli_dpi_sets_the_resolution_tags() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    grey_png(&input);
+    let out = tmp.path().join("out");
+    let args = vec![input.clone().into_os_string(), "--dpi".into(), "300".into(), "-o".into(), out.clone().into_os_string()];
+    let output = run_os(&args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let file = fs::File::open(out.join("in.jpg")).unwrap();
+    let exif = exif::Reader::new().read_from_container(&mut std::io::BufReader::new(file)).unwrap();
+    let x = exif.get_field(exif::Tag::XResolution, exif::In::PRIMARY).unwrap();
+    assert_eq!(x.display_value().to_string(), "300");
+}
+
+#[test]
+fn cli_names_options_from_the_defaults_file() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("in.png");
+    grey_png(&input);
+    let defaults = tmp.path().join("defaults");
+    fs::write(&defaults, "--strip-gps\n--quality 80\n").unwrap();
+    let out = tmp.path().join("out");
+    let output = Command::new(rawdog_bin())
+        .env("RAWDOG_DEFAULTS", &defaults)
+        .arg(&input)
+        .args(["-q", "90", "-o"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Defaults from") && stderr.contains("--strip-gps"), "{stderr}");
+    assert!(!stderr.contains("--quality 80"), "an overridden default is named: {stderr}");
+}
