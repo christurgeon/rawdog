@@ -519,8 +519,15 @@ fn defaults_path() -> Option<PathBuf> {
     }
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        // Windows sets neither; its per-user settings live in %APPDATA%.
+        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))?;
     Some(config.join("rawdog").join("defaults"))
+}
+
+/// The home directory: `HOME`, or `USERPROFILE` on Windows.
+fn home_dir() -> Option<std::ffi::OsString> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
 }
 
 /// Arguments from a defaults file. Each line holds one option, and optionally
@@ -542,7 +549,7 @@ fn parse_defaults(text: &str) -> Result<Vec<String>, String> {
         match line.split_once(char::is_whitespace) {
             Some((option, value)) => {
                 args.push(option.to_string());
-                args.push(expand_home(value.trim(), std::env::var_os("HOME").as_deref()));
+                args.push(expand_home(value.trim(), home_dir().as_deref()));
             }
             None if value_is_optional(line) => {
                 return Err(format!(
@@ -2384,7 +2391,8 @@ mod tests {
     #[test]
     fn expand_home_replaces_only_a_leading_tilde() {
         let home = Some(std::ffi::OsStr::new("/Users/jd"));
-        assert_eq!(expand_home("~/logo.png", home), "/Users/jd/logo.png");
+        let expected = Path::new("/Users/jd").join("logo.png");
+        assert_eq!(expand_home("~/logo.png", home), expected.to_string_lossy());
         assert_eq!(expand_home("(c) ~ J. Doe", home), "(c) ~ J. Doe");
         assert_eq!(expand_home("~other/x", home), "~other/x");
         assert_eq!(expand_home("~/logo.png", None), "~/logo.png");
