@@ -266,7 +266,7 @@ For print, `--dpi 300` sets the print resolution that labs and layout software r
 
 ### Watching a folder
 
-For tethered or event shooting, `--watch` keeps running and converts new files as they arrive, checking every 5 seconds (or the number given). A file is converted once it has not changed for 3 seconds, so a file that is still being copied is left for the next check. With `--gallery`, the page is updated each time, and it reloads itself in the browser, so a screen at the event shows new images:
+For tethered or event shooting, `--watch` keeps running and converts new files as they arrive, checking every 5 seconds (or the number given). If an input folder has a number as its name, such as `2026`, write the interval as `--watch=10` or put the inputs first. A file is converted once it has not changed for 3 seconds, so a file that is still being copied is left for the next check. With `--gallery`, the page is updated each time, and it reloads itself in the browser, so a screen at the event shows new images:
 
 ```sh
 rawdog ./incoming -r 2048 --fast -o ./live --gallery --watch
