@@ -241,6 +241,7 @@ fn cli_help_flag_shows_usage() {
     assert!(stdout.contains("--format"));
     assert!(stdout.contains("--quality"));
     assert!(stdout.contains("--output"));
+    assert!(stdout.contains("--no-defaults"));
 }
 
 fn run(args: &[&std::ffi::OsStr]) -> std::process::Output {
@@ -703,7 +704,7 @@ fn cli_tint_above_one_is_more_magenta() {
 
 #[test]
 fn cli_preview_conflicts_with_development_options() {
-    for other in [&["--fast", "-r", "100"][..], &["--exposure", "1"], &["--wb", "5000"]] {
+    for other in [&["--fast", "-r", "100"][..], &["--exposure", "1"], &["--wb", "5000"], &["--look", "flat"]] {
         let mut args: Vec<&std::ffi::OsStr> = vec!["--preview".as_ref(), "/tmp/fake.arw".as_ref()];
         args.extend(other.iter().map(|a| a.as_ref() as &std::ffi::OsStr));
         assert_eq!(run(&args).status.code(), Some(2), "{other:?}");

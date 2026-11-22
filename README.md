@@ -158,7 +158,7 @@ To see the metadata that filters and name templates use, `--info` prints one tab
 rawdog -R /Volumes/CARD --info
 ```
 
-Dates are the camera clock's local date. A file without the metadata that a filter needs is excluded; `--dry-run` lists each excluded file with the reason.
+Dates are the camera clock's local date, after any `--time-shift`. A file without the metadata that a filter needs is excluded; `--dry-run` lists each excluded file with the reason.
 
 ### Naming output files
 
