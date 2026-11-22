@@ -95,12 +95,12 @@ struct Cli {
     label: Vec<String>,
 
     /// Convert only files taken on or after this date (YYYY-MM-DD, camera
-    /// clock)
+    /// clock, after any --time-shift)
     #[arg(help_heading = "Selecting files", long, value_name = "DATE", value_parser = parse_date)]
     since: Option<(u16, u8, u8)>,
 
     /// Convert only files taken on or before this date (YYYY-MM-DD, camera
-    /// clock)
+    /// clock, after any --time-shift)
     #[arg(help_heading = "Selecting files", long, value_name = "DATE", value_parser = parse_date)]
     until: Option<(u16, u8, u8)>,
 
@@ -254,7 +254,7 @@ struct Cli {
     /// without developing the RAW data. Very fast, with the camera's own
     /// colours; the size depends on the camera (1616x1080 for most Sony
     /// bodies)
-    #[arg(help_heading = "Output", long, conflicts_with_all = ["fast", "exposure", "wb"])]
+    #[arg(help_heading = "Output", long, conflicts_with_all = ["fast", "exposure", "wb", "look"])]
     preview: bool,
 
     /// With -f original, write a SHA256SUMS file into each destination
@@ -320,6 +320,13 @@ struct Cli {
     /// Print errors only
     #[arg(help_heading = "Runs and scripts", long)]
     quiet: bool,
+
+    /// Ignore the defaults file for this run
+    // main() removes it before parsing; the field is here for --help and
+    // shell completions.
+    #[arg(help_heading = "Runs and scripts", long)]
+    #[allow(dead_code)]
+    no_defaults: bool,
 
     /// Read more inputs from this file, one path per line; "-" reads
     /// standard input, as in `find ... | rawdog --files-from - -o out`.

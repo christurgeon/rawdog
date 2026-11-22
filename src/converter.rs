@@ -60,8 +60,7 @@ pub struct ConvertOptions {
 pub enum Look {
     /// Brightness and contrast close to the camera's own JPEG.
     Camera,
-    /// imagepipe's base curve alone: darker and flatter, with more room for
-    /// editing afterwards.
+    /// Darker and flatter, with more room for editing afterwards.
     Flat,
 }
 
