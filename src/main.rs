@@ -197,7 +197,7 @@ struct Cli {
 
     /// Sharpen the output after the resize, from 0 to 3. Without a value
     /// the amount is 0.5, which suits images resized for screens
-    #[arg(help_heading = "Output", long, value_name = "AMOUNT", num_args = 0..=1, default_missing_value = "0.5",
+    #[arg(help_heading = "Output", long, value_name = "AMOUNT", num_args = 0..=1, default_missing_value = SHARPEN_DEFAULT,
           value_parser = float_in_range::<0, 3>)]
     sharpen: Option<f32>,
 
@@ -312,7 +312,7 @@ struct Cli {
 
     /// Keep running and convert new files as they arrive, checking every
     /// SECONDS (default 5), for tethered or event shooting. Stop with Ctrl-C
-    #[arg(help_heading = "Runs and scripts", long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "5",
+    #[arg(help_heading = "Runs and scripts", long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = WATCH_DEFAULT,
           conflicts_with_all = ["dry_run", "files_from"],
           value_parser = clap::value_parser!(u64).range(1..=3600))]
     watch: Option<u64>,
@@ -630,6 +630,41 @@ fn expand_home(value: &str, home: Option<&std::ffi::OsStr>) -> String {
     }
 }
 
+const SHARPEN_DEFAULT: &str = "0.5";
+const WATCH_DEFAULT: &str = "5";
+/// The options whose value may be left out, with the value they then take.
+const OPTIONAL_VALUES: [(&str, &str); 2] = [("--sharpen", SHARPEN_DEFAULT), ("--watch", WATCH_DEFAULT)];
+
+/// clap takes the argument after `--sharpen` or `--watch` as its value even
+/// when it is an input path, as in `rawdog --sharpen photo.ARW`. Put the
+/// default value in after the option when the next argument is not a number.
+fn fill_optional_values(args: &mut Vec<std::ffi::OsString>) -> Result<()> {
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--" {
+            break;
+        }
+        let Some((option, default)) = OPTIONAL_VALUES.iter().find(|(o, _)| args[i] == *o) else {
+            i += 1;
+            continue;
+        };
+        match args.get(i + 1).and_then(|a| a.to_str()) {
+            Some(next) if next.parse::<f64>().is_ok() => {
+                // A folder named 2026 after --watch would be taken as the interval.
+                if Path::new(next).exists() {
+                    bail!(
+                        "{option} {next}: {next} is also a file or folder. Write {option}={next} \
+                         for the value, or put the inputs before {option}."
+                    );
+                }
+            }
+            _ => args.insert(i + 1, (*default).into()),
+        }
+        i += 2;
+    }
+    Ok(())
+}
+
 /// True if `option` takes a value that may be left out, like `--sharpen`.
 /// In a defaults file such an option would take the next argument, the
 /// first input path, as its value, so it must be given a value there.
@@ -915,6 +950,7 @@ fn main() -> Result<()> {
     let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let skip_defaults = args.iter().any(|a| a == "--no-defaults");
     args.retain(|a| a != "--no-defaults");
+    fill_optional_values(&mut args)?;
     let typed = args.clone();
     let mut defaults_file = None;
     let mut defaults_used: Vec<String> = Vec::new();
@@ -2483,6 +2519,51 @@ mod tests {
         assert_eq!(expand_home("(c) ~ J. Doe", home), "(c) ~ J. Doe");
         assert_eq!(expand_home("~other/x", home), "~other/x");
         assert_eq!(expand_home("~/logo.png", None), "~/logo.png");
+    }
+
+    fn filled(args: &[&str]) -> Vec<String> {
+        let mut args: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
+        fill_optional_values(&mut args).unwrap();
+        args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn fill_optional_values_adds_the_default_before_a_path() {
+        assert_eq!(filled(&["rawdog", "--sharpen", "a.ARW"]), ["rawdog", "--sharpen", "0.5", "a.ARW"]);
+        assert_eq!(filled(&["rawdog", "--watch", "in", "-o", "out"]), ["rawdog", "--watch", "5", "in", "-o", "out"]);
+        assert_eq!(filled(&["rawdog", "a.ARW", "--sharpen"]), ["rawdog", "a.ARW", "--sharpen", "0.5"]);
+        assert_eq!(filled(&["rawdog", "--sharpen", "--fast"]), ["rawdog", "--sharpen", "0.5", "--fast"]);
+        // A default spliced in from the defaults file always has its value.
+        assert_eq!(
+            filled(&["rawdog", "--sharpen", "0.8", "a.ARW"]),
+            ["rawdog", "--sharpen", "0.8", "a.ARW"]
+        );
+    }
+
+    #[test]
+    fn fill_optional_values_keeps_numbers_and_equals_forms() {
+        assert_eq!(filled(&["rawdog", "--sharpen", "1", "a.ARW"]), ["rawdog", "--sharpen", "1", "a.ARW"]);
+        // Out of range: left for clap to reject.
+        assert_eq!(filled(&["rawdog", "--sharpen", "9"]), ["rawdog", "--sharpen", "9"]);
+        assert_eq!(filled(&["rawdog", "--sharpen=1", "a.ARW"]), ["rawdog", "--sharpen=1", "a.ARW"]);
+        assert_eq!(filled(&["rawdog", "--", "--sharpen", "a"]), ["rawdog", "--", "--sharpen", "a"]);
+        let parsed = Cli::try_parse_from(filled(&["rawdog", "--sharpen", "a.ARW"])).unwrap();
+        assert_eq!(parsed.sharpen, Some(0.5));
+        assert_eq!(parsed.input, [PathBuf::from("a.ARW")]);
+        let parsed = Cli::try_parse_from(filled(&["rawdog", "--watch", "in"])).unwrap();
+        assert_eq!(parsed.watch, Some(5));
+    }
+
+    #[test]
+    fn optional_values_list_matches_the_options() {
+        let optional: Vec<String> = Cli::command()
+            .get_arguments()
+            .filter_map(|a| a.get_long())
+            .map(|l| format!("--{l}"))
+            .filter(|o| value_is_optional(o))
+            .collect();
+        let listed: Vec<String> = OPTIONAL_VALUES.iter().map(|(o, _)| o.to_string()).collect();
+        assert_eq!(optional, listed);
     }
 
     #[test]

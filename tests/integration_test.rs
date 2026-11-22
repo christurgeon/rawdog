@@ -592,6 +592,33 @@ fn cli_sharpen_accepts_no_value_or_a_value_in_range() {
 
     let output = run(&[input.as_ref(), "--sharpen".as_ref(), "9".as_ref()]);
     assert_eq!(output.status.code(), Some(2));
+
+    // The flag without a value before the input must not take the input as its value.
+    let before = tmp.path().join("before");
+    let output = run(&[
+        "--sharpen".as_ref(),
+        input.as_ref(),
+        "-f".as_ref(),
+        "png".as_ref(),
+        "-o".as_ref(),
+        before.as_ref(),
+    ]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(px(&before, 15), px(&sharp, 15));
+}
+
+#[test]
+fn cli_optional_value_that_is_also_a_folder_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir(tmp.path().join("2026")).unwrap();
+    let output = Command::new(rawdog_bin())
+        .current_dir(tmp.path())
+        .args(["--no-defaults", "--watch", "2026"])
+        .output()
+        .expect("failed to run rawdog");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--watch=2026"), "got: {stderr}");
 }
 
 #[test]
