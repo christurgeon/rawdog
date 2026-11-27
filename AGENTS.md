@@ -76,3 +76,12 @@ the code around your change.
 - Nikon High Efficiency NEF (Z 8, Z f) and some phone DNG files (Samsung
   Galaxy S23 Ultra) do not decode. rawdog reports an error for these.
 - CR3 metadata is copied field by field, not as a whole EXIF block.
+
+## Writing style
+
+Write all responses in ASD-STE100 Simplified Technical English (STE). This applies to chat responses, code comments, commit messages, and documentation.
+
+- Keep instructions to 20 words or fewer. Keep descriptive sentences to 25 words or fewer.
+- Use the active voice, simple verb tenses, and one meaning for each word.
+- Use the same term for the same concept.
+- Do not change code, commands, file paths, error messages, or quoted text to follow these rules.
